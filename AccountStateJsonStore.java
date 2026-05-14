@@ -60,17 +60,39 @@ public final class AccountStateJsonStore {
         /** Compact JSON met key-item -> quantity in bank ten tijde van snapshot. */
         public String knownBankItemQtyJson;
         /** Laatst bekende coin stack in bank (snapshot-moment). */
-        public int knownBankCoins;
+        public long knownBankCoins;
         /** Laatst bekende coin stack in inventory (snapshot-moment). */
-        public int knownInventoryCoins;
+        public long knownInventoryCoins;
         /** Rolling gemiddelde (EWMA) van gp-opbrengst per Imps-banktrip voor dit account. */
         public int impsTripAvgGp;
         /** Aantal Imps-trip samples dat is meegenomen in de gemiddelde opbrengst. */
         public int impsTripSamples;
         /** Laatste gemeten Imps-tripopbrengst in gp. */
         public int impsTripLastGp;
+        /** Totaal aantal anti-ban acties dat voor dit account is uitgevoerd. */
+        public int antiBanActionsTotal;
+        /** Laatste anti-ban actie label (menselijk leesbaar). */
+        public String antiBanLastAction;
+        /** Epoch-ms van de laatste anti-ban actie. */
+        public long antiBanLastActionMs;
+        /** Per anti-ban actie-key hoeveel keer uitgevoerd (bijv. CAMERA_MMB=12). */
+        public Map<String, Integer> antiBanActionCounts = new LinkedHashMap<>();
         public long lastBankCalibrationMs;
         public long lastUpdatedMs;
+
+        // ----- Chronicle (Varrock teleport via Diango Chronicle + Teleport cards) -----
+        /** {@code true} als we ergens (inv/equip/bank) een Chronicle bezitten. Update bij bank-snapshot of trade. */
+        public boolean chronicleOwned;
+        /** Laatst bekende charges-aantal (decrementeer bij elke teleport, increment bij card-use). */
+        public int chronicleCharges;
+        /** Losse Teleport cards in bank (bijgehouden via bank-snapshot/withdraw/deposit). */
+        public int chronicleCardsBank;
+        /** Losse Teleport cards in inventory (bijgehouden via withdraw/deposit/use-on-chronicle). */
+        public int chronicleCardsInv;
+        /** Epoch-ms van laatste sync van bovenstaande chronicle-velden. */
+        public long chronicleLastSyncMs;
+        /** Vink uit/aan via account-tab; gespiegeld vanuit ManagedJagexAccountRow voor snel uitlezen. */
+        public boolean chronicleTeleportEnabled;
     }
 
     public static AccountProgressFile loadFile() {
@@ -195,7 +217,7 @@ public final class AccountStateJsonStore {
     }
 
     public static void putBankSnapshot(String displayName, String knownBankItemsCsv, String knownBankItemQtyJson,
-                                       int bankCoins, int invCoins, boolean calibrated) {
+                                       long bankCoins, long invCoins, boolean calibrated) {
         update(displayName, e -> {
             e.knownBankItemsCsv = knownBankItemsCsv;
             e.knownBankItemQtyJson = knownBankItemQtyJson;
@@ -206,6 +228,45 @@ public final class AccountStateJsonStore {
                 e.lastBankCalibrationMs = System.currentTimeMillis();
             }
         });
+    }
+
+    @SuppressWarnings("unchecked")
+    public static Map<String, Double> knownBankQtyMap(AccountEntry e) {
+        if (e == null || e.knownBankItemQtyJson == null || e.knownBankItemQtyJson.trim().isEmpty()) {
+            return new LinkedHashMap<>();
+        }
+        try {
+            Map<String, Double> raw = GSON.fromJson(e.knownBankItemQtyJson, Map.class);
+            return raw != null ? raw : new LinkedHashMap<>();
+        } catch (Throwable t) {
+            DebugLog.log("AccountStateJson", "knownBankQtyMap: " + t.getMessage());
+            return new LinkedHashMap<>();
+        }
+    }
+
+    public static int knownBankQty(AccountEntry e, String itemName) {
+        if (e == null || itemName == null || itemName.trim().isEmpty()) {
+            return 0;
+        }
+        Map<String, Double> qty = knownBankQtyMap(e);
+        for (Map.Entry<String, Double> it : qty.entrySet()) {
+            if (it.getKey() != null && it.getKey().equalsIgnoreCase(itemName.trim())) {
+                Double v = it.getValue();
+                return v != null ? Math.max(0, v.intValue()) : 0;
+            }
+        }
+        return 0;
+    }
+
+    public static boolean hasKnownBankItem(AccountEntry e, String itemName) {
+        return knownBankQty(e, itemName) > 0;
+    }
+
+    public static long knownCoinsApprox(AccountEntry e) {
+        if (e == null) {
+            return 0L;
+        }
+        return Math.max(0L, e.knownInventoryCoins) + Math.max(0L, e.knownBankCoins);
     }
 
     public static int getImpsTripAvgGp(String displayName) {
@@ -228,6 +289,28 @@ public final class AccountStateJsonStore {
         });
     }
 
+    public static void recordAntiBanAction(String displayName, String actionKey, String actionLabel) {
+        if (displayName == null || displayName.trim().isEmpty()) {
+            return;
+        }
+        final String safeKey = (actionKey == null || actionKey.trim().isEmpty())
+                ? "UNKNOWN"
+                : actionKey.trim().toUpperCase(Locale.ROOT);
+        final String safeLabel = (actionLabel == null || actionLabel.trim().isEmpty())
+                ? safeKey
+                : actionLabel.trim();
+        update(displayName, e -> {
+            if (e.antiBanActionCounts == null) {
+                e.antiBanActionCounts = new LinkedHashMap<>();
+            }
+            int prev = Math.max(0, e.antiBanActionCounts.getOrDefault(safeKey, 0));
+            e.antiBanActionCounts.put(safeKey, prev + 1);
+            e.antiBanActionsTotal = Math.max(0, e.antiBanActionsTotal) + 1;
+            e.antiBanLastAction = safeLabel;
+            e.antiBanLastActionMs = System.currentTimeMillis();
+        });
+    }
+
     /** Questvelden (Vampire Slayer + hammer) — gebruikt door {@link AccountQuestProgressStore}. */
     public static AccountQuestProgressStore.QuestEntry getQuestEntry(String displayName) {
         AccountEntry e = getEntry(displayName);
@@ -238,6 +321,48 @@ public final class AccountStateJsonStore {
         q.vampireSlayerStep = e.vampireSlayerStep;
         q.hammerFromImp = e.hammerFromImp;
         return q;
+    }
+
+    // ============================================================
+    // Chronicle helpers (Varrock teleport via Diango Chronicle + Teleport cards)
+    // ============================================================
+
+    /**
+     * Schrijf nieuwe chronicle-state weg. Velden waarvan je niets weet: geef {@code -1} of {@code null} mee.
+     * Daarmee blijft de bestaande waarde behouden.
+     */
+    public static void putChronicleState(String displayName, Boolean owned, Integer charges,
+                                         Integer cardsBank, Integer cardsInv) {
+        update(displayName, e -> {
+            if (owned != null) e.chronicleOwned = owned;
+            if (charges != null && charges >= 0) e.chronicleCharges = Math.max(0, charges);
+            if (cardsBank != null && cardsBank >= 0) e.chronicleCardsBank = Math.max(0, cardsBank);
+            if (cardsInv != null && cardsInv >= 0) e.chronicleCardsInv = Math.max(0, cardsInv);
+            e.chronicleLastSyncMs = System.currentTimeMillis();
+        });
+    }
+
+    public static void setChronicleTeleportEnabled(String displayName, boolean enabled) {
+        update(displayName, e -> e.chronicleTeleportEnabled = enabled);
+    }
+
+    /** Decrement charges met 1 nadat een teleport gelukt is. */
+    public static void decrementChronicleCharges(String displayName) {
+        update(displayName, e -> {
+            int n = Math.max(0, e.chronicleCharges) - 1;
+            e.chronicleCharges = Math.max(0, n);
+            e.chronicleLastSyncMs = System.currentTimeMillis();
+        });
+    }
+
+    /** Card → chronicle gebruikt: charges += 1, cardsInv -= 1. */
+    public static void registerCardChargedFromInv(String displayName) {
+        update(displayName, e -> {
+            e.chronicleCharges = Math.max(0, e.chronicleCharges) + 1;
+            int inv = Math.max(0, e.chronicleCardsInv) - 1;
+            e.chronicleCardsInv = Math.max(0, inv);
+            e.chronicleLastSyncMs = System.currentTimeMillis();
+        });
     }
 
     public static void putQuestEntry(String displayName, AccountQuestProgressStore.QuestEntry quest) {

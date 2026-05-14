@@ -2,6 +2,7 @@ package com.combatbot;
 
 import net.runelite.api.Skill;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.util.Text;
 import net.storm.api.domain.actors.INPC;
 import net.storm.api.domain.actors.IPlayer;
 import net.storm.api.domain.items.IInventoryItem;
@@ -11,6 +12,7 @@ import net.storm.sdk.entities.NPCs;
 import net.storm.sdk.entities.Players;
 import net.storm.sdk.entities.TileItems;
 import net.storm.sdk.game.Combat;
+import net.storm.sdk.game.Game;
 import net.storm.sdk.game.Skills;
 import net.storm.sdk.items.Bank;
 import net.storm.sdk.items.Equipment;
@@ -637,6 +639,15 @@ public class CombatHandler {
         IInventoryItem food = isAnyFood() ? findAnyFood() : Inventory.getFirst(config.foodName());
         if (food != null) {
             food.interact("Eat");
+            // Soms 2x eten op lage HP als we waarschijnlijk niet full overhealen.
+            if (shouldAttemptDoubleEatNow()) {
+                sleep(260, 520);
+                IInventoryItem second = isAnyFood() ? findAnyFood() : Inventory.getFirst(config.foodName());
+                if (second != null) {
+                    second.interact("Eat");
+                    return antiBan.varyDelay(randomDelay(1450, 2200));
+                }
+            }
             return antiBan.varyDelay(randomDelay(1200, 1800));
         }
         return 600;
@@ -954,6 +965,23 @@ public class CombatHandler {
             // Blijf in LOOTING state — reset pas als er geen loot meer is
             return antiBan.varyDelay(randomDelay(1200, 2000));
         }
+
+        // Inv vol + er ligt nog loot wat we willen → probeer 1 hap te eten om plek te maken.
+        // Voorwaarden zitten in EatForLootSpaceHelper (toggle, HP < max, food beschikbaar).
+        if (loot != null && Inventory.isFull()) {
+            int eatDelay = EatForLootSpaceHelper.tryEatForSpace(
+                    config,
+                    config.lootOnlyOwn(),
+                    8,
+                    lootNames,
+                    this::debug);
+            if (eatDelay > 0) {
+                paint.setCurrentStatus("🍗 Eet voor loot-ruimte");
+                lastLootPickupTime = System.currentTimeMillis();
+                return antiBan.varyDelay(eatDelay);
+            }
+        }
+
         // Geen loot meer gevonden — reset kill counter zodat nieuwe cycle begint
         killsSinceLastLoot = 0;
         effectiveLootKills = -1;
@@ -1287,8 +1315,34 @@ public class CombatHandler {
         return want != null && missing.equalsIgnoreCase(want);
     }
 
+    private String localRsnOrNull() {
+        try {
+            if (Game.isLoggedIn()) {
+                IPlayer lp = Players.getLocal();
+                if (lp != null && lp.getName() != null) {
+                    return Text.removeTags(lp.getName());
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
     public boolean hasOtherActiveSkills() {
-        return config.impsMode() || config.giantsMode() || config.barbLootEnabled()
+        String rsn = localRsnOrNull();
+        ManagedJagexAccountsStore.ManagedJagexAccountRow row =
+                ManagedJagexAccountsStore.findRowForDisplayName(config, rsn);
+        if (row != null && row.rotationUseCustomProfile) {
+            return ManagedJagexAccountsStore.resolveImpsInRotationForDisplayName(config, rsn)
+                    || ManagedJagexAccountsStore.resolveGiantsModeForDisplayName(config, rsn)
+                    || config.barbLootEnabled()
+                    || (row.rotationPickWc && CenterManager.countActive(config.wcCenters()) > 0)
+                    || (row.rotationPickMining && CenterManager.countActive(config.miningCenters()) > 0)
+                    || (row.rotationPickFishing && CenterManager.countActive(config.fishingCenters()) > 0);
+        }
+        return ManagedJagexAccountsStore.resolveImpsInRotationForDisplayName(config, rsn)
+                || ManagedJagexAccountsStore.resolveGiantsModeForDisplayName(config, rsn)
+                || config.barbLootEnabled()
                 || (config.wcEnabled() && CenterManager.countActive(config.wcCenters()) > 0)
                 || (config.miningEnabled() && CenterManager.countActive(config.miningCenters()) > 0)
                 || (config.fishingEnabled() && CenterManager.countActive(config.fishingCenters()) > 0);
@@ -1578,6 +1632,32 @@ public class CombatHandler {
         try {
             return Combat.getHealthPercent() < config.eatPercent();
         } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Lage-HP variant: random tweede hap als we nog ruim onder max HP zitten.
+     * We gebruiken HP-percent als veilige proxy (geen overheal naar "bijna vol").
+     */
+    private boolean shouldAttemptDoubleEatNow() {
+        if (!hasFoodToEat()) {
+            return false;
+        }
+        try {
+            double hpPct = Combat.getHealthPercent();
+            double missingPct = Math.max(0, 100.0 - hpPct);
+            if (missingPct < 16) {
+                return false;
+            }
+            double eatThreshold = Math.max(8, config.eatPercent());
+            double lowHpGate = Math.max(5, eatThreshold - 10);
+            if (hpPct > lowHpGate) {
+                return false;
+            }
+            // Niet altijd: menselijker gedrag (ongeveer 45% kans).
+            return random.nextInt(100) < 45;
+        } catch (Exception ignored) {
             return false;
         }
     }

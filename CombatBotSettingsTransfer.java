@@ -77,8 +77,6 @@ public final class CombatBotSettingsTransfer {
         sb.append(',');
         appendStr(sb, "combatCenters", config.combatCenters());
         sb.append(',');
-        appendBool(sb, "accountsUseGlobalCenterListsOnly", config.accountsUseGlobalCenterListsOnly());
-        sb.append(',');
         appendStr(sb, "combatStyle", config.combatStyle().name());
         sb.append(',');
         appendBool(sb, "showCombatOverlay", config.showCombatOverlay());

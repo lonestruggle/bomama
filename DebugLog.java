@@ -234,6 +234,81 @@ public class DebugLog {
         return getMlClicksFile();
     }
 
+    /**
+     * Één JSON-object per regel (NDJSON) voor ruwe muis-traces:
+     * {@code ~/.runelite/prive-logs/combat-bot-mouse-trace-YYYY-MM-DD.jsonl}.
+     * Wordt gebruikt om menselijke muis-snelheid/beweging/click-drag patronen te analyseren.
+     */
+    public static void appendMouseTraceJsonLine(String jsonLine) {
+        if (jsonLine == null || jsonLine.isEmpty()) {
+            return;
+        }
+        synchronized (DebugLog.class) {
+            try (FileWriter fw = new FileWriter(getMouseTraceFile(), true)) {
+                fw.write(jsonLine);
+                fw.write(System.lineSeparator());
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    public static File getMouseTraceFilePath() {
+        return getMouseTraceFile();
+    }
+
+    /**
+     * Eén JSON-object per regel (NDJSON) voor walk-tile events:
+     * {@code ~/.runelite/prive-logs/combat-bot-walk-tiles-YYYY-MM-DD.jsonl}.
+     * Bevat zowel "click"-events ("Walk here" door bot/jezelf) als "traverse"-events
+     * (speler liep over een tile). Wordt gebruikt voor offline hotspot-/route-analyse.
+     */
+    public static void appendWalkTilesJsonLine(String jsonLine) {
+        if (jsonLine == null || jsonLine.isEmpty()) {
+            return;
+        }
+        synchronized (DebugLog.class) {
+            try (FileWriter fw = new FileWriter(getWalkTilesFile(), true)) {
+                fw.write(jsonLine);
+                fw.write(System.lineSeparator());
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
+    public static File getWalkTilesFilePath() {
+        return getWalkTilesFile();
+    }
+
+    /**
+     * Schrijft een one-shot snapshot-export van de huidige walk-tile-aggregaten naar
+     * {@code ~/.runelite/prive-logs/combat-bot-walk-tiles-export-YYYY-MM-DD-HHmmss.jsonl}.
+     * Eén regel per tile met alle counters; geschikt voor analyse zonder dat auto-log
+     * aan hoeft te staan. Retourneert het pad of {@code null} bij fout.
+     */
+    public static File exportWalkTilesSnapshot(Iterable<String> jsonLines) {
+        if (jsonLines == null) return null;
+        String userHome = System.getProperty("user.home");
+        File rlDir = new File(userHome, ".runelite");
+        File logsDir = new File(rlDir, "prive-logs");
+        if (!logsDir.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            logsDir.mkdirs();
+        }
+        String stamp = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE)
+                + "-" + LocalTime.now().format(DateTimeFormatter.ofPattern("HHmmss"));
+        File out = new File(logsDir, "combat-bot-walk-tiles-export-" + stamp + ".jsonl");
+        try (FileWriter fw = new FileWriter(out, false)) {
+            for (String line : jsonLines) {
+                if (line == null || line.isEmpty()) continue;
+                fw.write(line);
+                fw.write(System.lineSeparator());
+            }
+            return out;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
     private static File getMlClicksFile() {
         String userHome = System.getProperty("user.home");
         File rlDir = new File(userHome, ".runelite");
@@ -244,6 +319,30 @@ public class DebugLog {
         }
         String day = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE);
         return new File(logsDir, "combat-bot-ml-clicks-" + day + ".jsonl");
+    }
+
+    private static File getMouseTraceFile() {
+        String userHome = System.getProperty("user.home");
+        File rlDir = new File(userHome, ".runelite");
+        File logsDir = new File(rlDir, "prive-logs");
+        if (!logsDir.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            logsDir.mkdirs();
+        }
+        String day = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE);
+        return new File(logsDir, "combat-bot-mouse-trace-" + day + ".jsonl");
+    }
+
+    private static File getWalkTilesFile() {
+        String userHome = System.getProperty("user.home");
+        File rlDir = new File(userHome, ".runelite");
+        File logsDir = new File(rlDir, "prive-logs");
+        if (!logsDir.exists()) {
+            //noinspection ResultOfMethodCallIgnored
+            logsDir.mkdirs();
+        }
+        String day = LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE);
+        return new File(logsDir, "combat-bot-walk-tiles-" + day + ".jsonl");
     }
 
     private static String normalizeSource(String source) {

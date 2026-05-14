@@ -1324,6 +1324,16 @@ public class LootHandler {
             boolean atLootSpot = near(me, BARB_LOOT_CENTER, SPOT_PROX);
 
             if (Inventory.isFull()) {
+                // Probeer eerst 1 hap te eten om plek te maken voor de vis op de grond.
+                // Alleen als toggle aan + HP niet vol + er ligt eet-waardige loot.
+                if (fish != null) {
+                    int eatDelay = EatForLootSpaceHelper.tryEatForSpace(
+                            config, false, 8, null, this::debug);
+                    if (eatDelay > 0) {
+                        paint.setCurrentStatus("🍗 Eet voor loot-ruimte");
+                        return antiBan.varyDelay(eatDelay);
+                    }
+                }
                 return handleBankEdge(local);
             }
 

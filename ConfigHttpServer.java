@@ -235,7 +235,6 @@ public class ConfigHttpServer {
         appendStr(sb, "miningCenters", config.miningCenters()); sb.append(",");
         appendStr(sb, "fishingCenters", config.fishingCenters()); sb.append(",");
         appendStr(sb, "impsCenters", config.impsCenters()); sb.append(",");
-        appendBool(sb, "accountsUseGlobalCenterListsOnly", config.accountsUseGlobalCenterListsOnly()); sb.append(",");
         // Giants Mode
         appendBool(sb, "giantsMode", config.giantsMode()); sb.append(",");
         appendStr(sb, "giantsMonsterName", config.giantsMonsterName()); sb.append(",");

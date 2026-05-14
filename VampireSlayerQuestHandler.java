@@ -99,6 +99,38 @@ public final class VampireSlayerQuestHandler {
     private long lastObjMs;
     private long lastDialogMs;
     private long lastShopMs;
+    /** Signature van de laatste fallback-dialog (option-tekst) + hoeveel keer dezelfde fallback achter elkaar.
+     * Wordt gebruikt om bij ≥2 mislukte chooseOption(0)-pogingen over te schakelen op een keyboard-cijfer. */
+    private String lastFallbackDialogSig = "";
+    private int sameFallbackHits = 0;
+    /**
+     * Wordt ge-set zodra Dr Harlow zegt: "Yesh. You must've put it somewhere. Go find it."
+     * Betekent: Harlow geeft GEEN nieuwe stake. De stake ligt elders (bank of Death's office).
+     * Reset bij stake in inventory of bij phase-change.
+     */
+    private boolean harlowSaidGoFindStake = false;
+    private long harlowSaidGoFindStakeMs = 0L;
+    /** Aantal keer dat we de Draynor bank hebben gecheckt op stake na Harlow's "go find it". */
+    private int draynorBankStakeCheckCount = 0;
+    /**
+     * Hard signaal naar de plugin: stake is nergens beschikbaar (niet in inv, niet in bank,
+     * Harlow weigert). Plugin moet de quest tijdelijk uitschakelen en doorrouteren naar
+     * een andere skill (of account-switch / logout als geen alternatief is).
+     * Reset bij phase-change of zodra de plugin het signaal opgepakt heeft.
+     */
+    private boolean questBlockedStakeMissing = false;
+    private long questBlockedStakeMissingMs = 0L;
+    /**
+     * Blacklist van Count-NPC-indices die NIET van ons zijn (Draynor manor crypt is geïnstantieerd
+     * per coffin-open, dus elke speler heeft z'n eigen Count). Gevuld via chat-message
+     * "The vampyre doesn't seem interested in fighting you." Sleutel = NPC index; waarde = expireMs.
+     */
+    private final java.util.Map<Integer, Long> notOurCountUntilMs = new java.util.HashMap<>();
+    /** Korte tracker voor de NPC waar we laatst op klikten (om bij de chat-error te blacklisten). */
+    private int lastAttackedCountIndex = -1;
+    private long lastAttackedCountClickMs = 0L;
+    /** Hoe lang we een Count blacklisten nadat hij "doesn't seem interested" zei. */
+    private static final long NOT_OUR_COUNT_BLACKLIST_MS = 45_000L;
     private long lastBankActionMs;
     private long lastEatMs;
     private long coffinOpenMs;
@@ -186,6 +218,12 @@ public final class VampireSlayerQuestHandler {
                 attackedCount = false;
                 coffinOpenMs = 0L;
             }
+            // Bij volledige reset (varp 0 of 3): ook de Harlow-stake-flag resetten.
+            if (phase == 0 || phase == 3) {
+                harlowSaidGoFindStake = false;
+                draynorBankStakeCheckCount = 0;
+                questBlockedStakeMissing = false;
+            }
             DebugLog.log("QUEST", "Fase gewijzigd → varp=" + phase);
         } else if (phaseStartMs > 0 && now - phaseStartMs > PHASE_FAILSAFE_MS) {
             DebugLog.log("QUEST", "Failsafe: fase " + phase + " > 5 min, reset state");
@@ -195,6 +233,8 @@ public final class VampireSlayerQuestHandler {
             attackedCount = false;
             coffinOpenedOnce = false;
             coffinOpenMs = 0L;
+            // Failsafe ook de bank-check counter resetten zodat we opnieuw kunnen verifiëren.
+            draynorBankStakeCheckCount = 0;
         }
     }
 
@@ -230,12 +270,18 @@ public final class VampireSlayerQuestHandler {
                     "But this is your friend Morgan we're talking about!",
                     // Dr Harlow — 2e gesprek met bier op zak: bier afgeven, daarna stake
                     "Here you go.",
+                    // Dr Harlow — gesprek voor de eerste stake (we waren hier elke keer in fallback aan
+                    // het belanden, dus expliciet matchen i.p.v. chooseOption(0)).
+                    "Did you say I'd need a stake?",
             };
             for (String opt : exactPreferred) {
                 final String target = opt;
                 if (Dialog.hasOption(s -> s != null && s.equalsIgnoreCase(target))) {
+                    if (antiBan != null) antiBan.notifyHandlerAction("dialog-option-exact", 1500);
                     Dialog.chooseOption(s -> s != null && s.equalsIgnoreCase(target));
                     DebugLog.log("QUEST", "Dialog option (exact): " + opt);
+                    sameFallbackHits = 0;
+                    lastFallbackDialogSig = "";
                     return antiBan.varyDelay(randomDelay(700, 1300));
                 }
             }
@@ -246,6 +292,11 @@ public final class VampireSlayerQuestHandler {
                     "friend morgan we're talking about",
                     "So tell me how to kill vampyres",
                     "I'm in search of a vampyre", "vampyre", "vampire",
+                    // Eerste stake-prompt (Dr Harlow). Was niet gedekt → fallback ging steeds naar 0
+                    // wat technisch gelijk is maar de keuze ging niet door (zie sameFallbackHits).
+                    "did you say i'd need a stake", "i'd need a stake", "say i'd need a stake",
+                    "need a stake",
+                    // Tweede stake (na falen Count Draynor)
                     "I need another stake", "another stake",
                     "glass of your finest ale", "finest ale", "ale please",
                     "A beer please", "One beer please.", "beer",
@@ -254,18 +305,82 @@ public final class VampireSlayerQuestHandler {
             for (String opt : containsPreferred) {
                 final String key = opt.toLowerCase(Locale.ROOT);
                 if (Dialog.hasOption(s -> s != null && s.toLowerCase(Locale.ROOT).contains(key))) {
+                    if (antiBan != null) antiBan.notifyHandlerAction("dialog-option-contains", 1500);
                     Dialog.chooseOption(s -> s != null && s.toLowerCase(Locale.ROOT).contains(key));
                     DebugLog.log("QUEST", "Dialog option (contains): " + opt);
+                    sameFallbackHits = 0;
+                    lastFallbackDialogSig = "";
                     return antiBan.varyDelay(randomDelay(700, 1300));
                 }
             }
-            // Fallback: eerste optie
+            // Fallback: eerste optie. Log de echte beschikbare opties zodat we kunnen zien
+            // WAAROM we hier vastlopen (bijv. Dr Harlow heeft een sub-prompt buiten onze lijst).
+            String dialogSig = "";
+            try {
+                java.util.List<IWidget> shown = Dialog.getOptions();
+                if (shown != null && !shown.isEmpty()) {
+                    StringBuilder sigSb = new StringBuilder();
+                    StringBuilder sb = new StringBuilder("Dialog: fallback optie 0 gekozen | beschikbaar=");
+                    for (int i = 0; i < shown.size(); i++) {
+                        if (i > 0) {
+                            sb.append(" || ");
+                            sigSb.append('|');
+                        }
+                        IWidget w = shown.get(i);
+                        String txt = "";
+                        try {
+                            if (w != null && w.getText() != null) txt = net.runelite.client.util.Text.removeTags(w.getText()).trim();
+                        } catch (Throwable ignored2) {}
+                        sb.append('[').append(i).append(']').append(' ').append(txt);
+                        sigSb.append(txt);
+                    }
+                    dialogSig = sigSb.toString();
+                    DebugLog.log("QUEST", sb.toString());
+                } else {
+                    DebugLog.log("QUEST", "Dialog: fallback optie 0 gekozen (geen opties zichtbaar)");
+                }
+            } catch (Throwable ignored) {
+                DebugLog.log("QUEST", "Dialog: fallback optie 0 gekozen");
+            }
+
+            // Track of we DEZELFDE dialog steeds opnieuw zien — als chooseOption(0) blijkbaar niet
+            // doorgaat (zie het stake-loop incident), escaleer naar keyboard "1".
+            if (!dialogSig.isEmpty() && dialogSig.equals(lastFallbackDialogSig)) {
+                sameFallbackHits++;
+            } else {
+                sameFallbackHits = 1;
+                lastFallbackDialogSig = dialogSig;
+            }
+
+            if (antiBan != null) antiBan.notifyHandlerAction("dialog-option-fallback", 1500);
+            if (sameFallbackHits >= 2) {
+                // chooseOption(0) lijkt niet door te komen → keyboard "1" (OSRS dialog accepteert
+                // cijfertoetsen voor opties; werkt ook als de widget-click in een race-window valt).
+                try {
+                    net.storm.sdk.input.Keyboard.pressed(java.awt.event.KeyEvent.VK_1);
+                    DebugLog.log("QUEST", "Dialog: chooseOption(0) hangt → keyboard '1' geforceerd"
+                            + " (hits=" + sameFallbackHits + ")");
+                } catch (Throwable t) {
+                    DebugLog.log("QUEST", "Dialog: keyboard '1' fallback fout: " + t.getMessage());
+                    Dialog.chooseOption(0);
+                }
+                // Reset zodat we niet eindeloos keys blijven sturen
+                if (sameFallbackHits >= 4) {
+                    sameFallbackHits = 0;
+                    lastFallbackDialogSig = "";
+                }
+                return antiBan.varyDelay(randomDelay(900, 1500));
+            }
             Dialog.chooseOption(0);
-            DebugLog.log("QUEST", "Dialog: fallback optie 0 gekozen");
             return antiBan.varyDelay(randomDelay(700, 1300));
         }
 
         if (Dialog.canContinue()) {
+            // Lees de NPC-dialog tekst vóór we continue klikken — sommige speech triggers
+            // moeten we vastleggen omdat ze de quest-state beïnvloeden (bv. Dr Harlow die zegt
+            // dat de stake al uitgereikt is en we hem moeten zoeken).
+            detectStateChangingNpcSpeech();
+            if (antiBan != null) antiBan.notifyHandlerAction("dialog-continue", 1000);
             Dialog.continueSpace();
             DebugLog.log("QUEST", "Dialog continue (spatie)");
             return antiBan.varyDelay(randomDelay(450, 800));
@@ -273,6 +388,66 @@ public final class VampireSlayerQuestHandler {
 
         // Open maar niet-continueable, niet-options — even wachten
         return antiBan.varyDelay(randomDelay(400, 700));
+    }
+
+    /**
+     * Probeert de huidige NPC dialog-tekst te lezen via meerdere bekende widget-ID's.
+     * OSRS gebruikt verschillende dialog-widgets (klassieke chatbox, modern overlay).
+     * Geeft "" terug als geen tekst gevonden.
+     */
+    private String currentNpcDialogText() {
+        // Bekende NPC-dialog widget locaties: (group, child) paren.
+        // - 231,6   = klassieke NPC chathead text
+        // - 217,5/6 = player chathead text (alternatief layout)
+        // - 11,4/5  = single-line "object examine" / continue
+        // - 193,2   = sprite-overlay dialog
+        int[][] candidates = {
+                {231, 6}, {231, 5}, {231, 4},
+                {217, 5}, {217, 6}, {217, 4},
+                {11, 4}, {11, 5},
+                {193, 2}
+        };
+        for (int[] gc : candidates) {
+            try {
+                IWidget w = Widgets.get(gc[0], gc[1]);
+                if (w == null || w.isHidden()) continue;
+                String txt = w.getText();
+                if (txt == null) continue;
+                String clean = Text.removeTags(txt).trim();
+                if (!clean.isEmpty()) {
+                    return clean;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return "";
+    }
+
+    /**
+     * Vangt NPC-speech die invloed heeft op de quest-state. Wordt aangeroepen vóór
+     * elke {@code Dialog.continueSpace()} zodat we niet door de tekst heen klikken
+     * en de trigger missen.
+     */
+    private void detectStateChangingNpcSpeech() {
+        String npc = currentNpcDialogText();
+        if (npc.isEmpty()) return;
+        String low = npc.toLowerCase(Locale.ROOT);
+        // Dr Harlow's "ik heb je al een stake gegeven, ga 'm zoeken" speech.
+        // Mogelijk varianten:
+        //   "Yesh. You must've put it somewhere. Go find it."
+        //   "You must have put it somewhere. Go find it."
+        if (low.contains("must've put it somewhere")
+                || low.contains("must have put it somewhere")
+                || (low.contains("go find it") && low.contains("somewhere"))
+                || (low.contains("put it somewhere") && low.contains("find"))) {
+            if (!harlowSaidGoFindStake) {
+                DebugLog.log("QUEST", "Dr Harlow: \"" + npc + "\" → stake ligt elders, niet meer Harlow lastigvallen");
+            }
+            harlowSaidGoFindStake = true;
+            harlowSaidGoFindStakeMs = System.currentTimeMillis();
+            // Forceer een nieuwe bank-bezoek zodat we daadwerkelijk gaan kijken.
+            visitedDraynorBank = false;
+        }
     }
 
     // ===================================================================
@@ -333,14 +508,25 @@ public final class VampireSlayerQuestHandler {
             return antiBan.varyDelay(randomDelay(3500, 5500));
         }
 
-        // Stake bij Dr Harlow (vereist bier — niet leeg!)
+        // Stake bij Dr Harlow (vereist bier — niet leeg!).
+        // Maar: als Harlow eerder zei "go find it", weet hij dat we al een stake gehad hebben
+        // en geeft hij geen nieuwe meer. Dan moeten we eerst de bank checken (en uiteindelijk
+        // Death's Office als de stake daar terecht is gekomen na een dood).
         if (!hasStake) {
+            if (harlowSaidGoFindStake) {
+                return recoverMissingStake(local);
+            }
             // FIX #4: Beer-safeguard. "Beer glass" (leeg) telt niet, alleen volle Beer.
             boolean hasFullBeer = inventoryHasFullBeer();
             if (!hasFullBeer) {
                 return getBeerFromBartender(local);
             }
             return talkToHarlowForStake(local);
+        } else if (harlowSaidGoFindStake) {
+            // Stake terug op zak → flag opheffen.
+            harlowSaidGoFindStake = false;
+            draynorBankStakeCheckCount = 0;
+            DebugLog.log("QUEST", "Stake terug in inventory — Dr Harlow flag gereset");
         }
 
         // Hammer kopen in Varrock General Store als we hem nog niet hebben
@@ -436,6 +622,10 @@ public final class VampireSlayerQuestHandler {
         }
         if (!hasStake || !hasHammer) {
             if (!hasStake) {
+                // Harlow weigert nieuwe stake → bank/Death pad i.p.v. eindeloze Harlow-loop.
+                if (harlowSaidGoFindStake) {
+                    return recoverMissingStake(local);
+                }
                 if (!inventoryHasFullBeer()) {
                     paint.setCurrentStatus("Quest: varp2 maar geen stake — eerst bier halen");
                     DebugLog.log("QUEST", "varp2 guard: stake ontbreekt, bier halen");
@@ -471,6 +661,118 @@ public final class VampireSlayerQuestHandler {
         paint.setLastAntiBanAction("Vampyre Slayer voltooid");
         paint.setCurrentStatus("Quest voltooid");
         return antiBan.varyDelay(randomDelay(1800, 3200));
+    }
+
+    /**
+     * Recovery-pad als Dr Harlow zegt dat de stake "ergens" ligt en geen nieuwe meer geeft.
+     * Stappen:
+     *   1. Eerst de Draynor bank checken (snapshot + actuele Bank-API als die open is).
+     *   2. Als de stake daadwerkelijk in de bank zit → withdrawen.
+     *   3. Als bank leeg is en we hebben max checks gehad → log instructie naar Death's
+     *      Office (account-tabel onthoudt de last-known coin/items state, dus user
+     *      kan hier inspringen). Auto-pathing naar Death is bewust uitgeschakeld
+     *      omdat de Death-flow account-specifiek is en handmatige bevestiging vraagt.
+     */
+    private int recoverMissingStake(IPlayer local) {
+        // Snapshot-check (cheap, geen open bank nodig).
+        Integer snapshotQty = bankSnapshotStakeQty();
+        if (snapshotQty != null && snapshotQty > 0) {
+            paint.setCurrentStatus("Quest: stake ligt in bank (snapshot " + snapshotQty + ") — ophalen");
+        } else if (snapshotQty != null && snapshotQty == 0 && draynorBankStakeCheckCount >= 1) {
+            // Snapshot zegt: stake niet in bank, en we hebben dat al ingame bevestigd.
+            return reportStakeAtDeathAndPause();
+        } else {
+            paint.setCurrentStatus("Quest: stake zoek — Draynor bank openen om te verifiëren");
+        }
+
+        if (local.getWorldLocation().distanceTo(DRAYNOR_BANK_TILE) > 6) {
+            issueWalk(DRAYNOR_BANK_TILE);
+            return travelDelay();
+        }
+        inBankSession = true;
+        if (!Bank.isOpen()) {
+            BankHelper.openSdkBankAndWait();
+            lastBankActionMs = System.currentTimeMillis();
+            DebugLog.log("QUEST", "Recover stake: Draynor bank openen");
+            return antiBan.varyDelay(randomDelay(1200, 2000));
+        }
+        if (System.currentTimeMillis() - lastBankActionMs < 600) {
+            return antiBan.varyDelay(randomDelay(300, 500));
+        }
+        if (Bank.contains("Stake")) {
+            Bank.withdraw("Stake", 1);
+            lastBankActionMs = System.currentTimeMillis();
+            DebugLog.log("QUEST", "Recover stake: Stake uit bank gewithdrawn");
+            // Bank dichtdoen na een korte tick zodat hasStake-check daarna doortikt.
+            return antiBan.varyDelay(randomDelay(700, 1200));
+        }
+        // Bank ingame leeg op stake.
+        draynorBankStakeCheckCount++;
+        DebugLog.log("QUEST", "Recover stake: niet in Draynor bank (check #" + draynorBankStakeCheckCount + ")");
+        if (draynorBankStakeCheckCount >= 2) {
+            inBankSession = false;
+            Bank.close();
+            return reportStakeAtDeathAndPause();
+        }
+        return antiBan.varyDelay(randomDelay(800, 1300));
+    }
+
+    /**
+     * Stake zit niet in inv en niet in Draynor bank → vrijwel zeker bij Death (na een dood
+     * tijdens deze quest). Death-collect automatiseren is bewust uitgesteld omdat het een
+     * account-specifieke instance-flow is.
+     * <p>
+     * I.p.v. eindeloos pauzeren zetten we een hard block-signaal zodat de plugin de quest
+     * uitschakelt, doorroteert naar een andere skill (als die enabled is) of bij gebrek
+     * daaraan account-switcht / uitlogt. Geen "niets doen"-loop meer.
+     */
+    private int reportStakeAtDeathAndPause() {
+        paint.setCurrentStatus("Quest: stake niet beschikbaar — quest uitschakelen, andere skill proberen");
+        DebugLog.log("QUEST", "Stake nergens te vinden (inv/bank leeg, Harlow weigert) → quest geblokkeerd."
+                + " Plugin moet doorrouteren naar andere skill of account-switch/logout."
+                + " Collect handmatig bij Death (Lumbridge Death's Office) om verder te gaan met de quest.");
+        questBlockedStakeMissing = true;
+        questBlockedStakeMissingMs = System.currentTimeMillis();
+        // Korte delay — plugin pakt het signaal in de volgende tick op.
+        return antiBan.varyDelay(randomDelay(500, 900));
+    }
+
+    /** Hard block-signaal: quest kan nu niet verder (stake missing). Plugin moet uitroteren. */
+    public boolean isQuestBlockedStakeMissing() {
+        return questBlockedStakeMissing;
+    }
+
+    /** Wordt door de plugin aangeroepen nadat het signaal verwerkt is. */
+    public void resetQuestBlockedStakeMissing() {
+        questBlockedStakeMissing = false;
+    }
+
+    /**
+     * @return aantal stakes in de bank-snapshot ({@code null} als er geen recente snapshot is).
+     */
+    private Integer bankSnapshotStakeQty() {
+        try {
+            String rsn = currentDisplayName();
+            if (rsn == null || rsn.isEmpty()) return null;
+            AccountStateJsonStore.AccountEntry e = AccountStateJsonStore.getEntry(rsn);
+            if (e == null) return null;
+            if (e.knownBankItemQtyJson == null || e.knownBankItemQtyJson.trim().isEmpty()) {
+                return null;
+            }
+            return AccountStateJsonStore.knownBankQty(e, "Stake");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private String currentDisplayName() {
+        try {
+            IPlayer lp = Players.getLocal();
+            if (lp == null || lp.getName() == null) return null;
+            return Text.removeTags(lp.getName()).trim();
+        } catch (Throwable ignored) {
+            return null;
+        }
     }
 
     // ===================================================================
@@ -870,15 +1172,20 @@ public final class VampireSlayerQuestHandler {
             ensureMagicAutocast();
         }
 
-        INPC count = NPCs.getNearest(n -> n != null && n.getName() != null
-                && n.getName().contains("Count Draynor")
-                && !n.isDead());
+        // Verplichte volgorde: eerst coffin openen → daarna spawnt JOUW Count. Andere Counts in
+        // de crypt zijn van andere spelers en geven "The vampyre doesn't seem interested in
+        // fighting you." Dus tot we de coffin hebben geopend NIET aanvallen.
+        if (!coffinOpenedOnce) {
+            return doFirstCoffinClick(local);
+        }
 
-        if (count != null) {
+        // Onze eigen Count zoeken: prioriteit op "ons aanvalt" of "we vechten er al mee".
+        INPC ourCount = findOurCount(local);
+        if (ourCount != null) {
             attackedCount = true;
-            coffinOpenMs = 0; // reset coffin-failsafe
-            if (local.getWorldLocation().distanceTo(count.getWorldLocation()) > 10) {
-                issueWalk(count.getWorldLocation());
+            coffinOpenMs = 0;
+            if (local.getWorldLocation().distanceTo(ourCount.getWorldLocation()) > 10) {
+                issueWalk(ourCount.getWorldLocation());
                 return travelDelay();
             }
             if (InteractionThrottle.shouldWaitAfterGlobalInteraction(local)) {
@@ -886,42 +1193,104 @@ public final class VampireSlayerQuestHandler {
                 return antiBan.varyDelay(randomDelay(500, 900));
             }
             if (local.getInteracting() == null) {
-                if (count.hasAction("Attack")) {
-                    count.interact("Attack");
+                lastAttackedCountIndex = ourCount.getIndex();
+                lastAttackedCountClickMs = System.currentTimeMillis();
+                if (ourCount.hasAction("Attack")) {
+                    ourCount.interact("Attack");
                 } else {
-                    count.interact(0);
+                    ourCount.interact(0);
                 }
                 InteractionThrottle.markGlobalInteraction();
-                DebugLog.log("QUEST", "Attack Count Draynor");
+                DebugLog.log("QUEST", "Attack Count Draynor (idx=" + ourCount.getIndex() + ")");
                 return antiBan.varyDelay(randomDelay(800, 1400));
             }
             return antiBan.varyDelay(randomDelay(600, 1100));
         }
 
-        // FIX #9: Failsafe — als coffin lang open is en geen Count, pas dan opnieuw klikken.
+        // Failsafe — als coffin lang open is en geen Count, pas dan opnieuw klikken.
         if (coffinOpenMs > 0 && System.currentTimeMillis() - coffinOpenMs > 90_000L
                 && !recentInteractionInProgress(local, lastCoffinInteractMs)) {
             DebugLog.log("QUEST", "Failsafe: Count niet gespawnt, coffin opnieuw");
             coffinOpenMs = 0;
             attackedCount = false;
             coffinOpenedOnce = false;
+            return antiBan.varyDelay(randomDelay(500, 900));
         }
 
-        // Coffin al gebruikt: geen tweede Open/Search — wacht op Count of op varp 3 (quest klaar).
-        if (coffinOpenedOnce) {
-            if (attackedCount) {
-                paint.setCurrentStatus("Quest: Count verslagen — wachten op update");
-                return antiBan.varyDelay(randomDelay(1000, 2000));
-            }
-            if (local.getWorldLocation().distanceTo(COFFIN_TILE) > 8) {
-                issueWalk(COFFIN_TILE);
-                return travelDelay();
-            }
-            paint.setCurrentStatus("Quest: wacht op Count…");
-            return antiBan.varyDelay(randomDelay(600, 1200));
+        // Coffin al geopend, geen "eigen" Count zichtbaar (alleen andere spelers' Counts).
+        if (attackedCount) {
+            paint.setCurrentStatus("Quest: Count verslagen — wachten op update");
+            return antiBan.varyDelay(randomDelay(1000, 2000));
         }
+        if (local.getWorldLocation().distanceTo(COFFIN_TILE) > 8) {
+            issueWalk(COFFIN_TILE);
+            return travelDelay();
+        }
+        int blacklistedHere = countNearbyBlacklistedCounts(local);
+        if (blacklistedHere > 0) {
+            paint.setCurrentStatus("Quest: " + blacklistedHere + " andere Count's — wachten op eigen spawn");
+        } else {
+            paint.setCurrentStatus("Quest: wacht op eigen Count…");
+        }
+        return antiBan.varyDelay(randomDelay(600, 1200));
+    }
 
-        // Eerste keer: naar coffin en één keer Open (of Search als al open)
+    /**
+     * Zoek de Count Draynor die ECHT van ons is. Strategie:
+     *  1. Count die {@code local} interact-target heeft (= valt ons aan).
+     *  2. Count waarmee wij interact-target hebben (= we vechten al).
+     *  3. Count zonder andere player als target, mits niet geblacklist.
+     * Counts die ons "not interested"-bericht gaven worden geskipt.
+     */
+    private INPC findOurCount(IPlayer local) {
+        long now = System.currentTimeMillis();
+        // Eerst: een Count die ons al aanvalt of waar wij mee vechten (100% zekerheid).
+        INPC engaged = NPCs.getNearest(n -> {
+            if (n == null || n.getName() == null || !n.getName().contains("Count Draynor") || n.isDead()) return false;
+            if (isBlacklistedCount(n, now)) return false;
+            if (isAttackingUs(n, local)) return true;
+            return local.getInteracting() != null && local.getInteracting().equals(n);
+        });
+        if (engaged != null) return engaged;
+
+        // Daarna: Count zonder player-target (kandidaat — onze net-gespawnde Count heeft nog niemand).
+        // Skip Counts die met een ANDERE player interacteren.
+        return NPCs.getNearest(n -> {
+            if (n == null || n.getName() == null || !n.getName().contains("Count Draynor") || n.isDead()) return false;
+            if (isBlacklistedCount(n, now)) return false;
+            Object t = n.getInteracting();
+            if (t == null) return true;
+            if (t.equals(local)) return true;
+            // Interacteert met iemand anders → niet van ons.
+            return false;
+        });
+    }
+
+    private boolean isAttackingUs(INPC n, IPlayer local) {
+        try {
+            Object t = n.getInteracting();
+            return t != null && t.equals(local);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private boolean isBlacklistedCount(INPC n, long now) {
+        if (n == null) return false;
+        Long expire = notOurCountUntilMs.get(n.getIndex());
+        return expire != null && now < expire;
+    }
+
+    private int countNearbyBlacklistedCounts(IPlayer local) {
+        long now = System.currentTimeMillis();
+        java.util.List<INPC> all = NPCs.getAll(n -> n != null && n.getName() != null
+                && n.getName().contains("Count Draynor") && !n.isDead()
+                && isBlacklistedCount(n, now));
+        return all != null ? all.size() : 0;
+    }
+
+    /** Eén keer coffin Open/Search; pas weer na failsafe. */
+    private int doFirstCoffinClick(IPlayer local) {
         if (local.getWorldLocation().distanceTo(COFFIN_TILE) > 6) {
             issueWalk(COFFIN_TILE);
             return travelDelay();
@@ -952,8 +1321,32 @@ public final class VampireSlayerQuestHandler {
         InteractionThrottle.markGlobalInteraction();
         coffinOpenMs = System.currentTimeMillis();
         attackedCount = false;
-        DebugLog.log("QUEST", "Coffin geopend (1x)");
+        DebugLog.log("QUEST", "Coffin geopend (1x) — wacht op eigen Count");
         return antiBan.varyDelay(randomDelay(2200, 3600));
+    }
+
+    /**
+     * Wordt door de plugin aangeroepen op elke chat-message. Vangt de specifieke
+     * "doesn't seem interested" speech af zodat we de net-aangeklikte Count blacklisten
+     * en niet meer opnieuw proberen.
+     */
+    public void onChatMessage(String message) {
+        if (message == null) return;
+        String low = message.toLowerCase(Locale.ROOT);
+        if (low.contains("doesn't seem interested in fighting you")
+                || low.contains("does not seem interested in fighting you")) {
+            // Blacklist alleen als we recent een Count geklikt hebben (binnen 8s).
+            long now = System.currentTimeMillis();
+            if (lastAttackedCountIndex >= 0 && now - lastAttackedCountClickMs < 8000L) {
+                notOurCountUntilMs.put(lastAttackedCountIndex, now + NOT_OUR_COUNT_BLACKLIST_MS);
+                DebugLog.log("QUEST", "Count idx=" + lastAttackedCountIndex
+                        + " is van andere speler — blacklist 45s, wachten op eigen Count");
+                // Reset zodat we niet dezelfde Count opnieuw als "lastAttacked" houden.
+                lastAttackedCountIndex = -1;
+                // Force een nieuwe coffin-open cyclus alleen als we ook geen running fight hebben.
+                attackedCount = false;
+            }
+        }
     }
 
     // ===================================================================

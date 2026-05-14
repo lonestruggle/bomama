@@ -88,20 +88,84 @@ public interface CombatBotConfig extends Config {
     @ConfigItem(
             keyName = "debugWalkClickOverlay",
             name = "Debug: walk-klik tiles (overlay)",
-            description = "Tekent MovementHelper-loopdoelen op de kaart (max. 1000 punten, 24 uur zichtbaar). Spoor wordt opgeslagen en blijft na plugin-reload zichtbaar zolang overlay weer aan staat. Reset via Debug-tab. Ook aan/uit daar.",
+            description = "Master-switch voor de walk-tile overlay. Zet hieronder per laag aan/uit (click-tiles met x{count}, en/of pad-tiles met ·{n}). Bewaart max. 2000 unieke tiles, 24 uur zichtbaar. Spoor wordt opgeslagen en blijft na plugin-reload zichtbaar zolang overlay aan staat. Reset via Debug-tab.",
             section = controlSection,
             position = 3
     )
     default boolean debugWalkClickOverlay() { return false; }
 
     @ConfigItem(
+            keyName = "debugWalkOverlayShowClickTiles",
+            name = "└ Toon click-tiles (x{n})",
+            description = "Tekent ELKE 'Walk here' klik (van bot of jezelf) als heatmap-tile met een x{count} label. Vereist dat de master 'walk-klik tiles (overlay)' aan staat.",
+            section = controlSection,
+            position = 4
+    )
+    default boolean debugWalkOverlayShowClickTiles() { return true; }
+
+    @ConfigItem(
+            keyName = "debugWalkOverlayShowPathTiles",
+            name = "└ Toon pad-tiles (·{n})",
+            description = "Tekent elke tile waar de speler overheen wandelt (groene heatmap-tile met ·{n} bij ≥ 2 traversals). Vereist dat de master 'walk-klik tiles (overlay)' aan staat. Tip: zet uit als de overlay te druk wordt en je alleen klikken wil zien.",
+            section = controlSection,
+            position = 5
+    )
+    default boolean debugWalkOverlayShowPathTiles() { return true; }
+
+    @ConfigItem(
             keyName = "debugWalkClickPersistedQueue",
             name = "Intern: walk-overlay trail",
             description = "Automatisch beheerd — laatste loop-punten (x,y,vlak,verval). Leegmaken: Debug-tab \"Reset walk-tiles\".",
             section = controlSection,
-            position = 4
+            position = 6
     )
     default String debugWalkClickPersistedQueue() { return ""; }
+
+    @ConfigItem(
+            keyName = "debugWalkAutoLogToDisk",
+            name = "└ Auto-log walk-tiles → JSONL",
+            description = "Schrijft elke walk-klik en pad-traversal naar ~/.runelite/prive-logs/combat-bot-walk-tiles-YYYY-MM-DD.jsonl voor offline analyse. "
+                    + "Eén regel per event ({type, x, y, plane, count, traversals, t}). Vereist dat de master overlay aan staat.",
+            section = controlSection,
+            position = 7
+    )
+    default boolean debugWalkAutoLogToDisk() { return false; }
+
+    @ConfigItem(
+            keyName = "debugWalkStuckHotspotEnabled",
+            name = "└ Hotspot-stuck waarschuwing",
+            description = "Logt een waarschuwing in de Debug-tab als één tile binnen het tijdvenster meer dan N keer geklikt wordt — handig om vast te stellen dat de bot op één plek blijft kloppen.",
+            section = controlSection,
+            position = 8
+    )
+    default boolean debugWalkStuckHotspotEnabled() { return true; }
+
+    @ConfigItem(
+            keyName = "debugWalkStuckHotspotThreshold",
+            name = "└ Hotspot-drempel (clicks)",
+            description = "Aantal clicks op dezelfde tile binnen het tijdvenster vóór een waarschuwing. Aanbevolen 8–15.",
+            section = controlSection,
+            position = 9
+    )
+    default int debugWalkStuckHotspotThreshold() { return 10; }
+
+    @ConfigItem(
+            keyName = "debugWalkStuckHotspotWindowSec",
+            name = "└ Hotspot-tijdvenster (sec)",
+            description = "Tijdvenster waarbinnen de clicks geteld worden. Bijv. 120 = 'als bot 10x op dezelfde tile klikt in 2 minuten → waarschuwing'.",
+            section = controlSection,
+            position = 10
+    )
+    default int debugWalkStuckHotspotWindowSec() { return 120; }
+
+    @ConfigItem(
+            keyName = "debugMouseOverlay",
+            name = "Debug: toon muispositie overlay",
+            description = "Toont een cursor-markering + X/Y in-game zodat je precies ziet waar de muis staat.",
+            section = controlSection,
+            position = 5
+    )
+    default boolean debugMouseOverlay() { return false; }
 
     // ===================== COMBAT =====================
 
@@ -535,6 +599,17 @@ public interface CombatBotConfig extends Config {
 
     @ConfigItem(keyName = "lootDelayMaxSeconds", name = "Max. wachttijd (sec)", description = "Optioneel: max seconden (0 = alleen kills tellen)", section = lootSection, position = 9)
     default int lootDelayMaxSeconds() { return 0; }
+
+    @ConfigItem(
+            keyName = "eatToMakeSpaceForLoot",
+            name = "Eet om ruimte vrij te maken voor loot",
+            description = "Als je inventory vol is, er ligt loot op de grond (geen bones/ashes) en je HP is niet vol → "
+                    + "eet 1 portie food om een slot vrij te maken. Werkt voor alle skills die looten "
+                    + "(Combat, Giants, Imps, Barb-loot). Bury/scatter heeft altijd voorrang.",
+            section = lootSection,
+            position = 10
+    )
+    default boolean eatToMakeSpaceForLoot() { return true; }
 
     // ===================== BANKING =====================
 
@@ -1140,13 +1215,10 @@ public interface CombatBotConfig extends Config {
     @ConfigItem(keyName = "tutCompletedAccountsBlob", name = "Tut complete per account (intern)", description = "Per RSN: Tutorial Island eenmalig voltooid", section = jagexPasteSection, position = 9)
     default String tutCompletedAccountsBlob() { return ""; }
 
-    @ConfigItem(keyName = "accountsUseGlobalCenterListsOnly", name = "Accounts: alleen globale centers", description = "Als aan: bij geladen Jagex-account altijd de volledige center-lijsten van de Centers-tab; eigen locaties in Account bewerken worden genegeerd. Per skill blijft wel gelden of dat account die skill gebruikt (vink in Bewerken).", section = jagexPasteSection, position = 10)
-    default boolean accountsUseGlobalCenterListsOnly() { return false; }
-
-    @ConfigItem(keyName = "accountBehaviorProfileBlob", name = "Gedragsprofiel per RSN (intern)", description = "Per account: seed|delay%|anti-ban gewichten|struggle|fatigue|failureNudge (0–10, +5%/stap op delay; decay bij bank sluiten; +1 bij stuck-recovery); niet handmatig knoeien", section = jagexPasteSection, position = 11)
+    @ConfigItem(keyName = "accountBehaviorProfileBlob", name = "Gedragsprofiel per RSN (intern)", description = "Per account: seed|delay%|anti-ban gewichten|struggle|fatigue|failureNudge (0–10, +5%/stap op delay; decay bij bank sluiten; +1 bij stuck-recovery); niet handmatig knoeien", section = jagexPasteSection, position = 10)
     default String accountBehaviorProfileBlob() { return ""; }
 
-    @ConfigItem(keyName = "accountsTableHideSuspectBanned", name = "Accounts-tabel: verberg ban-vermoeden", description = "Als aan: verberg rijen op de 👤 Accounts-tab waarvan hiscore-stats als mogelijk geband markeren.", section = jagexPasteSection, position = 12)
+    @ConfigItem(keyName = "accountsTableHideSuspectBanned", name = "Accounts-tabel: verberg ban-vermoeden", description = "Als aan: verberg rijen op de 👤 Accounts-tab waarvan hiscore-stats als mogelijk geband markeren.", section = jagexPasteSection, position = 11)
     default boolean accountsTableHideSuspectBanned() { return false; }
 
     // ===================== MOVEMENT (TRAVEL) =====================
@@ -1165,11 +1237,26 @@ public interface CombatBotConfig extends Config {
 
     // ===================== ANTI-BAN =====================
 
+    enum AntiBanIntensity {
+        LOW,
+        NORMAL,
+        HIGH
+    }
+
     @ConfigItem(keyName = "antiBanEnabled", name = "Anti-ban inschakelen", description = "Schakel het anti-ban systeem in", section = antiBanSection, position = 0)
     default boolean antiBanEnabled() { return true; }
 
     @ConfigItem(keyName = "antiBanFrequency", name = "Anti-ban frequentie", description = "Gemiddeld aantal seconden tussen anti-ban acties", section = antiBanSection, position = 1)
     default int antiBanFrequency() { return 45; }
+
+    @ConfigItem(
+            keyName = "antiBanIntensity",
+            name = "Anti-ban heftigheid",
+            description = "LOW = rustiger/minder vaak, NORMAL = standaard, HIGH = actiever/vaker.",
+            section = antiBanSection,
+            position = 1_1
+    )
+    default AntiBanIntensity antiBanIntensity() { return AntiBanIntensity.NORMAL; }
 
     @ConfigItem(keyName = "cameraMovement", name = "Camera bewegingen", description = "Willekeurige camera rotaties uitvoeren", section = antiBanSection, position = 2)
     default boolean cameraMovement() { return true; }
@@ -1285,21 +1372,129 @@ public interface CombatBotConfig extends Config {
     @ConfigItem(keyName = "randomMouseMovement", name = "Muis bewegingen", description = "Willekeurige muisbewegingen maken", section = antiBanSection, position = 6)
     default boolean randomMouseMovement() { return true; }
 
-    @ConfigItem(keyName = "misClickEnabled", name = "Misclicks inschakelen", description = "Simuleer af en toe een rechtermuisklik-misclick", section = antiBanSection, position = 7)
+    @ConfigItem(
+            keyName = "mouseFidgetEnabled",
+            name = "Continuous muis-fidget",
+            description = "Achtergrond-thread die tussen bot-acties continu kleine muis-bewegingen doet. "
+                    + "Mens-realisme: cursor staat nooit lang stil tijdens vechten/skillen. "
+                    + "Pauseert automatisch tijdens echte clicks zodat hij niet interfereert. "
+                    + "Pixel/duur ranges instelbaar via 'Fidget amp/duur' sliders hieronder.",
+            section = antiBanSection,
+            position = 7
+    )
+    default boolean mouseFidgetEnabled() { return true; }
+
+    @ConfigItem(
+            keyName = "mouseFidgetAmpMinPx",
+            name = "Fidget amplitude min (px)",
+            description = "Minimum afstand (in pixels) per fidget-beweging. Lager = subtieler. "
+                    + "Standaard 20 px. Aanbevolen 1–200.",
+            section = antiBanSection,
+            position = 50
+    )
+    default int mouseFidgetAmpMinPx() { return 20; }
+
+    @ConfigItem(
+            keyName = "mouseFidgetAmpMaxPx",
+            name = "Fidget amplitude max (px)",
+            description = "Maximum afstand (in pixels) per fidget-beweging. "
+                    + "Standaard 80 px. Aanbevolen 1–200.",
+            section = antiBanSection,
+            position = 51
+    )
+    default int mouseFidgetAmpMaxPx() { return 80; }
+
+    @ConfigItem(
+            keyName = "mouseFidgetDurMinMs",
+            name = "Fidget duur min (ms)",
+            description = "Minimum duur in ms van één smooth fidget-beweging. "
+                    + "Lager = sneller (kan houteriger ogen). Standaard 180. Aanbevolen 50–2000.",
+            section = antiBanSection,
+            position = 52
+    )
+    default int mouseFidgetDurMinMs() { return 180; }
+
+    @ConfigItem(
+            keyName = "mouseFidgetDurMaxMs",
+            name = "Fidget duur max (ms)",
+            description = "Maximum duur in ms van één smooth fidget-beweging. "
+                    + "Hoger = trager (loomer). Standaard 600. Aanbevolen 50–2000.",
+            section = antiBanSection,
+            position = 53
+    )
+    default int mouseFidgetDurMaxMs() { return 600; }
+
+    @ConfigItem(
+            keyName = "mouseMicroMoveAmpMinPx",
+            name = "Micro-move amplitude min (px)",
+            description = "Minimum afstand (px) van een micro-muisbeweging tussen bot-acties (toggle: 'Muis bewegingen'). "
+                    + "Standaard 30. Aanbevolen 1–300.",
+            section = antiBanSection,
+            position = 54
+    )
+    default int mouseMicroMoveAmpMinPx() { return 30; }
+
+    @ConfigItem(
+            keyName = "mouseMicroMoveAmpMaxPx",
+            name = "Micro-move amplitude max (px)",
+            description = "Maximum afstand (px) van een micro-muisbeweging. Standaard 110. "
+                    + "Aanbevolen 1–300. (HumanProfile kan de bovenkant nog oprekken o.b.v. jouw eigen p95.)",
+            section = antiBanSection,
+            position = 55
+    )
+    default int mouseMicroMoveAmpMaxPx() { return 110; }
+
+    @ConfigItem(
+            keyName = "mouseMicroMoveDurMinMs",
+            name = "Micro-move duur min (ms)",
+            description = "Minimum duur (ms) van één smooth micro-muisbeweging. Standaard 200. Aanbevolen 50–2000.",
+            section = antiBanSection,
+            position = 56
+    )
+    default int mouseMicroMoveDurMinMs() { return 200; }
+
+    @ConfigItem(
+            keyName = "mouseMicroMoveDurMaxMs",
+            name = "Micro-move duur max (ms)",
+            description = "Maximum duur (ms) van één smooth micro-muisbeweging. Standaard 600. Aanbevolen 50–2000.",
+            section = antiBanSection,
+            position = 57
+    )
+    default int mouseMicroMoveDurMaxMs() { return 600; }
+
+    @ConfigItem(keyName = "misClickEnabled", name = "Misclicks inschakelen", description = "Simuleer af en toe een rechtermuisklik-misclick", section = antiBanSection, position = 8)
     default boolean misClickEnabled() { return true; }
 
-    @ConfigItem(keyName = "misClickPercent", name = "Misclick kans %", description = "Percentage kans dat een misclick plaatsvindt (1-100)", section = antiBanSection, position = 8)
+    @ConfigItem(keyName = "misClickPercent", name = "Misclick kans %", description = "Percentage kans dat een misclick plaatsvindt (1-100)", section = antiBanSection, position = 9)
     default int misClickPercent() { return 8; }
 
-    @ConfigItem(keyName = "tabGlanceEnabled", name = "Tab-wissel (inventory)", description = "Anti-ban: willekeurige F-toets (F1,F2,F4–F8), 2–4 s wachten, dan ESC voor inventory. Op Tutorial Island: Storm Tabs.open (tab-widgets), geen F-toetsen. Frequentie volgt anti-ban seconden (random ½–1½×).", section = antiBanSection, position = 9)
+    @ConfigItem(keyName = "tabGlanceEnabled", name = "Tab-wissel (inventory)", description = "Anti-ban: willekeurige F-toets (F1,F2,F4–F8), 2–4 s wachten, dan ESC voor inventory. Op Tutorial Island: Storm Tabs.open (tab-widgets), geen F-toetsen. Frequentie volgt anti-ban seconden (random ½–1½×).", section = antiBanSection, position = 10)
     default boolean tabGlanceEnabled() { return true; }
 
-    @ConfigItem(keyName = "accountBehaviorProfileEnabled", name = "Per-RSN gedragsprofiel", description = "Elk account: eigen anti-ban-timing/gewichten + licht verschoven bank-nadertegels (zelfde seed als profiel; Lumbridge-traproute ongemoeid). Intern opgeslagen — geen ML.", section = antiBanSection, position = 10)
+    @ConfigItem(keyName = "accountBehaviorProfileEnabled", name = "Per-RSN gedragsprofiel", description = "Elk account: eigen anti-ban-timing/gewichten + licht verschoven bank-nadertegels (zelfde seed als profiel; Lumbridge-traproute ongemoeid). Intern opgeslagen — geen ML.", section = antiBanSection, position = 11)
     default boolean accountBehaviorProfileEnabled() { return true; }
+
+    @ConfigItem(
+            keyName = "playerLookupAntibanEnabled",
+            name = "Speler lookup (rechtsklik)",
+            description = "Anti-ban: af en toe op een random nearby speler rechtsklikken en Lookup kiezen (met geheugen, geen directe herhaling).",
+            section = antiBanSection,
+            position = 11
+    )
+    default boolean playerLookupAntibanEnabled() { return false; }
+
+    @ConfigItem(
+            keyName = "skillHoverEnabled",
+            name = "Skill hover (anti-ban)",
+            description = "Opent af en toe het Skills-paneel en hovert soepel ~1–2 sec op het icoon van de actieve skill (Attack/Strength/WC/etc.). Géén klik. Daarna terug naar Inventory. Voelt menselijk: 'ik kijk even hoe ver ik ben'.",
+            section = antiBanSection,
+            position = 12
+    )
+    default boolean skillHoverEnabled() { return true; }
 
     // ===================== GIANTS MODE =====================
 
-    @ConfigItem(keyName = "giantsMode", name = "🗡 Giants Mode", description = "Schakel Giants in als skill in de rotatie. Beheer via de Centers tab in de web GUI.", section = giantsSection, position = -1)
+    @ConfigItem(keyName = "giantsMode", name = "🗡 Giants Mode", description = "Standaard: Giants als skill in de rotatie (Edgeville Dungeon). Per account: Accounts → Bewerken → Giants rotatie (Globaal / aan / uit).", section = giantsSection, position = -1)
     default boolean giantsMode() { return false; }
 
     @ConfigItem(keyName = "giantsMonsterName", name = "Monster naam", description = "Naam van het monster om te killen (standaard: Hill Giant)", section = giantsSection, position = 0)
@@ -1337,6 +1532,24 @@ public interface CombatBotConfig extends Config {
 
     @ConfigItem(keyName = "giantsPreferVarrock", name = "Voorkeur Varrock ingang", description = "Gebruik de Varrock shed ingang (met brass key) als voorkeur. Uit = altijd Edgeville trapdoor.", section = giantsSection, position = 8)
     default boolean giantsPreferVarrock() { return true; }
+
+    @ConfigItem(
+            keyName = "giantsBankForFood",
+            name = "Giants: bank voor food",
+            description = "Onafhankelijke Giants-toggle. Zodra food in inventory onder de drempel komt → terug naar de bank, ongeacht HP. Werkt los van de globale 'Bank als food op' switch.",
+            section = giantsSection,
+            position = 9
+    )
+    default boolean giantsBankForFood() { return true; }
+
+    @ConfigItem(
+            keyName = "giantsLowFoodBankThreshold",
+            name = "Giants: food drempel",
+            description = "Onder dit aantal food in inventory loopt de bot terug naar de bank (ongeacht HP). 0 = uit (alleen bij 0 food). Voorkomt paniek-eat-loops in de dungeon.",
+            section = giantsSection,
+            position = 10
+    )
+    default int giantsLowFoodBankThreshold() { return 2; }
 
     // ===================== WEB GUI =====================
 
@@ -1381,6 +1594,30 @@ public interface CombatBotConfig extends Config {
             section = widgetInspectorSection,
             position = 6)
     default boolean gameplayMlClickLogOnlyAuthentic() { return true; }
+
+    @ConfigItem(
+            keyName = "gameplayMouseTraceLog",
+            name = "Record muis trace (move/click/drag)",
+            description = "Log ruwe muis-events naar combat-bot-mouse-trace-YYYY-MM-DD.jsonl (x,y,timing,click,drag). Gebruik dit om jouw handmatige speelstijl te analyseren.",
+            section = widgetInspectorSection,
+            position = 7)
+    default boolean gameplayMouseTraceLog() { return false; }
+
+    @ConfigItem(
+            keyName = "gameplayMouseTraceOnlyWhenBotOff",
+            name = "Mouse trace alleen met bot UIT",
+            description = "Aanbevolen voor pure handmatige data. Uit = ook events tijdens bot-run opnemen.",
+            section = widgetInspectorSection,
+            position = 8)
+    default boolean gameplayMouseTraceOnlyWhenBotOff() { return true; }
+
+    @ConfigItem(
+            keyName = "gameplayMouseTraceMoveSampleMs",
+            name = "Mouse trace move sample (ms)",
+            description = "Minimale tijd tussen move/drag samples (lager = gedetailleerder, groter bestand).",
+            section = widgetInspectorSection,
+            position = 9)
+    default int gameplayMouseTraceMoveSampleMs() { return 35; }
 
     // ===================== COMPATIBILITY =====================
     default String foodName() {

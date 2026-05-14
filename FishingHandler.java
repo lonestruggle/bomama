@@ -405,11 +405,12 @@ public class FishingHandler {
                     debug("determineState: spot te ver voor klik (" + d + " tiles) → WALKING_TO_SPOT");
                     return FishingState.WALKING_TO_SPOT;
                 }
-            } else if (myWp.distanceTo(fishingSpot) > 6) {
-                // Geen NPC in zoekgebied (niet geladen / rand van area): naar center zodat we niet op "wachten" blijven hangen
-                walkTargetSpot = fishingSpot;
+            } else if (MovementHelper.distanceToArea(myWp, fishingSpot, getEffectiveAreaRadius()) > 0) {
+                // Geen NPC geladen en nog buiten het werkgebied: loop naar een willekeurige tile
+                // ruim binnen de radius, niet naar de exacte center of rand.
+                walkTargetSpot = randomInnerFishingAreaTarget();
                 idleStartTime = 0;
-                debug("determineState: geen spot-NPC gevonden, loop naar center → WALKING_TO_SPOT");
+                debug("determineState: geen spot-NPC gevonden, loop naar random area target → WALKING_TO_SPOT");
                 return FishingState.WALKING_TO_SPOT;
             }
         }
@@ -1646,8 +1647,8 @@ public class FishingHandler {
                 if (rsn != null && !rsn.trim().isEmpty()) {
                     AccountStateJsonStore.AccountEntry e = AccountStateJsonStore.getEntry(rsn.trim());
                     if (e != null) {
-                        int snapCoins = Math.max(0, e.knownInventoryCoins) + Math.max(0, e.knownBankCoins);
-                        available = Math.max(available, snapCoins);
+                        long snapCoins = AccountStateJsonStore.knownCoinsApprox(e);
+                        available = Math.max(available, (int) Math.min(Integer.MAX_VALUE, snapCoins));
                     }
                 }
             } catch (Exception ignored) {
@@ -1823,9 +1824,6 @@ public class FishingHandler {
         if (local.isAnimating()) {
             return antiBan.varyDelay(randomDelay(600, 1200));
         }
-        if (local.isMoving()) {
-            return antiBan.varyDelay(randomDelay(400, 800));
-        }
         if (System.currentTimeMillis() - lastInteractTime < INTERACT_COOLDOWN_MS) {
             return antiBan.varyDelay(randomDelay(400, 800));
         }
@@ -1908,8 +1906,8 @@ public class FishingHandler {
             walkTargetSpot = findNearestFishingSpotPositionInArea(method, local);
             walkTargetSetTime = now;
             if (walkTargetSpot == null) {
-                debug("handleWalkingToSpot: fallback naar center");
-                walkTargetSpot = fishingSpot;
+                debug("handleWalkingToSpot: fallback naar random tile binnen radius");
+                walkTargetSpot = randomInnerFishingAreaTarget();
             }
         }
 
@@ -2028,6 +2026,14 @@ public class FishingHandler {
         lastTravelClickTime = now;
         paint.setLastAntiBanAction("↩ Terug naar vis spot");
         return antiBan.varyDelay(TravelWalkHelper.postClickDelayMs(config, random));
+    }
+
+    private WorldPoint randomInnerFishingAreaTarget() {
+        if (fishingSpot == null) return null;
+        int radius = getEffectiveAreaRadius();
+        int inner = radius <= 2 ? Math.max(1, radius)
+                : Math.max(1, Math.min(radius - 2, (int) Math.floor(radius * 0.70)));
+        return MovementHelper.getRandomPointInRadius(fishingSpot, inner);
     }
 
     private int handleIdleAtSpot() {

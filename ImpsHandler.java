@@ -277,6 +277,8 @@ public class ImpsHandler {
     private int meleeOpenerAirWithdrawAttempts = 0;
     private int meleeOpenerMindWithdrawAttempts = 0;
     private static final int MELEE_OPENER_RUNE_MAX_WITHDRAW_TRIES = 4;
+    /** Law voor Varrock/Fally/Lummy teleport tijdens gear prep; zelfde anti-loop als melee opener. */
+    private static final int TELEPORT_LAW_MAX_WITHDRAW_TRIES = 4;
 
     // GE locatie
     private static final WorldPoint GE_LOCATION = new WorldPoint(3164, 3487, 0);
@@ -1106,13 +1108,7 @@ public class ImpsHandler {
         if (inventoryOrEquipBestRangedBowProgressRank() >= Integer.MAX_VALUE) {
             return false;
         }
-        // Need 100+ arrows (any type) to be considered "adequate"
-        String[] arrowTypes = {"Bronze arrow", "Iron arrow", "Steel arrow", "Mithril arrow", "Adamant arrow", "Rune arrow"};
-        int totalArrows = 0;
-        for (String arrow : arrowTypes) {
-            totalArrows += getItemQuantity(arrow);
-        }
-        return totalArrows >= 100;
+        return getTotalArrows() >= 100;
     }
 
     private boolean hasMageSetup() {
@@ -3079,6 +3075,18 @@ public class ImpsHandler {
 
             return antiBan.varyDelay(randomDelay(1400, 2200));
         }
+
+        // Inv vol + er ligt nog imp-loot wat we willen → probeer 1 hap te eten om plek te maken.
+        if (loot != null && Inventory.isFull()) {
+            int eatDelay = EatForLootSpaceHelper.tryEatForSpace(
+                    config, false, 6, null, this::debugLog);
+            if (eatDelay > 0) {
+                paint.setCurrentStatus("🍗 Eet voor loot-ruimte");
+                lastLootPickupTime = System.currentTimeMillis();
+                return antiBan.varyDelay(eatDelay);
+            }
+        }
+
         // Geen loot meer gevonden - klaar
         pickingUpLoot = false;
         prioritizeSpecialLootUntil = 0;
@@ -3246,14 +3254,61 @@ public class ImpsHandler {
         return false;
     }
 
-    /** Tel het totaal aantal arrows (alle types) in equipment + inventory. */
+    /** Tel arrows: inventory-stacks + ammo in quiver (Equipment-telling dekt sommige clients niet). */
     private int getTotalArrows() {
         String[] arrowTypes = {"Bronze arrow", "Iron arrow", "Steel arrow", "Mithril arrow", "Adamant arrow", "Rune arrow"};
-        int total = 0;
+        int fromInv = 0;
         for (String arrow : arrowTypes) {
-            total += getItemQuantity(arrow);
+            fromInv += getInventoryQuantityIncludingStacks(arrow);
         }
-        return total;
+        int fromQuiver = 0;
+        try {
+            fromQuiver = RangedAmmoKit.getEquippedRangedAmmoQuantity();
+        } catch (Throwable ignored) {
+        }
+        return fromInv + fromQuiver;
+    }
+
+    /**
+     * Law rune start vaak een nieuwe stack; bij 0 vrije slots faalt withdraw stil.
+     * Bunker overtollige elementaire runes (niet Law) of arrows boven trip-minimum.
+     */
+    private int tryMakeFreeSlotForTeleportLawRunes() {
+        if (!Bank.isOpen()) {
+            return -1;
+        }
+        if (Inventory.getFreeSlots() >= 1) {
+            return -1;
+        }
+        if (getItemQuantity("Law rune") > 0) {
+            return -1;
+        }
+        String[] trimRunes = {"Mind rune", "Air rune", "Water rune", "Earth rune", "Fire rune", "Chaos rune"};
+        for (String name : trimRunes) {
+            int inv = getInventoryQuantityIncludingStacks(name);
+            if (inv > 150) {
+                int dep = inv - 100;
+                Bank.deposit(name, dep);
+                chatLog("[gear-prep] " + name + " deels gebunkerd (-" + dep + ") voor Law-rune slot");
+                return antiBan.varyDelay(randomDelay(500, 900));
+            }
+        }
+        int totalArr = getTotalArrows();
+        if (totalArr > 160) {
+            String[] arrowTypes = {"Bronze arrow", "Iron arrow", "Steel arrow", "Mithril arrow", "Adamant arrow", "Rune arrow"};
+            for (String arrow : arrowTypes) {
+                int inv = getInventoryQuantityIncludingStacks(arrow);
+                if (inv > 120) {
+                    int dep = Math.min(inv - 80, totalArr - 100);
+                    if (dep > 0) {
+                        Bank.deposit(arrow, dep);
+                        chatLog("[gear-prep] " + arrow + " deels gebunkerd (-" + dep + ") voor Law-rune slot");
+                        return antiBan.varyDelay(randomDelay(500, 900));
+                    }
+                }
+            }
+        }
+        return -1;
     }
 
     private boolean shouldStartBanking() {
@@ -3611,6 +3666,35 @@ public class ImpsHandler {
 
         paint.setCurrentStatus("Imps: Zoeken deposit box...");
         return antiBan.varyDelay(randomDelay(1200, 1800));
+    }
+
+    private String[] amuletOrderForStyle(CombatBotConfig.ImpsCombatStyle style) {
+        if (style == CombatBotConfig.ImpsCombatStyle.MAGE) {
+            return new String[]{"Amulet of magic", "Amulet of power", "Amulet of accuracy", "Amulet of defence"};
+        }
+        if (style == CombatBotConfig.ImpsCombatStyle.MELEE) {
+            return new String[]{"Amulet of strength", "Amulet of power", "Amulet of accuracy", "Amulet of defence"};
+        }
+        return new String[]{"Amulet of power", "Amulet of accuracy", "Amulet of defence"};
+    }
+
+    private String bestInventoryAmuletForStyle(CombatBotConfig.ImpsCombatStyle style) {
+        for (String amulet : amuletOrderForStyle(style)) {
+            if (Inventory.contains(item -> item != null && item.getName() != null
+                    && item.getName().equalsIgnoreCase(amulet))) {
+                return amulet;
+            }
+        }
+        return null;
+    }
+
+    private String bestBankAmuletForStyle(CombatBotConfig.ImpsCombatStyle style) {
+        for (String amulet : amuletOrderForStyle(style)) {
+            if (Bank.contains(amulet)) {
+                return amulet;
+            }
+        }
+        return null;
     }
 
     /**
@@ -4530,6 +4614,17 @@ public class ImpsHandler {
         chatLog("[TP] Gear prep: " + label + " teleport -> daarna dichtstbijzijnde bank");
         paint.setCurrentStatus("Imps: [tp] " + label + " -> bank");
         try {
+            // Chronicle-pad heeft voorrang op de Varrock-spell als de account-toggle aan staat
+            // EN er een chronicle in inv ligt met charges (of cards om te laden).
+            if (teleportSpell == SpellBook.Standard.VARROCK_TELEPORT) {
+                String rsn = impsLocalRsnOrNull();
+                if (VarrockTeleportHelper.tryExecuteChronicleTeleport(rsn)) {
+                    chatLog("[TP] Chronicle (Diango) gebruikt i.p.v. Varrock-spell");
+                    lastTeleportTime = now;
+                    lastWalkClickTime = now;
+                    return antiBan.varyDelay(randomDelay(4800, 6800));
+                }
+            }
             Magic.cast(teleportSpell);
             lastTeleportTime = now;
             lastWalkClickTime = now;
@@ -4760,42 +4855,60 @@ public class ImpsHandler {
         // 4b. Alleen Law runes voor teleport (bv. Varrock naar GE) - 10 is genoeg
         if (config.impsUseVarrockTeleport() || config.impsUseFaladorTeleport() || config.impsUseLumbridgeTeleport()) {
             int law = getItemQuantity("Law rune");
-            if (law < 10) {
-                if (bankHasUsableItemNamed("Law rune") && teleportRuneWithdrawAttempts < 3) {
+            if (law >= 10) {
+                teleportRuneWithdrawAttempts = 0;
+            } else if (!bankHasUsableItemNamed("Law rune")
+                    && config.impsTeleportBuyRunes()
+                    && getCoinCount() >= config.impsLawRuneBuyPrice() * 15) {
+                chatLog("[GE] Te weinig Law runes in bank -> naar GE om te kopen");
+                isBuyingLawRunesAtGe = true;
+                buyLawRunesStep = 0;
+                teleportRuneWithdrawAttempts = 0;
+                Bank.close();
+                return antiBan.varyDelay(randomDelay(600, 1000));
+            } else if (bankHasUsableItemNamed("Law rune")) {
+                if (Inventory.getFreeSlots() < 1) {
+                    int makeRoom = tryMakeFreeSlotForTeleportLawRunes();
+                    if (makeRoom >= 0) {
+                        return makeRoom;
+                    }
+                }
+                if (teleportRuneWithdrawAttempts < TELEPORT_LAW_MAX_WITHDRAW_TRIES) {
+                    int before = law;
                     teleportRuneWithdrawAttempts++;
                     Bank.withdraw("Law rune", 10);
                     chatLog("Law runes opgehaald (10) voor teleports");
+                    if (!waitUntilItemQuantityIncreases("Law rune", before, 2500)) {
+                        chatLog("[!] Gear prep: Law withdraw geen effect (voor=" + before + ", nu=" + getItemQuantity("Law rune")
+                                + ") — volle inv of noted withdraw?");
+                    }
                     return antiBan.varyDelay(randomDelay(500, 900));
                 }
-                if (!bankHasUsableItemNamed("Law rune")
-                        && config.impsTeleportBuyRunes()
-                        && getCoinCount() >= config.impsLawRuneBuyPrice() * 15) {
-                    chatLog("[GE] Te weinig Law runes in bank -> naar GE om te kopen");
-                    isBuyingLawRunesAtGe = true;
-                    buyLawRunesStep = 0;
-                    teleportRuneWithdrawAttempts = 0;
-                    Bank.close();
+                chatLog("[!] Gear prep: stop Law withdraw na " + TELEPORT_LAW_MAX_WITHDRAW_TRIES + " pogingen (law="
+                        + getItemQuantity("Law rune") + ") — ga verder met gear");
+            }
+        }
+
+        // 4c. Beste amulet per style: niet alleen Amulet of power.
+        boolean amuletEquipped = Equipment.contains(item -> item != null && item.getName() != null
+                && item.getName().toLowerCase().contains("amulet"));
+        if (!amuletEquipped) {
+            String invAmulet = bestInventoryAmuletForStyle(style);
+            if (invAmulet != null) {
+                IInventoryItem amulet = Inventory.getFirst(item -> item != null && item.getName() != null
+                        && item.getName().equalsIgnoreCase(invAmulet));
+                if (amulet != null) {
+                    amulet.interact(amulet.hasAction("Wear") ? "Wear" : "Wield");
+                    chatLog(invAmulet + " aangedaan");
                     return antiBan.varyDelay(randomDelay(600, 1000));
                 }
             }
-            teleportRuneWithdrawAttempts = 0;
-        }
-
-        // 4c. Amulet of power (gear prep voor elke style): trek aan als in inv, anders haal uit bank
-        boolean amuletEquipped = Equipment.contains(item -> item != null && item.getName() != null && item.getName().equalsIgnoreCase("Amulet of power"));
-        if (!amuletEquipped && Inventory.contains(item -> item != null && item.getName() != null && item.getName().equalsIgnoreCase("Amulet of power"))) {
-            IInventoryItem amulet = Inventory.getFirst(item -> item != null && item.getName() != null && item.getName().equalsIgnoreCase("Amulet of power"));
-            if (amulet != null) {
-                amulet.interact(amulet.hasAction("Wear") ? "Wear" : "Wield");
-                chatLog("Amulet of power aangedaan");
-                return antiBan.varyDelay(randomDelay(600, 1000));
+            String bankAmulet = bestBankAmuletForStyle(style);
+            if (bankAmulet != null) {
+                Bank.withdraw(bankAmulet, 1);
+                chatLog(bankAmulet + " opgehaald uit bank");
+                return antiBan.varyDelay(randomDelay(500, 900));
             }
-        }
-        if (!amuletEquipped && !Inventory.contains(item -> item != null && item.getName() != null && item.getName().equalsIgnoreCase("Amulet of power"))
-                && Bank.contains("Amulet of power")) {
-            Bank.withdraw("Amulet of power", 1);
-            chatLog("Amulet of power opgehaald uit bank");
-            return antiBan.varyDelay(randomDelay(500, 900));
         }
 
         // 5. Check of we nu adequate gear hebben (incl. Fire Strike air-gate alleen voor MAGE)
@@ -6815,6 +6928,14 @@ public class ImpsHandler {
                 // Probeer Varrock teleport te gebruiken als dat geactiveerd is en zinvol is
                 if (config.impsUseVarrockTeleport() && !varrockTeleportUsedThisGeTrip) {
                     SpellBook.Standard varrockTele = SpellBook.Standard.VARROCK_TELEPORT;
+                    String rsnTp = impsLocalRsnOrNull();
+                    boolean canChronicle = VarrockTeleportHelper.tryExecuteChronicleTeleport(rsnTp);
+                    if (canChronicle) {
+                        chatLog("[TP] Chronicle (Diango) gebruikt i.p.v. Varrock-spell -> GE");
+                        lastTeleportTime = now;
+                        varrockTeleportUsedThisGeTrip = true;
+                        return antiBan.varyDelay(randomDelay(5000, 7000));
+                    }
                     if (myPos.distanceTo(GE_LOCATION) > 40
                             && (now - lastTeleportTime) > TELEPORT_COOLDOWN_MS
                             && varrockTele.canCast()) {

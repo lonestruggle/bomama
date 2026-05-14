@@ -18,7 +18,9 @@ import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.MenuOpened;
 import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
+import net.runelite.api.widgets.Widget;
 import net.runelite.api.ChatMessageType;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.ui.ClientToolbar;
@@ -53,6 +55,9 @@ import java.nio.charset.StandardCharsets;
 import java.awt.Canvas;
 import java.awt.Image;
 import java.awt.Point;
+import java.awt.Rectangle;
+import java.awt.event.MouseEvent;
+import java.awt.event.MouseAdapter;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.time.ZoneId;
@@ -64,7 +69,6 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -72,6 +76,9 @@ import java.util.Random;
 import java.util.Set;
 import java.util.Locale;
 import java.util.function.BooleanSupplier;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 @PluginDescriptor(
         name = "Combat Bot",
@@ -113,6 +120,9 @@ public class CombatBotPlugin extends LoopedPlugin {
 
     @Inject
     private WidgetHoverOverlay widgetHoverOverlay;
+
+    @Inject
+    private MouseDebugOverlay mouseDebugOverlay;
 
     private CombatBotPaint paint;
     private AntiBan antiBan;
@@ -166,6 +176,8 @@ public class CombatBotPlugin extends LoopedPlugin {
     private int moneyImpsCashFarmTripsTarget = 0;
     private int moneyImpsCashFarmTripsStart = 0;
     private long lastBankSnapshotSyncMs = 0L;
+    /** Vorige tick: bank open geweest voor snapshot (rising edge = direct sync). */
+    private boolean bankSnapshotPrevOpen = false;
     private long lastQuestCalibrationSyncMs = 0L;
     /** Panel “reset”: volgende fresh start laadt starter-fase niet uit account-JSON. */
     private boolean ignoreStarterJsonOnNextFreshStart;
@@ -176,6 +188,16 @@ public class CombatBotPlugin extends LoopedPlugin {
     /** Tijdens re-log: tekst-pings met ETA ( los van screenshot-interval; loop stopt vroeg tijdens pauze). */
     private long lastDiscordRelogPingMs = 0L;
     private long lastWidgetInspectorDumpMs = 0L;
+    /** Path-traversal tracker voor de Walk-klik overlay: laatste tile waarop we de speler zagen. */
+    private WorldPoint lastPathTraversalWp = null;
+    /** Click-destination tracker: laatste RuneLite local destination die als click-tile is gemarkeerd. */
+    private WorldPoint lastWalkDestinationWp = null;
+    /**
+     * Aantal aankomende game-ticks waarin we de actuele RL destination als click-tile registreren,
+     * ook als die nog niet gewijzigd is. Wordt bv. gezet na een minimap-click of een mislukte
+     * scene-decode zodat we de échte target-tile zeker te pakken krijgen.
+     */
+    private int pendingDestCaptureTicks = 0;
     private static final long DISCORD_RELOG_PING_INTERVAL_MS = 5L * 60L * 1000L;
     private long lastRandomEventActionMs = 0;
     private long lastLampSkillSelectMs = 0;
@@ -195,7 +217,7 @@ public class CombatBotPlugin extends LoopedPlugin {
      * Zie o.a. deadzone-config; IDs kunnen per revisie verschuiven — fallback blijft volledige scan.
      */
     private static final int[] LAMP_INTERFACE_GROUPS_PRIORITY = {
-            219, 229, 233, 134, 260, 261, 311, 312, 162, 163
+            240, 219, 229, 233, 134, 260, 261, 311, 312, 162, 163
     };
     /** Fragmenten in widget-tekst die samen met "confirm" op een lamp-skill scherm wijzen. */
     private static final String[] LAMP_SKILL_LABEL_FRAGMENTS = {
@@ -207,6 +229,10 @@ public class CombatBotPlugin extends LoopedPlugin {
     private static final Gson COMPACT_GSON = new Gson();
     private static final DateTimeFormatter CALIBRATION_TIME_FMT = DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm");
     private long lastLampInventoryInteractMs = 0;
+    private MouseAdapter gameplayMouseTraceListener;
+    private long gameplayMouseTraceLastMoveMs = 0L;
+    private long gameplayMouseTraceLastEventMs = 0L;
+    private boolean gameplayMouseTraceDragging = false;
 
     /**
      * Alternatieve widget-teksten per skill, voor als de interface niet exact {@link CombatBotConfig.GenieLampSkill#displayName()} gebruikt.
@@ -249,7 +275,13 @@ public class CombatBotPlugin extends LoopedPlugin {
             "pillory guard",
             "beekeeper",
             "security guard",
-            "certer"
+            "certer",
+            "giles",
+            "niles",
+            "miles"
+    ));
+    private static final Set<String> LAMP_COURIER_NAMES = new HashSet<>(Arrays.asList(
+            "giles", "niles", "miles"
     ));
     // Event-specifieke IDs kunnen hier uitgebreid worden zodra je ze in logs ziet.
     private static final Set<Integer> DISMISS_RANDOM_EVENT_IDS = new HashSet<>(List.of(
@@ -353,6 +385,7 @@ public class CombatBotPlugin extends LoopedPlugin {
         CombatBotRuntime.setActivePlugin(this);
         paint = new CombatBotPaint();
         antiBan = new AntiBan(config, paint);
+        antiBan.startFidgetWorker();
         accountSwitcher = new AccountSwitcher(config, paint);
         accountSwitcher.setOnRotationAccountReady(this::applyManagedCentersForDisplayName);
         accountSwitcher.setManagedJagexLoginPreparer(this::tryApplyManagedRowLoginForSwitcher);
@@ -379,6 +412,7 @@ public class CombatBotPlugin extends LoopedPlugin {
         overlayManager.add(areaOverlay);
         overlayManager.add(walkClickHighlightOverlay);
         overlayManager.add(widgetHoverOverlay);
+        overlayManager.add(mouseDebugOverlay);
         areaOverlay.setConfig(config);
         walkClickHighlightOverlay.setConfig(config);
         areaOverlay.setTileMarkerManager(tileMarkerManager);
@@ -387,6 +421,52 @@ public class CombatBotPlugin extends LoopedPlugin {
                 csv -> stormConfigManager.setConfiguration("combatbot", "debugWalkClickPersistedQueue",
                         csv == null ? "" : csv),
                 () -> config.debugWalkClickPersistedQueue());
+
+        // Auto-log walk-tile events naar JSONL — alleen als toggle aan staat (config-gated bij elke event).
+        MovementHelper.setWalkTileEventSink(line -> {
+            if (config.debugWalkAutoLogToDisk() && config.debugWalkClickOverlay()) {
+                DebugLog.appendWalkTilesJsonLine(line);
+            }
+        });
+
+        // Anti-ban: vraag de fidget-worker om ~1.2 sec rust voor elke walk-actie zodat
+        // synthetische muis-bewegingen niet bovenop een echte walk-/destinatie-click landen.
+        MovementHelper.setPreWalkActionHook(() -> {
+            if (antiBan != null) antiBan.notifyHandlerAction("walk", 1200);
+        });
+
+        // Per-account GE shop policy: GeShopPolicy bevraagt de huidige row van de ingelogde RSN.
+        GeShopPolicy.setCurrentRowSupplier(() ->
+                ManagedJagexAccountsStore.findRowForDisplayName(config, tryGetLocalRsn()));
+
+        // Scene-check predicate voor de walk-tile diagnose-knop: een WorldPoint zit in scene
+        // als LocalPoint.fromWorld een waarde teruggeeft (= overlay zou hem kunnen tekenen).
+        MovementHelper.setSceneInBoundsCheck(wp -> {
+            try {
+                if (wp == null || client == null) return false;
+                if (client.getGameState() != GameState.LOGGED_IN) return false;
+                return net.runelite.api.coords.LocalPoint.fromWorld(client, wp) != null;
+            } catch (Throwable ignored) {
+                return false;
+            }
+        });
+
+        // Polygon-check: kan de overlay-renderer hier echt een vlak tekenen?
+        // (camera/hoogte/occlusie kan in-scene tiles alsnog blokkeren)
+        MovementHelper.setPolygonRenderableCheck(wp -> {
+            try {
+                if (wp == null || client == null) return false;
+                if (client.getGameState() != GameState.LOGGED_IN) return false;
+                net.runelite.api.coords.LocalPoint lp = net.runelite.api.coords.LocalPoint.fromWorld(client, wp);
+                if (lp == null) return false;
+                return net.runelite.api.Perspective.getCanvasTilePoly(client, lp) != null;
+            } catch (Throwable ignored) {
+                return false;
+            }
+        });
+
+        // Hotspot-stuck waarschuwing — initieel uit configuratie laden.
+        applyWalkTileStuckConfig();
 
         // AreaMenuListener met center callbacks
         areaMenuListener = new AreaMenuListener();
@@ -448,7 +528,11 @@ public class CombatBotPlugin extends LoopedPlugin {
                 this::requestSwitchNow, this::requestNextAccountNow, this::requestSellNow, this::requestLoginNow, this::requestPanelLogout,
                 this::requestTestAutoLogin,
                 () -> accountSwitcher.reload(), this::prepareLoginFromManagedAccount,
-                this::resetAllBotStateFromPanel, this::emergencyStopAllFromPanel);
+                this::resetAllBotStateFromPanel, this::emergencyStopAllFromPanel,
+                this::requestTestPlayerLookupAntiban,
+                this::requestTestLampHoverWidgets,
+                this::requestTestHumanMicroMouse,
+                this::requestTestFidgetBurst);
 
         // Maak een eenvoudig icoon (16x16 gouden zwaard)
         BufferedImage icon = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
@@ -465,6 +549,7 @@ public class CombatBotPlugin extends LoopedPlugin {
                 .priority(5)
                 .build();
         clientToolbar.addNavigation(navButton);
+        installGameplayMouseTraceListener();
 
         // === HTTP Server starten ===
         httpServer = new ConfigHttpServer(config, stormConfigManager);
@@ -474,11 +559,14 @@ public class CombatBotPlugin extends LoopedPlugin {
     @Override
     public void shutDown() throws Exception {
         CombatBotRuntime.setActivePlugin(null);
+        if (antiBan != null) antiBan.stopFidgetWorker();
         overlayManager.remove(overlay);
         overlayManager.remove(areaOverlay);
         overlayManager.remove(walkClickHighlightOverlay);
         overlayManager.remove(widgetHoverOverlay);
+        overlayManager.remove(mouseDebugOverlay);
         saveTileMarkersToConfig();
+        uninstallGameplayMouseTraceListener();
 
         if (panel != null) panel.stopTimer();
         if (navButton != null) clientToolbar.removeNavigation(navButton);
@@ -495,12 +583,154 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
     }
 
+    private void installGameplayMouseTraceListener() {
+        uninstallGameplayMouseTraceListener();
+        if (client == null) {
+            return;
+        }
+        Canvas canvas = client.getCanvas();
+        if (canvas == null) {
+            return;
+        }
+        gameplayMouseTraceLastMoveMs = 0L;
+        gameplayMouseTraceLastEventMs = 0L;
+        gameplayMouseTraceDragging = false;
+        gameplayMouseTraceListener = new MouseAdapter() {
+            @Override
+            public void mouseMoved(MouseEvent e) {
+                logGameplayMouseTraceEvent("move", e, false);
+            }
+
+            @Override
+            public void mouseDragged(MouseEvent e) {
+                logGameplayMouseTraceEvent("drag_move", e, true);
+            }
+
+            @Override
+            public void mousePressed(MouseEvent e) {
+                gameplayMouseTraceDragging = true;
+                logGameplayMouseTraceEvent("press", e, false);
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                logGameplayMouseTraceEvent("release", e, false);
+                gameplayMouseTraceDragging = false;
+            }
+
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                logGameplayMouseTraceEvent("click", e, false);
+            }
+        };
+        canvas.addMouseListener(gameplayMouseTraceListener);
+        canvas.addMouseMotionListener(gameplayMouseTraceListener);
+    }
+
+    private void uninstallGameplayMouseTraceListener() {
+        if (client == null || gameplayMouseTraceListener == null) {
+            gameplayMouseTraceListener = null;
+            return;
+        }
+        Canvas canvas = client.getCanvas();
+        if (canvas != null) {
+            canvas.removeMouseListener(gameplayMouseTraceListener);
+            canvas.removeMouseMotionListener(gameplayMouseTraceListener);
+        }
+        gameplayMouseTraceListener = null;
+    }
+
+    private void logGameplayMouseTraceEvent(String type, MouseEvent e, boolean sampledMotion) {
+        if (!config.gameplayMouseTraceLog() || e == null) {
+            return;
+        }
+        if (config.gameplayMouseTraceOnlyWhenBotOff() && config.botEnabled()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (sampledMotion) {
+            int sampleMs = Math.max(10, config.gameplayMouseTraceMoveSampleMs());
+            if (gameplayMouseTraceLastMoveMs > 0 && now - gameplayMouseTraceLastMoveMs < sampleMs) {
+                return;
+            }
+            gameplayMouseTraceLastMoveMs = now;
+        }
+
+        JsonObject j = new JsonObject();
+        j.addProperty("t", now);
+        j.addProperty("type", type);
+        j.addProperty("x", e.getX());
+        j.addProperty("y", e.getY());
+        j.addProperty("button", e.getButton());
+        j.addProperty("modsEx", e.getModifiersEx());
+        j.addProperty("clickCount", e.getClickCount());
+        j.addProperty("dragging", gameplayMouseTraceDragging || "drag_move".equals(type));
+        j.addProperty("botEnabled", config.botEnabled());
+        j.addProperty("dt", gameplayMouseTraceLastEventMs > 0 ? now - gameplayMouseTraceLastEventMs : 0L);
+        gameplayMouseTraceLastEventMs = now;
+
+        DebugLog.appendMouseTraceJsonLine(COMPACT_GSON.toJson(j));
+    }
+
     /**
      * Logt gekozen menu-acties voor ML / replay-analyse: canvas-positie, optie, target, params.
      * NDJSON: {@code ~/.runelite/prive-logs/combat-bot-ml-clicks-YYYY-MM-DD.jsonl}; leesbare regels onder bron ML_CLICK.
      */
     @Subscribe
     public void onMenuOptionClicked(MenuOptionClicked event) {
+        // Walk-click overlay: registreer ELKE walk-actie (van bot of van mens) zodat de
+        // overlay alle daadwerkelijk geklikte tiles toont met een count erop.
+        // Dit is onafhankelijk van de ML-click logger hieronder.
+        // Alleen actief als master + sub-toggle voor click-tiles aan staan.
+        if (config.debugWalkClickOverlay() && config.debugWalkOverlayShowClickTiles()) {
+            try {
+                MenuAction ma = event.getMenuAction();
+                boolean isWalk = ma == MenuAction.WALK
+                        || (event.getMenuOption() != null
+                                && event.getMenuOption().equalsIgnoreCase("Walk here"));
+                if (isWalk) {
+                    int sceneX = event.getParam0();
+                    int sceneY = event.getParam1();
+                    boolean wasMinimap = isMouseInMinimapArea();
+                    WorldPoint clickWp = sceneToWorldClickTile(sceneX, sceneY);
+
+                    // Sanity-check: als de gedecodeerde tile onrealistisch ver weg ligt
+                    // (typisch bij minimap-clicks waar param0/param1 geen scene-coords zijn)
+                    // dan plannen we een fallback via de actuele RL destination.
+                    boolean decodeLooksOff = false;
+                    try {
+                        IPlayer lpz = Players.getLocal();
+                        if (clickWp != null && lpz != null && lpz.getWorldLocation() != null) {
+                            int dist = clickWp.distanceTo(lpz.getWorldLocation());
+                            // Game-view scene = 104x104; alles > ~80 vanaf speler is verdacht.
+                            if (dist > 80) {
+                                decodeLooksOff = true;
+                            }
+                        }
+                    } catch (Throwable ignored2) {
+                    }
+
+                    if (clickWp != null && !decodeLooksOff) {
+                        MovementHelper.recordExternalWalkClick(clickWp);
+                    }
+                    if (wasMinimap || clickWp == null || decodeLooksOff) {
+                        // Schedule een paar ticks fallback-capture op de echte RL destination.
+                        pendingDestCaptureTicks = Math.max(pendingDestCaptureTicks, 4);
+                    }
+
+                    // Live debug-info zodat je in de Debug-tab ziet wat er gebeurt bij élke walk-klik
+                    // (vooral handig om te zien wanneer er via de minimap geklikt wordt).
+                    DebugLog.log("WalkClickDbg", String.format(
+                            "WALK click: minimap=%s p0=%d p1=%d → wp=%s%s",
+                            wasMinimap ? "JA" : "nee",
+                            sceneX, sceneY,
+                            clickWp == null ? "(decode FAIL)" : (clickWp.getX() + "," + clickWp.getY() + ",p" + clickWp.getPlane()),
+                            decodeLooksOff ? " [decode_lijkt_fout]" : ""));
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
         if (!config.gameplayMlClickLog()) {
             return;
         }
@@ -573,6 +803,152 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
     }
 
+    /**
+     * Converteer params (uit MenuOptionClicked.getParam0/getParam1 voor WALK acties) naar
+     * een wereld-tile. Detecteert automatisch of de waarden tile-coords (0..103) zijn of
+     * LocalPoint-pixel-coords (~0..13312, 128 px per tile) — dat laatste komt voor bij
+     * walks die via {@code client.invokeMenuAction(...)} door de SDK gedispatcht worden.
+     * Geeft {@code null} als niet ingelogd of buiten bereik.
+     */
+    private WorldPoint sceneToWorldClickTile(int sceneX, int sceneY) {
+        if (client == null || client.getGameState() != GameState.LOGGED_IN) {
+            return null;
+        }
+        if (sceneX < 0 || sceneY < 0) {
+            return null;
+        }
+        try {
+            // Heuristiek: als params buiten scene-tile bereik vallen → behandel als
+            // LocalPoint pixel-coords (1 tile = Perspective.LOCAL_TILE_SIZE = 128 px).
+            int sx = sceneX;
+            int sy = sceneY;
+            if (sx > 103 || sy > 103) {
+                int ts = net.runelite.api.Perspective.LOCAL_TILE_SIZE; // 128
+                sx = sceneX / ts;
+                sy = sceneY / ts;
+            }
+            if (sx > 103 || sy > 103) {
+                // Nog te groot na conversie → onbruikbaar
+                return null;
+            }
+            WorldView wv = client.getTopLevelWorldView();
+            int plane = wv != null ? wv.getPlane() : client.getPlane();
+            return WorldPoint.fromScene(client, sx, sy, plane);
+        } catch (Throwable ignored) {
+            try {
+                int baseX = client.getBaseX();
+                int baseY = client.getBaseY();
+                int plane = client.getPlane();
+                return new WorldPoint(baseX + sceneX, baseY + sceneY, plane);
+            } catch (Throwable ignored2) {
+                return null;
+            }
+        }
+    }
+
+    /**
+     * Detecteert of de muis op het moment van een click in het minimap-vlak van het scherm zat.
+     * Heuristiek dekt zowel <i>fixed</i> als <i>resizable</i> layout: minimap zit altijd
+     * rechts-bovenin en is ~210 px breed.
+     */
+    private boolean isMouseInMinimapArea() {
+        try {
+            net.runelite.api.Point mp = client.getMouseCanvasPosition();
+            if (mp == null) return false;
+            int cw = client.getCanvasWidth();
+            int x = (int) mp.getX();
+            int y = (int) mp.getY();
+            // Minimap area: rechtsbovenin. Met wat marge zodat ook compass/orbs meetellen.
+            return x >= (cw - 250) && y >= 0 && y <= 200;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * Voor walk-click overlay: bepaal of de speler momenteel een NPC volgt/aanvalt.
+     * Tijdens NPC-follow hercomputeert de client elke tick het pad naar de bewegende NPC,
+     * waardoor {@link #localDestinationWorldPoint()} steeds verandert. Die updates zijn
+     * GEEN echte walk-clicks en moeten dus niet als click-tiles geregistreerd worden
+     * (anders krijg je een blauw spoor achter elke wegrennende vijand).
+     */
+    private boolean isInteractingWithNpcForOverlay() {
+        try {
+            IPlayer lp = Players.getLocal();
+            if (lp == null) return false;
+            Object target = lp.getInteracting();
+            return target instanceof INPC;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * RuneLite houdt tijdens lopen de actieve destination bij. Storm movement triggert niet
+     * altijd een normale {@link MenuOptionClicked}, dus dit vangt ook SDK-interne walk-clicks.
+     *
+     * BELANGRIJK: {@code client.getLocalDestinationLocation()} geeft een {@code LocalPoint}
+     * waarvan {@code getX()}/{@code getY()} de positie in <i>pixels</i> teruggeven (0–13312),
+     * niet tile-coords. We gebruiken {@code WorldPoint.fromLocal} dat de pixel→tile→world
+     * conversie correct uitvoert.
+     */
+    private WorldPoint localDestinationWorldPoint() {
+        if (client == null || client.getGameState() != GameState.LOGGED_IN) {
+            return null;
+        }
+        try {
+            java.lang.reflect.Method m = client.getClass().getMethod("getLocalDestinationLocation");
+            Object dst = m.invoke(client);
+            if (dst == null) {
+                return null;
+            }
+            if (dst instanceof net.runelite.api.coords.LocalPoint) {
+                return WorldPoint.fromLocal(client, (net.runelite.api.coords.LocalPoint) dst);
+            }
+            // Fallback voor SDK's die een ander type teruggeven: probeer getSceneX/getSceneY
+            // (tile-coords); geef NIET getX/getY door — dat zijn pixel-coords en geeft fantoom-WP's.
+            try {
+                java.lang.reflect.Method getSx = dst.getClass().getMethod("getSceneX");
+                java.lang.reflect.Method getSy = dst.getClass().getMethod("getSceneY");
+                Object osx = getSx.invoke(dst);
+                Object osy = getSy.invoke(dst);
+                if (osx instanceof Number && osy instanceof Number) {
+                    return sceneToWorldClickTile(((Number) osx).intValue(), ((Number) osy).intValue());
+                }
+            } catch (Throwable ignored2) {
+            }
+            return null;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Pakt de huidige hotspot-stuck instellingen uit de config en geeft ze door aan
+     * {@link MovementHelper}. Wordt aangeroepen bij startUp en elke loop-tick zodat
+     * config-changes direct doorwerken zonder restart.
+     */
+    private void applyWalkTileStuckConfig() {
+        if (config == null) {
+            return;
+        }
+        if (!config.debugWalkClickOverlay()
+                || !config.debugWalkOverlayShowClickTiles()
+                || !config.debugWalkStuckHotspotEnabled()) {
+            MovementHelper.setStuckHotspotConfig(null, 0, 60);
+            return;
+        }
+        int thr = Math.max(2, config.debugWalkStuckHotspotThreshold());
+        int win = Math.max(10, config.debugWalkStuckHotspotWindowSec());
+        MovementHelper.setStuckHotspotConfig((info, threshold, windowSec) -> {
+            if (info == null || info.point == null) return;
+            DebugLog.log("WalkHotspot", "⚠ Hotspot-stuck: tile " + info.point.getX() + ","
+                    + info.point.getY() + " (plane " + info.point.getPlane() + ") kreeg "
+                    + threshold + "+ clicks in " + windowSec + "s "
+                    + "(totaal clicks=" + info.count + ", traversals=" + info.traversals + ")");
+        }, thr, win);
+    }
+
     /** RuneLite: {@code isAuthentic()} op nieuwere clients; op oudere API {@code null} (= geen filter). */
     private static Boolean tryMenuOptionClickedAuthentic(MenuOptionClicked event) {
         if (event == null) {
@@ -623,6 +999,9 @@ public class CombatBotPlugin extends LoopedPlugin {
         if (fishingHandler != null) {
             fishingHandler.onGameMessage(msg);
         }
+        if (vampireSlayerQuestHandler != null) {
+            vampireSlayerQuestHandler.onChatMessage(msg);
+        }
     }
 
     /**
@@ -630,6 +1009,79 @@ public class CombatBotPlugin extends LoopedPlugin {
      */
     @Subscribe
     public void onGameTick(GameTick event) {
+        boolean trackClicks = config.debugWalkClickOverlay()
+                && config.debugWalkOverlayShowClickTiles()
+                && Game.isLoggedIn();
+        if (trackClicks) {
+            try {
+                WorldPoint dst = localDestinationWorldPoint();
+                boolean changed = dst != null && !dst.equals(lastWalkDestinationWp);
+                // Tijdens een pending-capture window registeren we de destination ook als
+                // hij niet veranderd is — handig na een minimap-klik waar de scene-decode faalde.
+                boolean forceCapture = pendingDestCaptureTicks > 0 && dst != null;
+                // NPC-follow / combat-volgen genereert élke tick een nieuwe destination omdat
+                // de client het pad naar de bewegende NPC hercomputeert. Dat is GEEN echte
+                // walk-click — als we dit zouden recorden krijg je een spoor van blauwe tiles
+                // achter elke wegrennende vijand. We skippen daarom alle destination-updates
+                // terwijl de speler een NPC als interact-target heeft.
+                boolean followingNpc = isInteractingWithNpcForOverlay();
+                if (changed) {
+                    if (followingNpc) {
+                        // Stilzwijgend bijwerken zonder te recorden — anders triggert de volgende
+                        // tick weer "changed" en zou de eerstvolgende ondanks de filter alsnog
+                        // worden gemarkeerd.
+                        lastWalkDestinationWp = dst;
+                    } else {
+                        MovementHelper.recordExternalWalkClick(dst);
+                        lastWalkDestinationWp = dst;
+                        DebugLog.log("WalkClickDbg", "destination → " + dst.getX() + "," + dst.getY()
+                                + ",p" + dst.getPlane() + (forceCapture ? " [pendingFallback]" : ""));
+                    }
+                } else if (forceCapture && !followingNpc) {
+                    // Re-record alleen als het niet al de laatste was om dubbele entries te voorkomen.
+                    if (lastWalkDestinationWp == null || !dst.equals(lastWalkDestinationWp)) {
+                        MovementHelper.recordExternalWalkClick(dst);
+                        lastWalkDestinationWp = dst;
+                        DebugLog.log("WalkClickDbg", "destination [forced] → " + dst.getX() + ","
+                                + dst.getY() + ",p" + dst.getPlane());
+                    }
+                } else if (dst == null) {
+                    lastWalkDestinationWp = null;
+                }
+                if (pendingDestCaptureTicks > 0) {
+                    pendingDestCaptureTicks--;
+                }
+            } catch (Throwable ignored) {
+            }
+        } else if (lastWalkDestinationWp != null) {
+            lastWalkDestinationWp = null;
+            pendingDestCaptureTicks = 0;
+        }
+
+        // Walk-klik overlay: log iedere tile-overgang van de speler als path-traversal
+        // (naast de "Walk here" klikken die we al via onMenuOptionClicked vangen).
+        // Hierdoor zie je het hele pad oplopen, niet alleen de eind-klik.
+        // Alleen actief als master + sub-toggle voor pad-tiles aan staan.
+        boolean trackPath = config.debugWalkClickOverlay()
+                && config.debugWalkOverlayShowPathTiles()
+                && Game.isLoggedIn();
+        if (trackPath) {
+            try {
+                IPlayer lp = Players.getLocal();
+                if (lp != null) {
+                    WorldPoint pos = lp.getWorldLocation();
+                    if (pos != null && !pos.equals(lastPathTraversalWp)) {
+                        MovementHelper.recordPathTileTraversal(pos);
+                        lastPathTraversalWp = pos;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        } else if (lastPathTraversalWp != null) {
+            // Overlay/sub-toggle uit → reset tracker zodat hij straks bij heractivatie fris start
+            lastPathTraversalWp = null;
+        }
+
         int interval = config.widgetInspectorIntervalSeconds();
         if (interval <= 0 || !Game.isLoggedIn()) {
             return;
@@ -659,6 +1111,7 @@ public class CombatBotPlugin extends LoopedPlugin {
         stormConfigManager.setConfiguration("combatbot", configKey, updated);
         refreshCentersForSkill(skill, updated);
         rememberCenterSnapshot(skill, updated);
+        syncCenterChangeAcrossManagedRow(skill, updated);
 
         if (skill == activeSkill) {
             setHandlerCenter(skill, point, CenterManager.DEFAULT_RADIUS);
@@ -676,6 +1129,7 @@ public class CombatBotPlugin extends LoopedPlugin {
         stormConfigManager.setConfiguration("combatbot", configKey, updated);
         refreshCentersForSkill(skill, updated);
         rememberCenterSnapshot(skill, updated);
+        syncCenterChangeAcrossManagedRow(skill, updated);
 
         if (skill == activeSkill) {
             CenterManager.Center newCenter = CenterManager.pickRandom(updated);
@@ -699,6 +1153,7 @@ public class CombatBotPlugin extends LoopedPlugin {
         stormConfigManager.setConfiguration("combatbot", configKey, updated);
         refreshCentersForSkill(skill, updated);
         rememberCenterSnapshot(skill, updated);
+        syncCenterChangeAcrossManagedRow(skill, updated);
 
         if (skill == activeSkill) {
             CenterManager.Center nearest = CenterManager.findNearest(updated, point);
@@ -709,6 +1164,87 @@ public class CombatBotPlugin extends LoopedPlugin {
 
         CenterManager.Center adj = CenterManager.findNearest(updated, point);
         paint.setLastAntiBanAction("📐 Radius: " + getSkillName(skill) + " r=" + (adj != null ? adj.radius : "?"));
+    }
+
+    /**
+     * Wordt aangeroepen na ELKE handmatige center-wijziging (in-game right-click én RuneLite-panel),
+     * zodat de in-memory master en — indien van toepassing — de huidige managed-account row
+     * niet stale raken. Anders wordt de nieuwe center bij de volgende {@link #applyManagedCentersForDisplayName}
+     * weer overschreven door de oude master/subset en lijkt het of het toevoegen "niet is opgeslagen".
+     */
+    private void syncCenterChangeAcrossManagedRow(ActiveSkill skill, String updated) {
+        if (applyingManagedCenters) {
+            return;
+        }
+        String value = nullToEmptyCenters(updated);
+
+        // 1) Master in-memory bijwerken. Dit is de bron-van-waarheid voor accounts die de globale
+        //    lijst gebruiken (useGlobal* = true + lege subset).
+        switch (skill) {
+            case COMBAT: masterCombatCenters = value; break;
+            case WOODCUTTING: masterWcCenters = value; break;
+            case MINING: masterMiningCenters = value; break;
+            case FISHING: masterFishingCenters = value; break;
+            case IMPS: masterImpsCenters = value; break;
+            default: return;
+        }
+
+        // 2) Als de huidige account een eigen subset gebruikt voor deze skill, die subset ook
+        //    bijwerken en de blob persist'en — anders gaat de nieuwe center verloren bij de
+        //    volgende account-switch.
+        try {
+            String label = tryGetLocalRsn();
+            if ((label == null || label.trim().isEmpty())
+                    && accountSwitcher != null && accountSwitcher.getAccountCount() > 0) {
+                label = accountSwitcher.getCurrentAccountName();
+            }
+            if (label == null || label.trim().isEmpty()) {
+                return;
+            }
+            String blob = config.managedJagexAccountsBlob();
+            if (blob == null || blob.trim().isEmpty()) {
+                return;
+            }
+            java.util.List<ManagedJagexAccountsStore.ManagedJagexAccountRow> rows =
+                    new java.util.ArrayList<>(ManagedJagexAccountsStore.parseRows(blob));
+            boolean changed = false;
+            for (ManagedJagexAccountsStore.ManagedJagexAccountRow r : rows) {
+                if (r == null || r.displayName == null) continue;
+                if (!r.displayName.equalsIgnoreCase(label.trim())) continue;
+                boolean rowHasSubset = false;
+                switch (skill) {
+                    case COMBAT:
+                        rowHasSubset = r.useGlobalCombatCenters && r.combatCenters != null && !r.combatCenters.trim().isEmpty();
+                        if (rowHasSubset) { r.combatCenters = value; changed = true; }
+                        break;
+                    case WOODCUTTING:
+                        rowHasSubset = r.useGlobalWcCenters && r.wcCenters != null && !r.wcCenters.trim().isEmpty();
+                        if (rowHasSubset) { r.wcCenters = value; changed = true; }
+                        break;
+                    case MINING:
+                        rowHasSubset = r.useGlobalMiningCenters && r.miningCenters != null && !r.miningCenters.trim().isEmpty();
+                        if (rowHasSubset) { r.miningCenters = value; changed = true; }
+                        break;
+                    case FISHING:
+                        rowHasSubset = r.useGlobalFishingCenters && r.fishingCenters != null && !r.fishingCenters.trim().isEmpty();
+                        if (rowHasSubset) { r.fishingCenters = value; changed = true; }
+                        break;
+                    case IMPS:
+                        rowHasSubset = r.useGlobalImpsCenters && r.impsCenters != null && !r.impsCenters.trim().isEmpty();
+                        if (rowHasSubset) { r.impsCenters = value; changed = true; }
+                        break;
+                    default: break;
+                }
+                break;
+            }
+            if (changed) {
+                ManagedJagexAccountsStore.persist(stormConfigManager, rows);
+                DebugLog.log("Centers", "Persistente per-account subset bijgewerkt voor "
+                        + label + " (" + getSkillName(skill) + ")");
+            }
+        } catch (Throwable t) {
+            DebugLog.log("Centers", "syncCenterChangeAcrossManagedRow fout: " + t.getMessage());
+        }
     }
 
     private void refreshCentersForSkill(ActiveSkill skill, String centersData) {
@@ -777,6 +1313,7 @@ public class CombatBotPlugin extends LoopedPlugin {
             snapCombatCenters = c;
             if (!applyingManagedCenters) {
                 masterCombatCenters = c;
+                syncCenterChangeAcrossManagedRow(ActiveSkill.COMBAT, c);
             }
             loadAndSetForSkill(ActiveSkill.COMBAT, c);
             any = true;
@@ -785,6 +1322,7 @@ public class CombatBotPlugin extends LoopedPlugin {
             snapWcCenters = c;
             if (!applyingManagedCenters) {
                 masterWcCenters = c;
+                syncCenterChangeAcrossManagedRow(ActiveSkill.WOODCUTTING, c);
             }
             loadAndSetForSkill(ActiveSkill.WOODCUTTING, c);
             any = true;
@@ -793,6 +1331,7 @@ public class CombatBotPlugin extends LoopedPlugin {
             snapMiningCenters = c;
             if (!applyingManagedCenters) {
                 masterMiningCenters = c;
+                syncCenterChangeAcrossManagedRow(ActiveSkill.MINING, c);
             }
             loadAndSetForSkill(ActiveSkill.MINING, c);
             any = true;
@@ -801,6 +1340,7 @@ public class CombatBotPlugin extends LoopedPlugin {
             snapFishingCenters = c;
             if (!applyingManagedCenters) {
                 masterFishingCenters = c;
+                syncCenterChangeAcrossManagedRow(ActiveSkill.FISHING, c);
             }
             loadAndSetForSkill(ActiveSkill.FISHING, c);
             any = true;
@@ -809,6 +1349,7 @@ public class CombatBotPlugin extends LoopedPlugin {
             snapImpsCenters = c;
             if (!applyingManagedCenters) {
                 masterImpsCenters = c;
+                syncCenterChangeAcrossManagedRow(ActiveSkill.IMPS, c);
             }
             loadAndSetForSkill(ActiveSkill.IMPS, c);
             any = true;
@@ -937,6 +1478,7 @@ public class CombatBotPlugin extends LoopedPlugin {
     public int loop() {
         MovementHelper.setForceLargeStepMode(config.impsForceLargeSteps());
         MovementHelper.setDebugWalkHighlightEnabled(config.debugWalkClickOverlay());
+        applyWalkTileStuckConfig();
         if (Game.isLoggedIn()) {
             coldLoginAccountListPrimed = false;
         }
@@ -965,6 +1507,7 @@ public class CombatBotPlugin extends LoopedPlugin {
             wasBotEnabled = false;
             resetIdleStuckMonitor();
             prevTickBankOpen = false;
+            bankSnapshotPrevOpen = false;
             paint.setCurrentStatus("⏸ Bot gepauzeerd/gestopt — Start om verder te gaan");
             if (Game.isLoggedIn() && panelLogoutRequested) {
                 int panelOff = tickPanelLogoutWhileBotStopped();
@@ -1248,6 +1791,9 @@ public class CombatBotPlugin extends LoopedPlugin {
                     if (handleVampireSlayerOutOfFood()) {
                         return 1000;
                     }
+                    if (handleVampireSlayerStakeBlocked()) {
+                        return 800;
+                    }
                     paint.setActiveSkill(getSkillName(activeSkill));
                     return finalizePanelLogoutIfReady(qDelay);
                 } else {
@@ -1282,7 +1828,8 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
 
         if (activeSkill == ActiveSkill.STARTER) {
-            boolean rotationEnabled = config.barbarianMode() || config.wcEnabled() || config.miningEnabled() || config.fishingEnabled()
+            boolean rotationEnabled = getEnabledSkills().size() >= 2
+                    || config.barbarianMode() || config.wcEnabled() || config.miningEnabled() || config.fishingEnabled()
                     || config.barbLootEnabled() || barbLootSessionActive;
             paint.setRotationEnabled(rotationEnabled);
             paint.setActiveSkill(getSkillName(activeSkill));
@@ -1310,7 +1857,8 @@ public class CombatBotPlugin extends LoopedPlugin {
             return 1500;
         }
 
-        boolean rotationEnabled = config.barbarianMode() || config.wcEnabled() || config.miningEnabled() || config.fishingEnabled()
+        boolean rotationEnabled = getEnabledSkills().size() >= 2
+                || config.barbarianMode() || config.wcEnabled() || config.miningEnabled() || config.fishingEnabled()
                 || config.barbLootEnabled() || barbLootSessionActive;
         paint.setRotationEnabled(rotationEnabled);
         paint.setActiveSkill(getSkillName(activeSkill));
@@ -1333,7 +1881,7 @@ public class CombatBotPlugin extends LoopedPlugin {
             case WOODCUTTING: {
                 int wcDelay = woodcutterHandler.loop();
                 WoodcutterHandler.ImpsCashFarmRequest req = woodcutterHandler.pollImpsCashFarmRequest();
-                boolean impsAvailable = (CenterManager.countActive(config.impsCenters()) > 0) || config.impsMode();
+                boolean impsAvailable = effectiveImpsInRotation();
                 if (req != null && config.wcAxeCashViaImpsEnabled() && impsAvailable) {
                     wcImpsCashFarmActive = true;
                     wcImpsCashFarmTripsTarget = Math.max(1, req.estimatedImpsTrips);
@@ -1357,7 +1905,7 @@ public class CombatBotPlugin extends LoopedPlugin {
                 syncFishingCenterForTrainingLevel();
                 handlerDelay = fishingHandler.loop();
                 FishingHandler.ImpsCashFarmRequest fishReq = fishingHandler.pollImpsCashFarmRequest();
-                boolean impsAvailableForCash = (CenterManager.countActive(config.impsCenters()) > 0) || config.impsMode();
+                boolean impsAvailableForCash = effectiveImpsInRotation();
                 if (fishReq != null && impsAvailableForCash) {
                     moneyImpsCashFarmActive = true;
                     moneyImpsCashFarmReturnSkill = ActiveSkill.FISHING;
@@ -1444,6 +1992,9 @@ public class CombatBotPlugin extends LoopedPlugin {
                 if (handleVampireSlayerOutOfFood()) {
                     return 1000;
                 }
+                if (handleVampireSlayerStakeBlocked()) {
+                    return 800;
+                }
                 break;
             case COMBAT:
             default: handlerDelay = combatHandler.loop(); break;
@@ -1468,6 +2019,67 @@ public class CombatBotPlugin extends LoopedPlugin {
             wasBotEnabled = false;
             invokeGameLogoutOnClientThread();
         }
+        return true;
+    }
+
+    /**
+     * Stake-block recovery: als Dr Harlow de stake niet meer geeft en die ook niet in de bank
+     * ligt, kan de quest niet verder. We gaan dan NIET eindeloos wachten. Stappen:
+     *   1. Vampire Slayer quest-mode UIT zetten (anders pakt de priority-loop hem opnieuw).
+     *   2. Probeer een andere skill in de huidige rotation. Als er minstens één non-VS skill
+     *      enabled is, switch daar naartoe.
+     *   3. Geen alternatieve skill → account-switch.
+     *   4. Geen accounts beschikbaar → logout + botEnabled=false.
+     */
+    private boolean handleVampireSlayerStakeBlocked() {
+        if (vampireSlayerQuestHandler == null || !vampireSlayerQuestHandler.isQuestBlockedStakeMissing()) {
+            return false;
+        }
+        vampireSlayerQuestHandler.resetQuestBlockedStakeMissing();
+
+        // 1) Quest-mode uit zodat de priority-loop niet meteen weer VS pakt.
+        try {
+            stormConfigManager.setConfiguration("combatbot", "vampireSlayerQuestMode", "false");
+        } catch (Throwable ignored) {
+        }
+
+        // 2) Andere skill in rotation? Filter VS er uit; als er iets anders is, switch direct.
+        ActiveSkill fallback = null;
+        try {
+            List<ActiveSkill> enabled = getEnabledSkills();
+            for (ActiveSkill s : enabled) {
+                if (s != ActiveSkill.VAMPIRE_SLAYER) {
+                    fallback = s;
+                    break;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (fallback != null) {
+            paint.setLastAntiBanAction("⛔ Stake ontbreekt — VS uit, door naar " + getSkillName(fallback));
+            DebugLog.log("QUEST", "Stake-blocked: VS uitgeschakeld, switch naar " + fallback);
+            activeSkill = fallback;
+            resetHandlerForSkill(activeSkill);
+            resetSwitchTimer();
+            paint.setActiveSkill(getSkillName(activeSkill));
+            return true;
+        }
+
+        // 3) Geen alternatief → account-switch.
+        boolean switching = accountSwitcher != null
+                && accountSwitcher.requestImmediateSwitch("🔄 Vampire Slayer geblokkeerd (stake) — volgende account");
+        if (switching) {
+            paint.setLastAntiBanAction("⛔ Stake ontbreekt — geen andere skill, account-switch");
+            DebugLog.log("QUEST", "Stake-blocked: geen alt skill, account-switch gestart");
+            return true;
+        }
+
+        // 4) Geen accounts → logout.
+        paint.setLastAntiBanAction("⛔ Stake ontbreekt — geen alt skill/account, logout");
+        DebugLog.log("QUEST", "Stake-blocked: geen alt skill/account beschikbaar, bot uit + logout");
+        stormConfigManager.setConfiguration("combatbot", "botEnabled", "false");
+        wasBotEnabled = false;
+        invokeGameLogoutOnClientThread();
         return true;
     }
 
@@ -1511,9 +2123,13 @@ public class CombatBotPlugin extends LoopedPlugin {
                 return st == CombatBotConfig.ImpsCombatStyle.MELEE
                         ? config.impsMeleeTrainingStyle() : CombatBotConfig.MeleeTrainingStyle.BALANCED;
             }
-            case GIANTS:
-                return config.giantsCombatStyle() == CombatBotConfig.ImpsCombatStyle.MELEE
+            case GIANTS: {
+                String rsnG = tryGetLocalRsn();
+                CombatBotConfig.ImpsCombatStyle gst = ManagedJagexAccountsStore.resolveGiantsCombatStyleForDisplayName(
+                        config, rsnG != null ? rsnG : "");
+                return gst == CombatBotConfig.ImpsCombatStyle.MELEE
                         ? config.giantsMeleeTrainingStyle() : CombatBotConfig.MeleeTrainingStyle.BALANCED;
+            }
             default:
                 return CombatBotConfig.MeleeTrainingStyle.BALANCED;
         }
@@ -1531,9 +2147,12 @@ public class CombatBotPlugin extends LoopedPlugin {
                         config, rsnM != null ? rsnM : "") == CombatBotConfig.ImpsCombatStyle.MELEE;
                 break;
             }
-            case GIANTS:
-                meleeMode = config.giantsCombatStyle() == CombatBotConfig.ImpsCombatStyle.MELEE;
+            case GIANTS: {
+                String rsnGm = tryGetLocalRsn();
+                meleeMode = ManagedJagexAccountsStore.resolveGiantsCombatStyleForDisplayName(
+                        config, rsnGm != null ? rsnGm : "") == CombatBotConfig.ImpsCombatStyle.MELEE;
                 break;
+            }
             default:
                 meleeMode = false;
         }
@@ -1548,16 +2167,73 @@ public class CombatBotPlugin extends LoopedPlugin {
         int atk = Skills.getLevel(Skill.ATTACK);
         int str = Skills.getLevel(Skill.STRENGTH);
         int def = Skills.getLevel(Skill.DEFENCE);
-        if (row.targetAttackLevel > 0 && atk < row.targetAttackLevel) {
-            return CombatBotConfig.MeleeTrainingStyle.ATTACK;
+        return pickMeleeStyleByPriority(row, atk, str, def);
+    }
+
+    /**
+     * Bepaalt op basis van {@code row.targetMeleePriority} welke skill als eerste getraind wordt
+     * zolang die nog onder zijn target zit. "Lowest" varianten kiezen dynamisch op basis van
+     * absolute lvl of percentage onder target. Bij gelijkstand: vaste tiebreaker Att → Str → Def.
+     */
+    private CombatBotConfig.MeleeTrainingStyle pickMeleeStyleByPriority(
+            ManagedJagexAccountsStore.ManagedJagexAccountRow row, int atk, int str, int def) {
+        boolean atkBelow = row.targetAttackLevel > 0 && atk < row.targetAttackLevel;
+        boolean strBelow = row.targetStrengthLevel > 0 && str < row.targetStrengthLevel;
+        boolean defBelow = row.targetDefenceLevel > 0 && def < row.targetDefenceLevel;
+        if (!atkBelow && !strBelow && !defBelow) {
+            return CombatBotConfig.MeleeTrainingStyle.BALANCED;
         }
-        if (row.targetStrengthLevel > 0 && str < row.targetStrengthLevel) {
-            return CombatBotConfig.MeleeTrainingStyle.STRENGTH;
+        String mode = row.targetMeleePriority == null ? "" : row.targetMeleePriority.trim().toUpperCase();
+        switch (mode) {
+            case "LOWEST_FIRST":
+                return pickByLowestAbsolute(atk, str, def, atkBelow, strBelow, defBelow);
+            case "LOWEST_PCT_FIRST":
+                return pickByLowestPercent(row, atk, str, def, atkBelow, strBelow, defBelow);
+            case "STR_ATT_DEF":
+                if (strBelow) return CombatBotConfig.MeleeTrainingStyle.STRENGTH;
+                if (atkBelow) return CombatBotConfig.MeleeTrainingStyle.ATTACK;
+                return CombatBotConfig.MeleeTrainingStyle.DEFENCE;
+            case "DEF_ATT_STR":
+                if (defBelow) return CombatBotConfig.MeleeTrainingStyle.DEFENCE;
+                if (atkBelow) return CombatBotConfig.MeleeTrainingStyle.ATTACK;
+                return CombatBotConfig.MeleeTrainingStyle.STRENGTH;
+            case "":
+            case "ATT_STR_DEF":
+            default:
+                if (atkBelow) return CombatBotConfig.MeleeTrainingStyle.ATTACK;
+                if (strBelow) return CombatBotConfig.MeleeTrainingStyle.STRENGTH;
+                return CombatBotConfig.MeleeTrainingStyle.DEFENCE;
         }
-        if (row.targetDefenceLevel > 0 && def < row.targetDefenceLevel) {
-            return CombatBotConfig.MeleeTrainingStyle.DEFENCE;
+    }
+
+    private CombatBotConfig.MeleeTrainingStyle pickByLowestAbsolute(
+            int atk, int str, int def, boolean atkBelow, boolean strBelow, boolean defBelow) {
+        int bestLvl = Integer.MAX_VALUE;
+        CombatBotConfig.MeleeTrainingStyle best = CombatBotConfig.MeleeTrainingStyle.BALANCED;
+        if (atkBelow && atk < bestLvl) { bestLvl = atk; best = CombatBotConfig.MeleeTrainingStyle.ATTACK; }
+        if (strBelow && str < bestLvl) { bestLvl = str; best = CombatBotConfig.MeleeTrainingStyle.STRENGTH; }
+        if (defBelow && def < bestLvl) { best = CombatBotConfig.MeleeTrainingStyle.DEFENCE; }
+        return best;
+    }
+
+    private CombatBotConfig.MeleeTrainingStyle pickByLowestPercent(
+            ManagedJagexAccountsStore.ManagedJagexAccountRow row, int atk, int str, int def,
+            boolean atkBelow, boolean strBelow, boolean defBelow) {
+        double bestPct = Double.MAX_VALUE;
+        CombatBotConfig.MeleeTrainingStyle best = CombatBotConfig.MeleeTrainingStyle.BALANCED;
+        if (atkBelow) {
+            double pct = (double) atk / Math.max(1, row.targetAttackLevel);
+            if (pct < bestPct) { bestPct = pct; best = CombatBotConfig.MeleeTrainingStyle.ATTACK; }
         }
-        return CombatBotConfig.MeleeTrainingStyle.BALANCED;
+        if (strBelow) {
+            double pct = (double) str / Math.max(1, row.targetStrengthLevel);
+            if (pct < bestPct) { bestPct = pct; best = CombatBotConfig.MeleeTrainingStyle.STRENGTH; }
+        }
+        if (defBelow) {
+            double pct = (double) def / Math.max(1, row.targetDefenceLevel);
+            if (pct < bestPct) { best = CombatBotConfig.MeleeTrainingStyle.DEFENCE; }
+        }
+        return best;
     }
 
     private boolean activeContextWantsRangedCombat() {
@@ -1569,8 +2245,11 @@ public class CombatBotPlugin extends LoopedPlugin {
                 return ManagedJagexAccountsStore.resolveImpsCombatStyleForDisplayName(
                         config, rsn != null ? rsn : "") == CombatBotConfig.ImpsCombatStyle.RANGED;
             }
-            case GIANTS:
-                return config.giantsCombatStyle() == CombatBotConfig.ImpsCombatStyle.RANGED;
+            case GIANTS: {
+                String rsnGr = tryGetLocalRsn();
+                return ManagedJagexAccountsStore.resolveGiantsCombatStyleForDisplayName(
+                        config, rsnGr != null ? rsnGr : "") == CombatBotConfig.ImpsCombatStyle.RANGED;
+            }
             default:
                 return false;
         }
@@ -1971,8 +2650,29 @@ public class CombatBotPlugin extends LoopedPlugin {
 
     // ===================== Start Skill Resolutie =====================
 
+    /** Globale {@link CombatBotConfig#startSkill()}, tenzij dit account eigen center-lijsten heeft en een override zet. */
+    private CombatBotConfig.StartSkill effectiveStartSkillSetting() {
+        return effectiveStartSkillSettingForDisplayName(tryGetLocalRsn());
+    }
+
+    private CombatBotConfig.StartSkill effectiveStartSkillSettingForDisplayName(String displayName) {
+        ManagedJagexAccountsStore.ManagedJagexAccountRow row =
+                ManagedJagexAccountsStore.findRowForDisplayName(config, displayName);
+        if (row != null && !row.useGlobalCenterListsOnly) {
+            String ov = row.startSkillOverride != null ? row.startSkillOverride.trim() : "";
+            if (!ov.isEmpty()) {
+                try {
+                    return CombatBotConfig.StartSkill.valueOf(ov.toUpperCase(Locale.ROOT));
+                } catch (IllegalArgumentException ignored) {
+                    // onbekende waarde → globaal
+                }
+            }
+        }
+        return config.startSkill();
+    }
+
     private ActiveSkill resolveStartSkill() {
-        CombatBotConfig.StartSkill setting = config.startSkill();
+        CombatBotConfig.StartSkill setting = effectiveStartSkillSetting();
         List<ActiveSkill> enabled = getEnabledSkills();
         ActiveSkill fallback = enabled.isEmpty() ? ActiveSkill.COMBAT : enabled.get(0);
         ActiveSkill candidate = fallback;
@@ -2020,8 +2720,8 @@ public class CombatBotPlugin extends LoopedPlugin {
                 }
                 break;
             }
-            case IMPS:        candidate = (CenterManager.countActive(config.impsCenters()) > 0 || config.impsMode()) ? ActiveSkill.IMPS : fallback; break;
-            case GIANTS:      candidate = config.giantsMode() ? ActiveSkill.GIANTS : fallback; break;
+            case IMPS:        candidate = effectiveImpsInRotation() ? ActiveSkill.IMPS : fallback; break;
+            case GIANTS:      candidate = effectiveGiantsMode() ? ActiveSkill.GIANTS : fallback; break;
             case RANDOM: {
                 if (enabled.isEmpty()) return fallback;
                 return enabled.get(random.nextInt(enabled.size()));
@@ -2104,9 +2804,19 @@ public class CombatBotPlugin extends LoopedPlugin {
             starterSkillHandler.resetState();
         }
 
-        // Centers opnieuw laden
+        // Centers opnieuw laden. Belangrijk: bij managed accounts eerst de per-account centers
+        // toepassen en daarna pas resolveStartSkill() doen. Anders kan Start skill = Imps nog
+        // naar de vorige/globale impsCenters kijken en naar een andere skill fallbacken.
         loadCentersAndSetHandlers();
         captureCentersSnapshotFromConfig();
+        String managedCenterLabel = tryGetLocalRsn();
+        if ((managedCenterLabel == null || managedCenterLabel.trim().isEmpty())
+                && config.accountSwitchEnabled() && accountSwitcher.getAccountCount() > 0) {
+            managedCenterLabel = accountSwitcher.getCurrentAccountName();
+        }
+        if (managedCenterLabel != null && !managedCenterLabel.trim().isEmpty()) {
+            applyManagedCentersForDisplayName(managedCenterLabel);
+        }
 
         barbLootSessionActive = false;
         barbLootStartMagicCheckDone = false;
@@ -2132,9 +2842,6 @@ public class CombatBotPlugin extends LoopedPlugin {
         paint.setActiveSkill(getSkillName(activeSkill));
         paint.setLastAntiBanAction("▶ Fresh start — alles gereset");
         paint.setCurrentStatus("▶ Start skill: " + getSkillName(activeSkill));
-        if (config.accountSwitchEnabled() && accountSwitcher.getAccountCount() > 0) {
-            applyManagedCentersForDisplayName(accountSwitcher.getCurrentAccountName());
-        }
         DebugLog.log("StartSkill", "FreshStart activeSkill=" + getSkillName(activeSkill)
                 + " enabledNow=" + getEnabledSkills());
     }
@@ -2153,8 +2860,7 @@ public class CombatBotPlugin extends LoopedPlugin {
                 applyingManagedCenters = true;
                 try {
                     boolean any = false;
-                    boolean forceGlobal =
-                            config.accountsUseGlobalCenterListsOnly();
+                    boolean forceGlobal = r.useGlobalCenterListsOnly;
                     any |= setManagedCenterConfig("combatCenters", r.useGlobalCombatCenters,
                             forceGlobal ? "" : r.combatCenters, masterCombatCenters);
                     any |= setManagedCenterConfig("wcCenters", r.useGlobalWcCenters,
@@ -2391,18 +3097,29 @@ public class CombatBotPlugin extends LoopedPlugin {
 
         Object localWrapped = local.getWrapped();
         INPC randomNpc = NPCs.getNearest(npc -> {
-            if (npc == null || npc.getName() == null || npc.getInteracting() == null) {
+            if (npc == null || npc.getName() == null) {
+                return false;
+            }
+            if (npc.getWorldLocation() == null
+                    || npc.getWorldLocation().distanceTo(local.getWorldLocation()) > 6) {
+                return false;
+            }
+            String n = npc.getName().toLowerCase().trim();
+            // Random events van andere spelers kunnen óók dichtbij staan en óók "Dismiss" hebben.
+            // Daarom is Dismiss/naam/ID alleen een herkenning-signaal; we handelen pas als de NPC
+            // daadwerkelijk met onze local player interacteert.
+            boolean randomEventLike = npc.hasAction("Dismiss")
+                    || RANDOM_EVENT_NAMES.contains(n)
+                    || DISMISS_RANDOM_EVENT_IDS.contains(npc.getId());
+            if (!randomEventLike) {
                 return false;
             }
             Object interacting = npc.getInteracting();
-            boolean targetsLocal =
-                    interacting == local
-                            || interacting.equals(local)
-                            || (localWrapped != null
-                            && (interacting == localWrapped || interacting.equals(localWrapped)));
-            return targetsLocal
-                    && npc.getWorldLocation() != null
-                    && npc.getWorldLocation().distanceTo(local.getWorldLocation()) <= 6;
+            if (interacting == null) return false;
+            return interacting == local
+                    || interacting.equals(local)
+                    || (localWrapped != null
+                    && (interacting == localWrapped || interacting.equals(localWrapped)));
         });
         if (randomNpc == null || randomNpc.getName() == null) return 0;
 
@@ -2410,12 +3127,15 @@ public class CombatBotPlugin extends LoopedPlugin {
         int npcId = randomNpc.getId();
         boolean knownRandomByName = RANDOM_EVENT_NAMES.contains(name);
         boolean knownRandomById = DISMISS_RANDOM_EVENT_IDS.contains(npcId);
+        boolean hasDismiss = randomNpc.hasAction("Dismiss");
 
-        // Alleen handelen op bekende random events (naam/ID).
-        if (!knownRandomByName && !knownRandomById) return 0;
+        // Alleen handelen op bekende random events of NPC's met een Dismiss-actie.
+        if (!knownRandomByName && !knownRandomById && !hasDismiss) return 0;
 
         boolean isGenie = GENIE_NPC_IDS.contains(npcId) || name.contains("genie");
-        if (isGenie) {
+        boolean shouldKeepGenieLamp = config.genieLampSkill() != null
+                && config.genieLampSkill() != CombatBotConfig.GenieLampSkill.NONE;
+        if (isGenie && shouldKeepGenieLamp) {
             if (randomNpc.hasAction("Talk-to")) {
                 randomNpc.interact("Talk-to");
                 lastRandomEventActionMs = now;
@@ -2425,11 +3145,44 @@ public class CombatBotPlugin extends LoopedPlugin {
             return 0;
         }
 
-        if (randomNpc.hasAction("Dismiss")) {
+        if (hasDismiss) {
             randomNpc.interact("Dismiss");
             lastRandomEventActionMs = now;
-            paint.setLastAntiBanAction("👋 Random event dismissed");
+            paint.setLastAntiBanAction("👋 Random event dismissed: " + name);
             return 800 + random.nextInt(500);
+        }
+
+        // Lamp-koeriers (Giles/Niles/Miles): als Dismiss ontbreekt, Talk-to → XP-lamp.
+        boolean isLampCourier = LAMP_COURIER_NAMES.contains(name);
+        if (isLampCourier) {
+            if (Dialog.isOpen()) {
+                Dialog.continueSpace();
+                lastRandomEventActionMs = now;
+                paint.setLastAntiBanAction("📜 " + name + ": dialog doorklikken");
+                return 600 + random.nextInt(400);
+            }
+            if (randomNpc.hasAction("Talk-to")) {
+                randomNpc.interact("Talk-to");
+                lastRandomEventActionMs = now;
+                paint.setLastAntiBanAction("📜 " + name + " aanspreken");
+                return 900 + random.nextInt(600);
+            }
+            return 0;
+        }
+
+        // Fallback: bekende random event zonder Dismiss → toch praten zodat het scherm zich
+        // afsluit (bv. nieuwe varianten waar dismiss is verdwenen).
+        if (randomNpc.hasAction("Talk-to")) {
+            if (Dialog.isOpen()) {
+                Dialog.continueSpace();
+                lastRandomEventActionMs = now;
+                paint.setLastAntiBanAction("📜 " + name + ": dialog doorklikken");
+                return 600 + random.nextInt(400);
+            }
+            randomNpc.interact("Talk-to");
+            lastRandomEventActionMs = now;
+            paint.setLastAntiBanAction("📜 " + name + " aanspreken (geen Dismiss)");
+            return 900 + random.nextInt(600);
         }
         return 0;
     }
@@ -2633,33 +3386,40 @@ public class CombatBotPlugin extends LoopedPlugin {
         return false;
     }
 
+    /**
+     * Normale lamp: zelfde widget-bounds als {@link #runLampHoverWidgetTest} (vaste ids + keyword op 240),
+     * daarna linksklik i.p.v. alleen hover.
+     */
     private boolean clickLampWidgetByKeywordInLampGroup(String keyword) {
         if (keyword == null || keyword.isEmpty()) {
             return false;
         }
-        String lowKeyword = keyword.toLowerCase();
-        int group = lampInterfaceGroupHint;
+        String lowKeyword = keyword.toLowerCase(Locale.ROOT);
+        int group = lampInterfaceGroupHint >= 0 ? lampInterfaceGroupHint : findLampInterfaceGroup();
         if (group < 0) {
-            group = findLampInterfaceGroup();
+            group = 240;
         }
-        if (group < 0) {
-            return false;
+
+        Rectangle b = resolveLampWidgetBoundsLikeHoverTest(group, lowKeyword);
+        if (b != null && b.width > 0 && b.height > 0) {
+            return smoothMoveAndLeftClickLampWidget(b, "keyword '" + keyword + "'");
         }
 
         List<IWidget> candidates = new ArrayList<>();
         for (int child = 0; child <= 80; child++) {
             IWidget root = Widgets.get(group, child);
-            if (root == null || root.isHidden()) continue;
-            if (widgetNameContains(root, lowKeyword)) {
-                candidates.add(root);
+            if (root == null || root.isHidden()) {
+                continue;
             }
-            IWidget[] descendants = getWidgetChildren(root);
-            if (descendants == null) continue;
-            for (IWidget w : descendants) {
-                if (w == null || w.isHidden()) continue;
-                if (widgetNameContains(w, lowKeyword)) {
-                    candidates.add(w);
+            collectStormLampWidgetsMatching(root, lowKeyword, candidates);
+        }
+        if (group != 240) {
+            for (int child = 0; child <= 80; child++) {
+                IWidget root = Widgets.get(240, child);
+                if (root == null || root.isHidden()) {
+                    continue;
                 }
+                collectStormLampWidgetsMatching(root, lowKeyword, candidates);
             }
         }
         if (candidates.isEmpty()) {
@@ -2667,15 +3427,119 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
         Collections.shuffle(candidates, random);
         candidates.get(0).interact(0);
+        DebugLog.log("Lamp", "Storm interact(0) fallback keyword='" + keyword + "'");
         return true;
     }
 
+    /**
+     * Exact hetzelfde afwegingspatroon als de werkende lamp-hovertest: eerst keyword in RL-boom,
+     * daarna vaste children (confirm 27, attack 2, magic 5) en 240/24 fallbacks zoals in de test.
+     */
+    private Rectangle resolveLampWidgetBoundsLikeHoverTest(int group, String lowKeyword) {
+        Rectangle b = readWidgetBoundsByKeywordOnClientThread(group, lowKeyword);
+        if (b != null && b.width > 0 && b.height > 0) {
+            return b;
+        }
+        if ("confirm".equals(lowKeyword)) {
+            b = readWidgetBoundsOnClientThread(group, 27);
+            if (b != null && b.width > 0 && b.height > 0) {
+                return b;
+            }
+            b = readWidgetBoundsOnClientThread(240, 27);
+            if (b != null && b.width > 0 && b.height > 0) {
+                return b;
+            }
+            b = readWidgetBoundsOnClientThread(24, 27);
+            if (b != null && b.width > 0 && b.height > 0) {
+                return b;
+            }
+            return readWidgetBoundsByKeywordOnClientThread(240, lowKeyword);
+        }
+        if ("attack".equals(lowKeyword)) {
+            b = readWidgetBoundsOnClientThread(group, 2);
+            if (b != null && b.width > 0 && b.height > 0) {
+                return b;
+            }
+            return readWidgetBoundsOnClientThread(240, 2);
+        }
+        if ("magic".equals(lowKeyword)) {
+            b = readWidgetBoundsOnClientThread(group, 5);
+            if (b != null && b.width > 0 && b.height > 0) {
+                return b;
+            }
+            return readWidgetBoundsOnClientThread(240, 5);
+        }
+        if (group != 240) {
+            b = readWidgetBoundsByKeywordOnClientThread(240, lowKeyword);
+            if (b != null && b.width > 0 && b.height > 0) {
+                return b;
+            }
+        }
+        return null;
+    }
+
+    private void collectStormLampWidgetsMatching(IWidget node, String lowKeyword, List<IWidget> out) {
+        if (node == null || node.isHidden()) {
+            return;
+        }
+        if (widgetNameContains(node, lowKeyword)) {
+            out.add(node);
+        }
+        IWidget[] ch = getWidgetChildren(node);
+        if (ch == null) {
+            return;
+        }
+        for (IWidget c : ch) {
+            collectStormLampWidgetsMatching(c, lowKeyword, out);
+        }
+    }
+
+    /**
+     * Lamp- en UI-widgets tonen labels vaak in {@link IWidget#getText()} of actions, niet alleen in {@link IWidget#getName()}.
+     * Zonder text/actions-match faalt o.a. {@link #isLampLikeWidgetGroup} / {@link #findLampInterfaceGroup} terwijl vaste-id tests wél werken.
+     */
     private boolean widgetNameContains(IWidget widget, String keyword) {
-        if (widget == null || keyword == null || keyword.isEmpty()) return false;
-        String name = widget.getName();
-        if (name == null || name.isEmpty()) return false;
-        String cleaned = name.replaceAll("<[^>]*>", "").trim().toLowerCase();
-        return cleaned.contains(keyword);
+        if (widget == null || keyword == null || keyword.isEmpty()) {
+            return false;
+        }
+        String k = keyword.toLowerCase(Locale.ROOT);
+        String[] sources = new String[]{
+                safeWidgetText(widget),
+                widget.getName()
+        };
+        for (String src : sources) {
+            if (src == null || src.isEmpty()) {
+                continue;
+            }
+            String cleaned = src.replaceAll("<[^>]*>", "").trim().toLowerCase(Locale.ROOT);
+            if (cleaned.contains(k)) {
+                return true;
+            }
+        }
+        try {
+            String[] actions = widget.getActions();
+            if (actions != null) {
+                for (String a : actions) {
+                    if (a == null || a.isEmpty()) {
+                        continue;
+                    }
+                    String cleaned = a.replaceAll("<[^>]*>", "").trim().toLowerCase(Locale.ROOT);
+                    if (cleaned.contains(k)) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private String safeWidgetText(IWidget widget) {
+        try {
+            return widget.getText();
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     private IWidget[] getWidgetChildren(IWidget parent) {
@@ -3590,6 +4454,350 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
     }
 
+    public void requestTestPlayerLookupAntiban() {
+        if (antiBan == null) {
+            return;
+        }
+        int delay = antiBan.triggerPlayerLookupTest();
+        if (paint != null) {
+            paint.setLastAntiBanAction("🧪 Lookup test gestart");
+        }
+        if (delay > 0) {
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    public String requestTestHumanMicroMouse() {
+        if (antiBan == null) {
+            return "Anti-ban nog niet geïnitialiseerd";
+        }
+        try {
+            return antiBan.triggerHumanMicroMouseTest();
+        } catch (Throwable t) {
+            return "Fout: " + t.getMessage();
+        }
+    }
+
+    public String requestTestFidgetBurst() {
+        if (antiBan == null) {
+            return "Anti-ban nog niet geïnitialiseerd";
+        }
+        try {
+            return antiBan.triggerFidgetBurstTest();
+        } catch (Throwable t) {
+            return "Fout: " + t.getMessage();
+        }
+    }
+
+    public void requestTestLampHoverWidgets() {
+        Thread t = new Thread(this::runLampHoverWidgetTest, "combatbot-lamp-hover-test");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Oude werkende flow: vaste interface 240 (Attack 2, Magic 5, Confirm 27 + fallbacks), alleen hover. */
+    private void runLampHoverWidgetTest() {
+        try {
+            DebugLog.log("Lamp", "[TEST] Start lamp hover test");
+            clickLampInventoryOnceForTest();
+            sleepSafe(650, 1200);
+
+            hoverWidgetForTest(240, 2, "Attack");
+            sleepSafe(260, 480);
+            hoverWidgetForTest(240, 5, "Magic");
+            sleepSafe(260, 480);
+            if (!hoverWidgetForTest(240, 27, "Confirm")) {
+                if (!hoverWidgetForTest(24, 27, "Confirm fallback 24,27")) {
+                    hoverWidgetByKeywordForTest(240, "confirm", "Confirm keyword");
+                }
+            }
+
+            DebugLog.log("Lamp", "[TEST] Klaar lamp hover test");
+        } catch (Throwable t) {
+            DebugLog.log("Lamp", "[TEST] Fout: " + t.getMessage());
+        }
+    }
+
+    private void clickLampInventoryOnceForTest() {
+        try {
+            IInventoryItem lamp = Inventory.getFirst(i -> i != null && i.getId() == GENIE_LAMP_ITEM_ID);
+            if (lamp == null) {
+                DebugLog.log("Lamp", "[TEST] Geen lamp in inventory (id 2528)");
+                return;
+            }
+            if (lamp.hasAction("Rub")) {
+                lamp.interact("Rub");
+            } else if (lamp.hasAction("Use")) {
+                lamp.interact("Use");
+            } else {
+                lamp.interact(0);
+            }
+            DebugLog.log("Lamp", "[TEST] Lamp interact gedaan (Rub/Use)");
+        } catch (Throwable t) {
+            DebugLog.log("Lamp", "[TEST] Lamp interact fout: " + t.getMessage());
+        }
+    }
+
+    private boolean hoverWidgetForTest(int group, int child, String label) {
+        Rectangle b = readWidgetBoundsOnClientThread(group, child);
+        if (b == null || b.width <= 0 || b.height <= 0) {
+            DebugLog.log("Lamp", "[TEST] " + label + " widget niet gevonden: " + group + "," + child);
+            return false;
+        }
+        int x = b.x + Math.max(2, b.width / 2);
+        int y = b.y + Math.max(2, b.height / 2);
+        try {
+            Canvas canvas = net.storm.sdk.game.Client.getCanvas();
+            if (canvas != null) {
+                int maxX = Math.max(20, canvas.getWidth() - 3);
+                int maxY = Math.max(20, canvas.getHeight() - 3);
+                x = Math.max(3, Math.min(maxX, x));
+                y = Math.max(3, Math.min(maxY, y));
+                smoothHoverMoveTo(x, y, canvas);
+                sleepSafe(180, 320); // korte menselijke hover hold
+                if (paint != null) {
+                    paint.setLastAntiBanAction("🧞 Lamp test hover: " + label);
+                }
+                DebugLog.log("Lamp", "[TEST] Hover " + label + " -> (" + x + "," + y + ") bounds="
+                        + b.x + "," + b.y + " " + b.width + "x" + b.height);
+                return true;
+            }
+        } catch (Throwable t) {
+            DebugLog.log("Lamp", "[TEST] Hover " + label + " fout: " + t.getMessage());
+        }
+        return false;
+    }
+
+    private boolean hoverWidgetByKeywordForTest(int group, String keyword, String label) {
+        Rectangle b = readWidgetBoundsByKeywordOnClientThread(group, keyword);
+        if (b == null || b.width <= 0 || b.height <= 0) {
+            DebugLog.log("Lamp", "[TEST] " + label + " niet gevonden via keyword '" + keyword + "'");
+            return false;
+        }
+        int x = b.x + Math.max(2, b.width / 2);
+        int y = b.y + Math.max(2, b.height / 2);
+        try {
+            Canvas canvas = net.storm.sdk.game.Client.getCanvas();
+            if (canvas != null) {
+                int maxX = Math.max(20, canvas.getWidth() - 3);
+                int maxY = Math.max(20, canvas.getHeight() - 3);
+                x = Math.max(3, Math.min(maxX, x));
+                y = Math.max(3, Math.min(maxY, y));
+                smoothHoverMoveTo(x, y, canvas);
+                sleepSafe(180, 320);
+                if (paint != null) {
+                    paint.setLastAntiBanAction("🧞 Lamp test hover: " + label);
+                }
+                DebugLog.log("Lamp", "[TEST] Hover " + label + " -> (" + x + "," + y + ") bounds="
+                        + b.x + "," + b.y + " " + b.width + "x" + b.height);
+                return true;
+            }
+        } catch (Throwable t) {
+            DebugLog.log("Lamp", "[TEST] Hover " + label + " fout: " + t.getMessage());
+        }
+        return false;
+    }
+
+    private Rectangle readWidgetBoundsOnClientThread(int group, int child) {
+        if (client == null) {
+            return null;
+        }
+        if (clientThread == null) {
+            var w = client.getWidget(group, child);
+            return w != null && !w.isHidden() ? w.getBounds() : null;
+        }
+        AtomicReference<Rectangle> ref = new AtomicReference<>();
+        CountDownLatch latch = new CountDownLatch(1);
+        clientThread.invokeLater(() -> {
+            try {
+                var w = client.getWidget(group, child);
+                if (w != null && !w.isHidden()) {
+                    ref.set(w.getBounds());
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                latch.countDown();
+            }
+        });
+        try {
+            latch.await(350, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return ref.get();
+    }
+
+    private Rectangle readWidgetBoundsByKeywordOnClientThread(int group, String keyword) {
+        if (client == null || keyword == null || keyword.isEmpty()) {
+            return null;
+        }
+        String k = keyword.toLowerCase(Locale.ROOT);
+        if (clientThread == null) {
+            for (int child = 0; child <= 80; child++) {
+                Widget root = client.getWidget(group, child);
+                Widget found = findRlWidgetByKeyword(root, k);
+                if (found != null) {
+                    Rectangle b = found.getBounds();
+                    if (b != null && b.width > 0 && b.height > 0) {
+                        return b;
+                    }
+                }
+            }
+            return null;
+        }
+        AtomicReference<Rectangle> ref = new AtomicReference<>();
+        CountDownLatch latch = new CountDownLatch(1);
+        clientThread.invokeLater(() -> {
+            try {
+                for (int child = 0; child <= 80; child++) {
+                    Widget root = client.getWidget(group, child);
+                    Widget found = findRlWidgetByKeyword(root, k);
+                    if (found != null) {
+                        Rectangle b = found.getBounds();
+                        if (b != null && b.width > 0 && b.height > 0) {
+                            ref.set(b);
+                            break;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                latch.countDown();
+            }
+        });
+        try {
+            latch.await(450, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return ref.get();
+    }
+
+    /**
+     * Zelfde idee als {@link #clickLampWidgetByKeywordInLampGroup}: lamp-teksten zitten vaak in geneste widgets,
+     * niet alleen op (group, child) root-niveau.
+     */
+    private static Widget findRlWidgetByKeyword(Widget w, String keywordLower) {
+        if (w == null || w.isHidden() || keywordLower == null || keywordLower.isEmpty()) {
+            return null;
+        }
+        String name = w.getName();
+        if (name != null && !name.isEmpty()) {
+            String n = Text.removeTags(name).toLowerCase(Locale.ROOT);
+            if (n.contains(keywordLower)) {
+                Rectangle b = w.getBounds();
+                if (b != null && b.width > 0 && b.height > 0) {
+                    return w;
+                }
+            }
+        }
+        Widget[] children = w.getChildren();
+        if (children != null) {
+            for (Widget c : children) {
+                Widget found = findRlWidgetByKeyword(c, keywordLower);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        children = w.getDynamicChildren();
+        if (children != null) {
+            for (Widget c : children) {
+                Widget found = findRlWidgetByKeyword(c, keywordLower);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        try {
+            Widget[] nested = w.getNestedChildren();
+            if (nested != null) {
+                for (Widget c : nested) {
+                    Widget found = findRlWidgetByKeyword(c, keywordLower);
+                    if (found != null) {
+                        return found;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /**
+     * Zelfde geometrie/tween/hover-hold als {@link #hoverWidgetForTest}; daarna echte muisklik op de canvas.
+     * Geen {@link Mouse#click(int, int, boolean)} hier: vanaf de client thread voert Storm die asynchroon uit,
+     * waardoor de klik los kan laten lopen van de net gesimuleerde {@link Mouse#moved}-reeks. Low-level
+     * pressed/released/clicked gebruikt dezelfde {@link Canvas} en coördinaten als de hover-test.
+     */
+    private boolean smoothMoveAndLeftClickLampWidget(Rectangle b, String logCtx) {
+        if (b == null || b.width <= 0 || b.height <= 0) {
+            return false;
+        }
+        Canvas canvas = net.storm.sdk.game.Client.getCanvas();
+        if (canvas == null) {
+            return false;
+        }
+        int x = b.x + Math.max(2, b.width / 2);
+        int y = b.y + Math.max(2, b.height / 2);
+        int maxX = Math.max(20, canvas.getWidth() - 3);
+        int maxY = Math.max(20, canvas.getHeight() - 3);
+        x = Math.max(3, Math.min(maxX, x));
+        y = Math.max(3, Math.min(maxY, y));
+        try {
+            smoothHoverMoveTo(x, y, canvas);
+            sleepSafe(180, 320);
+            long tMove = System.currentTimeMillis();
+            Mouse.moved(x, y, canvas, tMove);
+            sleepSafe(28, 55);
+            long tPress = System.currentTimeMillis();
+            Mouse.pressed(x, y, canvas, tPress, MouseEvent.BUTTON1);
+            sleepSafe(45, 95);
+            long tRel = System.currentTimeMillis();
+            Mouse.released(x, y, canvas, tRel, MouseEvent.BUTTON1);
+            Mouse.clicked(x, y, canvas, tRel, MouseEvent.BUTTON1);
+            DebugLog.log("Lamp", "Click " + logCtx + " -> (" + x + "," + y + ") bounds="
+                    + b.x + "," + b.y + " " + b.width + "x" + b.height);
+            return true;
+        } catch (Throwable t) {
+            DebugLog.log("Lamp", "Click " + logCtx + " fout: " + t.getMessage());
+            return false;
+        }
+    }
+
+    private void smoothHoverMoveTo(int toX, int toY, Canvas canvas) {
+        net.runelite.api.Point p = client != null ? client.getMouseCanvasPosition() : null;
+        int startX = (p != null && p.getX() >= 0) ? p.getX() : toX;
+        int startY = (p != null && p.getY() >= 0) ? p.getY() : toY;
+        int maxX = canvas != null ? Math.max(20, canvas.getWidth() - 3) : 760;
+        int maxY = canvas != null ? Math.max(20, canvas.getHeight() - 3) : 500;
+        int steps = 8 + random.nextInt(8);
+        for (int i = 1; i <= steps; i++) {
+            double t = (double) i / steps;
+            double eased = (1.0 - Math.cos(t * Math.PI)) / 2.0;
+            int x = (int) Math.round(startX + ((toX - startX) * eased)) + random.nextInt(3) - 1;
+            int y = (int) Math.round(startY + ((toY - startY) * eased)) + random.nextInt(3) - 1;
+            x = Math.max(3, Math.min(maxX, x));
+            y = Math.max(3, Math.min(maxY, y));
+            Mouse.moved(x, y, canvas, System.currentTimeMillis());
+            sleepSafe(14, 32);
+        }
+    }
+
+    private void sleepSafe(int minMs, int maxMs) {
+        int high = Math.max(minMs, maxMs);
+        int ms = minMs + random.nextInt(Math.max(1, high - minMs + 1));
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     /**
      * Jagex OAuth + {@link Game#setGameAccount} op de client. Volgorde gelijk aan {@link AccountSwitcher} (OAuth-modus,
      * dan account), daarna Storm-session/display. Wordt gepland op {@link ClientThread#invokeAtTickEnd} zodat de engine
@@ -3997,15 +5205,48 @@ public class CombatBotPlugin extends LoopedPlugin {
     }
 
     private List<ActiveSkill> getEnabledSkills() {
+        ManagedJagexAccountsStore.ManagedJagexAccountRow rotRow =
+                ManagedJagexAccountsStore.findRowForDisplayName(config, tryGetLocalRsn());
+        if (rotRow != null && rotRow.rotationUseCustomProfile) {
+            List<ActiveSkill> skills = new ArrayList<>();
+            if (rotRow.rotationPickCombat && CenterManager.countActive(config.combatCenters()) > 0) {
+                skills.add(ActiveSkill.COMBAT);
+            }
+            if (effectiveImpsInRotation()) {
+                skills.add(ActiveSkill.IMPS);
+            }
+            if (effectiveGiantsMode()) {
+                skills.add(ActiveSkill.GIANTS);
+            }
+            if (config.barbarianMode()) {
+                skills.add(ActiveSkill.BARBARIAN);
+            }
+            if (rotRow.rotationPickWc && CenterManager.countActive(config.wcCenters()) > 0) {
+                skills.add(ActiveSkill.WOODCUTTING);
+            }
+            if (rotRow.rotationPickMining && CenterManager.countActive(config.miningCenters()) > 0) {
+                skills.add(ActiveSkill.MINING);
+            }
+            if (rotRow.rotationPickFishing && CenterManager.countActive(config.fishingCenters()) > 0) {
+                skills.add(ActiveSkill.FISHING);
+            }
+            boolean barbLootListed = config.barbLootEnabled() || barbLootSessionActive
+                    || (effectiveStartSkillSetting() == CombatBotConfig.StartSkill.BARB_LOOT && !barbLootStartMagicCheckDone);
+            if (barbLootListed) {
+                skills.add(ActiveSkill.LOOT);
+            }
+            return skills;
+        }
+
         List<ActiveSkill> skills = new ArrayList<>();
         // Center-based skills: actieve centers zijn leidend.
         if (CenterManager.countActive(config.combatCenters()) > 0) {
             skills.add(ActiveSkill.COMBAT);
         }
-        if (CenterManager.countActive(config.impsCenters()) > 0 || config.impsMode()) {
+        if (effectiveImpsInRotation()) {
             skills.add(ActiveSkill.IMPS);
         }
-        if (config.giantsMode()) {
+        if (effectiveGiantsMode()) {
             skills.add(ActiveSkill.GIANTS);
         }
         if (config.barbarianMode()) {
@@ -4021,7 +5262,7 @@ public class CombatBotPlugin extends LoopedPlugin {
             skills.add(ActiveSkill.FISHING);
         }
         boolean barbLootListed = config.barbLootEnabled() || barbLootSessionActive
-                || (config.startSkill() == CombatBotConfig.StartSkill.BARB_LOOT && !barbLootStartMagicCheckDone);
+                || (effectiveStartSkillSetting() == CombatBotConfig.StartSkill.BARB_LOOT && !barbLootStartMagicCheckDone);
         if (barbLootListed) {
             skills.add(ActiveSkill.LOOT);
         }
@@ -4187,22 +5428,18 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
     }
 
+    /** Giants in rotatie: {@link CombatBotConfig#giantsMode()} met per-account override (ingelogde RSN). */
+    private boolean effectiveGiantsMode() {
+        return ManagedJagexAccountsStore.resolveGiantsModeForDisplayName(config, tryGetLocalRsn());
+    }
+
+    /** Imps in rotatie: {@code impsMode} + imps-centers, met per-account “alleen Imps / alleen Giants”. */
+    private boolean effectiveImpsInRotation() {
+        return ManagedJagexAccountsStore.resolveImpsInRotationForDisplayName(config, tryGetLocalRsn());
+    }
+
     private ManagedJagexAccountsStore.ManagedJagexAccountRow findManagedRowByDisplayName(String displayName) {
-        if (displayName == null || displayName.trim().isEmpty()) {
-            return null;
-        }
-        String norm = JagexCredentialsHelper.normalizeDisplayNameForMatch(displayName);
-        for (ManagedJagexAccountsStore.ManagedJagexAccountRow r :
-                ManagedJagexAccountsStore.parseRows(config.managedJagexAccountsBlob())) {
-            if (r == null || r.displayName == null || r.displayName.trim().isEmpty()) {
-                continue;
-            }
-            String rn = JagexCredentialsHelper.normalizeDisplayNameForMatch(r.displayName);
-            if (rn.equalsIgnoreCase(norm)) {
-                return r;
-            }
-        }
-        return null;
+        return ManagedJagexAccountsStore.findRowForDisplayName(config, displayName);
     }
 
     private void clearManagedCalibrateFlag(String displayName) {
@@ -4226,68 +5463,6 @@ public class CombatBotPlugin extends LoopedPlugin {
         if (changed) {
             ManagedJagexAccountsStore.persist(stormConfigManager, rows);
         }
-    }
-
-    private String[] bankSnapshotKeyItems() {
-        return new String[] {
-                "Coins", "Tinderbox",
-                "Bronze axe", "Iron axe", "Steel axe", "Black axe", "Mithril axe", "Adamant axe", "Rune axe",
-                "Bronze pickaxe", "Iron pickaxe", "Steel pickaxe", "Black pickaxe", "Mithril pickaxe", "Adamant pickaxe", "Rune pickaxe",
-                "Bronze sword", "Iron sword", "Steel sword", "Black sword", "Mithril sword", "Adamant sword", "Rune sword",
-                "Bronze longsword", "Iron longsword", "Steel longsword", "Black longsword", "Mithril longsword", "Adamant longsword", "Rune longsword",
-                "Bronze scimitar", "Iron scimitar", "Steel scimitar", "Black scimitar", "Mithril scimitar", "Adamant scimitar", "Rune scimitar",
-                "Bronze dagger", "Iron dagger", "Steel dagger", "Black dagger", "Mithril dagger", "Adamant dagger", "Rune dagger",
-                "Bronze battleaxe", "Iron battleaxe", "Steel battleaxe", "Black battleaxe", "Mithril battleaxe", "Adamant battleaxe", "Rune battleaxe",
-                "Bronze med helm", "Iron med helm", "Steel med helm", "Black med helm", "Mithril med helm", "Adamant med helm", "Rune med helm",
-                "Bronze full helm", "Iron full helm", "Steel full helm", "Black full helm", "Mithril full helm", "Adamant full helm", "Rune full helm",
-                "Bronze chainbody", "Iron chainbody", "Steel chainbody", "Black chainbody", "Mithril chainbody", "Adamant chainbody", "Rune chainbody",
-                "Bronze platebody", "Iron platebody", "Steel platebody", "Black platebody", "Mithril platebody", "Adamant platebody", "Rune platebody",
-                "Bronze platelegs", "Iron platelegs", "Steel platelegs", "Black platelegs", "Mithril platelegs", "Adamant platelegs", "Rune platelegs",
-                "Bronze plateskirt", "Iron plateskirt", "Steel plateskirt", "Black plateskirt", "Mithril plateskirt", "Adamant plateskirt", "Rune plateskirt",
-                "Wooden shield", "Bronze kiteshield", "Iron kiteshield", "Steel kiteshield", "Black kiteshield", "Mithril kiteshield", "Adamant kiteshield", "Rune kiteshield",
-                "Fly fishing rod", "Feather", "Fishing bait",
-                "Fishing rod", "Small fishing net",
-                "Raw shrimps", "Shrimps", "Raw sardine", "Sardine", "Raw herring", "Herring",
-                "Raw trout", "Trout", "Raw salmon", "Salmon",
-                "Shortbow", "Longbow", "Bronze arrow", "Iron arrow", "Steel arrow", "Mithril arrow", "Adamant arrow", "Rune arrow",
-                "Staff of air", "Staff of fire", "Staff of water", "Staff of earth",
-                "Air rune", "Mind rune", "Chaos rune", "Law rune",
-                "Amulet of power", "Hammer", "Garlic", "Stake",
-                "Black bead", "Red bead", "Yellow bead", "White bead", "Mind talisman", "Fiendish ashes"
-        };
-    }
-
-    private String buildKnownBankItemsCsv() {
-        String[] keyItems = bankSnapshotKeyItems();
-        Set<String> present = new LinkedHashSet<>();
-        for (String item : keyItems) {
-            try {
-                if (Bank.contains(item)) {
-                    present.add(item);
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        return String.join(",", present);
-    }
-
-    private String buildKnownBankItemQtyJson() {
-        String[] keyItems = bankSnapshotKeyItems();
-        java.util.Map<String, Integer> qty = new java.util.LinkedHashMap<>();
-        for (String item : keyItems) {
-            int n = 0;
-            try {
-                if (Bank.contains(item)) {
-                    var bi = Bank.getFirst(item);
-                    n = bi != null ? Math.max(1, bi.getQuantity()) : 1;
-                }
-            } catch (Throwable ignored) {
-            }
-            if (n > 0) {
-                qty.put(item, n);
-            }
-        }
-        return COMPACT_GSON.toJson(qty);
     }
 
     private int handlePerAccountBankCalibrationAndSnapshot() {
@@ -4320,33 +5495,21 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
 
         if (!Bank.isOpen()) {
+            bankSnapshotPrevOpen = false;
             return 0;
         }
 
         long now = System.currentTimeMillis();
-        if (now - lastBankSnapshotSyncMs < 2500L) {
+        boolean bankJustOpened = !bankSnapshotPrevOpen;
+        bankSnapshotPrevOpen = true;
+        // Direct bij openen + daarna minstens elke seconde tijdens dezelfde sessie (lang banken = actuele JSON).
+        if (!bankJustOpened && now - lastBankSnapshotSyncMs < 1000L) {
             return needsCalibrate ? 250 : 0;
         }
         lastBankSnapshotSyncMs = now;
 
-        int invCoins = 0;
-        int bankCoins = 0;
-        try {
-            IInventoryItem coins = Inventory.getFirst("Coins");
-            invCoins = coins != null ? Math.max(0, coins.getQuantity()) : 0;
-        } catch (Throwable ignored) {
-        }
-        try {
-            if (Bank.contains("Coins")) {
-                var bc = Bank.getFirst("Coins");
-                bankCoins = bc != null ? Math.max(0, bc.getQuantity()) : 0;
-            }
-        } catch (Throwable ignored) {
-        }
-        String knownItemsCsv = buildKnownBankItemsCsv();
-        String knownItemQtyJson = buildKnownBankItemQtyJson();
-        // Elke bank-open is een echte live snapshot. De handmatige checkbox forceert alleen het openen + UI-melding.
-        AccountStateJsonStore.putBankSnapshot(rsn, knownItemsCsv, knownItemQtyJson, bankCoins, invCoins, true);
+        boolean markCalibrated = forceCalibrate || !AccountStateJsonStore.isBankCalibrated(rsn);
+        BankSnapshotHelper.writeSnapshotIfBankOpen(rsn, markCalibrated);
         if (forceCalibrate) {
             clearManagedCalibrateFlag(rsn);
             String stamp = Instant.ofEpochMilli(System.currentTimeMillis())
@@ -4413,7 +5576,7 @@ public class CombatBotPlugin extends LoopedPlugin {
                 return s;
             }
         }
-        if (config.impsMode()) {
+        if (effectiveImpsInRotation()) {
             return ActiveSkill.IMPS;
         }
         if (CenterManager.countActive(config.combatCenters()) > 0) {
@@ -4428,7 +5591,7 @@ public class CombatBotPlugin extends LoopedPlugin {
         if (CenterManager.countActive(config.fishingCenters()) > 0) {
             return ActiveSkill.FISHING;
         }
-        if (config.giantsMode()) {
+        if (effectiveGiantsMode()) {
             return ActiveSkill.GIANTS;
         }
         if (config.barbarianMode()) {
@@ -4442,7 +5605,7 @@ public class CombatBotPlugin extends LoopedPlugin {
      * anders {@link #barbLootSessionActive} aan zodat loot-handler draait zonder config-vink.
      */
     private void maybeApplyBarbLootStartMagicGate() {
-        if (config.startSkill() != CombatBotConfig.StartSkill.BARB_LOOT) {
+        if (effectiveStartSkillSetting() != CombatBotConfig.StartSkill.BARB_LOOT) {
             return;
         }
         if (barbLootStartMagicCheckDone) {
@@ -4936,6 +6099,8 @@ public class CombatBotPlugin extends LoopedPlugin {
         startupInventoryChecked = false;
         switchCooldownUntil = 0L;
         restoredProgressThisLogin = false;
+        bankSnapshotPrevOpen = false;
+        lastBankSnapshotSyncMs = 0L;
         if (combatHandler != null) combatHandler.resetState();
         if (woodcutterHandler != null) woodcutterHandler.resetState();
         if (miningHandler != null) miningHandler.resetState();
@@ -5027,7 +6192,7 @@ public class CombatBotPlugin extends LoopedPlugin {
      * <p>Geen {@link #resetHandlerForSkill(ActiveSkill)}: dat zou Starter-fase uit JSON wissen. Imps-state wel resetten.
      */
     private void enforceStarterStartSkillIfConfigured() {
-        if (config.startSkill() != CombatBotConfig.StartSkill.STARTER) {
+        if (effectiveStartSkillSetting() != CombatBotConfig.StartSkill.STARTER) {
             return;
         }
         if (activeSkill == ActiveSkill.STARTER) {
@@ -5070,7 +6235,7 @@ public class CombatBotPlugin extends LoopedPlugin {
             }
             return;
         }
-        if (config.startSkill() == CombatBotConfig.StartSkill.STARTER) {
+        if (effectiveStartSkillSettingForDisplayName(displayName) == CombatBotConfig.StartSkill.STARTER) {
             activeSkill = ActiveSkill.STARTER;
             resetSwitchTimer();
             paint.setActiveSkill(getSkillName(activeSkill));

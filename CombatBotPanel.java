@@ -9,6 +9,7 @@ import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
 import javax.swing.table.TableCellRenderer;
 import javax.swing.ListSelectionModel;
+import javax.swing.BorderFactory;
 import javax.swing.border.EmptyBorder;
 import javax.swing.border.LineBorder;
 import javax.swing.event.ChangeListener;
@@ -29,6 +30,7 @@ import java.nio.file.Files;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -38,6 +40,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.function.Consumer;
 import java.util.Objects;
+import java.lang.ref.WeakReference;
 
 /**
  * In-game zijpaneel met VOLLEDIGE settings GUI + live stats.
@@ -116,10 +119,25 @@ public class CombatBotPanel extends PluginPanel {
     private final Runnable onResetAllBotState;
     /** Noodstop: bot uit + alle runtime/pending flows afbreken. */
     private final Runnable onEmergencyStopAll;
+    /** Debug: forceer anti-ban speler-lookup testactie. */
+    private final Runnable onTestPlayerLookupRequested;
+    /** Debug: test lamp-widget hover flow (zonder klikken op skill/confirm). */
+    private final Runnable onTestLampHoverRequested;
+    /** Debug: forceer human-profile micro-mouse beweging nu, geeft status terug voor popup. */
+    private final java.util.function.Supplier<String> onTestHumanMicroMouseRequested;
+    /** Debug: forceer een fidget-burst (achtergrond mouse-fidget worker), geeft status terug. */
+    private final java.util.function.Supplier<String> onTestFidgetBurstRequested;
     /** Besturingsbalk Start/Pauze/Stop/Reset op Accounts-tab — verversen op config + opruimen als tab weg is. */
     private final List<BotBarHandle> accountsBotBarHandles = new ArrayList<>();
     /** Hoofd-Debug-tab + eventueel los venster: allemaal dezelfde DebugLog-inhoud. */
     private final List<JTextArea> debugLogTextAreas = new CopyOnWriteArrayList<>();
+    /**
+     * Eén accountlijst voor ingebed paneel én los venster — anders importeer je in het ene venster
+     * terwijl de tabel in het andere nog een oude {@code ArrayList} gebruikt (dan lijkt er "niets" te gebeuren).
+     */
+    private List<ManagedJagexAccountsStore.ManagedJagexAccountRow> sharedManagedAccountRows;
+    /** Elke geopende Accounts-tab registreert hier zijn {@code refillTable}; na import/persist alles verversen. */
+    private final CopyOnWriteArrayList<WeakReference<Runnable>> accountTableRefillCallbacks = new CopyOnWriteArrayList<>();
     /** Houd toggles met dezelfde config-key live synchroon (o.a. overlays in meerdere tabs). */
     private final Map<String, List<JCheckBox>> mirroredTogglesByConfigKey = new HashMap<>();
     private boolean syncingMirroredToggles = false;
@@ -127,7 +145,7 @@ public class CombatBotPanel extends PluginPanel {
             "COMBATBOT", "STARTSKILL", "STARTERSKILL", "MELEESTYLE", "COMBAT", "IMPS", "GIANTS",
             "WOODCUTTING", "MINING", "FISHING", "BARBLOOT", "QUEST", "LAMP", "DISCORD",
             "ACCOUNTS", "RELOG", "MOVEMENTHELPER", "BANKHELPER", "UBM", "GERESTOCK",
-            "ACCOUNTSTATEJSON", "INVCHECK", "SAFESPOT", "VARROCKTP", "DEBUG", "WIDGET"
+            "ACCOUNTSTATEJSON", "INVCHECK", "SAFESPOT", "VARROCKTP", "DEBUG", "WIDGET", "STORMIMPORT"
     };
 
     private static final class BotBarHandle {
@@ -146,7 +164,11 @@ public class CombatBotPanel extends PluginPanel {
                           Runnable onPanelLogoutRequested,
                           Runnable onTestAutoLoginRequested, Runnable onManagedAccountsSaved,
                           Consumer<ManagedJagexAccountsStore.ManagedJagexAccountRow> onAccountPrepareLogin,
-                          Runnable onResetAllBotState, Runnable onEmergencyStopAll) {
+                          Runnable onResetAllBotState, Runnable onEmergencyStopAll,
+                          Runnable onTestPlayerLookupRequested,
+                          Runnable onTestLampHoverRequested,
+                          java.util.function.Supplier<String> onTestHumanMicroMouseRequested,
+                          java.util.function.Supplier<String> onTestFidgetBurstRequested) {
         this.paint = paint;
         this.config = config;
         this.configManager = configManager;
@@ -160,6 +182,12 @@ public class CombatBotPanel extends PluginPanel {
         this.onAccountPrepareLogin = onAccountPrepareLogin != null ? onAccountPrepareLogin : (r) -> {};
         this.onResetAllBotState = onResetAllBotState != null ? onResetAllBotState : () -> {};
         this.onEmergencyStopAll = onEmergencyStopAll != null ? onEmergencyStopAll : () -> {};
+        this.onTestPlayerLookupRequested = onTestPlayerLookupRequested != null ? onTestPlayerLookupRequested : () -> {};
+        this.onTestLampHoverRequested = onTestLampHoverRequested != null ? onTestLampHoverRequested : () -> {};
+        this.onTestHumanMicroMouseRequested = onTestHumanMicroMouseRequested != null ? onTestHumanMicroMouseRequested
+                : () -> "Geen handler bekend";
+        this.onTestFidgetBurstRequested = onTestFidgetBurstRequested != null ? onTestFidgetBurstRequested
+                : () -> "Fidget-handler niet bekend";
         DebugLog.setDisabledSourcesCsv(config.debugDisabledSourcesCsv());
         for (String src : DEFAULT_DEBUG_SOURCES) {
             DebugLog.setSourceEnabled(src, DebugLog.isSourceEnabled(src));
@@ -256,7 +284,20 @@ public class CombatBotPanel extends PluginPanel {
         addToggle(control, "Grote loopstappen 15-20 (globaal)", config.impsForceLargeSteps(), v -> setConfig("impsForceLargeSteps", v));
         addToggle(control, "Reset per-account timers bij stop", config.resetAccountTimersOnStop(), v -> setConfig("resetAccountTimersOnStop", v));
         addTriggerToggle(control, "🚪 Uitloggen (wacht op combat, loot, client thread)", "panelLogoutTrigger", onPanelLogoutRequested);
+        addTextField(control, "Web GUI URL", config.webGuiUrl(), v -> setConfig("webGuiUrl", v));
         panel.add(control);
+        panel.add(Box.createVerticalStrut(6));
+
+        JPanel tiles = createSection("📍 Tile presets (snel)", false);
+        addTextField(tiles, "Preset naam", config.tilePresetName(), v -> setConfig("tilePresetName", v));
+        addActionButton(tiles, "💾 Sla huidige tile-set op als preset",
+                () -> setConfig("saveTilePreset", true));
+        addTextField(tiles, "Preset laden (naam)", config.loadTilePreset(), v -> setConfig("loadTilePreset", v));
+        addActionButton(tiles, "📂 Laad preset (naam hierboven)",
+                () -> setConfig("doLoadTilePreset", true));
+        addActionButton(tiles, "🗑 Wis tile markers (huidige skill)",
+                () -> setConfig("clearTileMarkers", true));
+        panel.add(tiles);
         panel.add(Box.createVerticalStrut(6));
 
         JPanel portable = createSection("💾 Zelfde instellingen op andere PC", false);
@@ -309,12 +350,17 @@ public class CombatBotPanel extends PluginPanel {
                 v -> setConfig("foodChoice", v.name()));
         addSlider(combat, "Eat HP %", config.eatPercent(), 5, 90, v -> setConfig("eatPercent", v));
         addSlider(combat, "Attack range", config.attackRange(), 1, 20, v -> setConfig("attackRange", v));
+        addSlider(combat, "Attack delay min (ms)", config.attackDelayMin(), 0, 5000, v -> setConfig("attackDelayMin", v));
+        addSlider(combat, "Attack delay max (ms)", config.attackDelayMax(), 0, 10000, v -> setConfig("attackDelayMax", v));
         addToggle(combat, "Stop bij geen food", config.disableCombatNoFood(), v -> setConfig("disableCombatNoFood", v));
         addToggle(combat, "Bury Bones/Ashes", config.buryBones(), v -> setConfig("buryBones", v));
         addSlider(combat, "Bones/ashes bij min. X stuks", config.buryBonesMinBatch(), 1, 28, v -> setConfig("buryBonesMinBatch", v));
         addToggle(combat, "Safespot", config.safespotEnabled(), v -> setConfig("safespotEnabled", v));
         addToggle(combat, "🎯 Imps Mode", config.impsMode(), v -> setConfig("impsMode", v));
         addOverlayToggle(combat, "Combat overlay", config.showCombatOverlay(), "showCombatOverlay");
+        addToggle(combat, "Arrows/bolts oppakken", config.pickupArrows(), v -> setConfig("pickupArrows", v));
+        addSlider(combat, "Arrow pickup min kills", config.pickupArrowsMinKills(), 0, 30, v -> setConfig("pickupArrowsMinKills", v));
+        addSlider(combat, "Arrow pickup max kills", config.pickupArrowsMaxKills(), 1, 50, v -> setConfig("pickupArrowsMaxKills", v));
         addSlider(combat, "Arrow min (bank onder)", config.combatArrowMin(), 0, 500, v -> setConfig("combatArrowMin", v));
         addSlider(combat, "Arrow target (ophalen)", config.combatArrowTarget(), 1, 1000, v -> setConfig("combatArrowTarget", v));
         addSlider(combat, "Rune min (bank onder)", config.combatRuneMin(), 0, 500, v -> setConfig("combatRuneMin", v));
@@ -336,6 +382,7 @@ public class CombatBotPanel extends PluginPanel {
         addSlider(loot, "Kills vóór looten", config.lootDelayKills(), 0, 15, v -> setConfig("lootDelayKills", v));
         addSlider(loot, "Min wacht (sec)", config.lootDelayMinSeconds(), 0, 30, v -> setConfig("lootDelayMinSeconds", v));
         addSlider(loot, "Max wacht (sec)", config.lootDelayMaxSeconds(), 0, 60, v -> setConfig("lootDelayMaxSeconds", v));
+        addToggle(loot, "Eet om ruimte te maken voor loot", config.eatToMakeSpaceForLoot(), v -> setConfig("eatToMakeSpaceForLoot", v));
         panel.add(loot);
         panel.add(Box.createVerticalStrut(6));
 
@@ -348,6 +395,9 @@ public class CombatBotPanel extends PluginPanel {
         addComboBox(bank, "GE food type (F2P)", CombatBotConfig.CombatGeFoodType.values(), config.combatGeFoodType(),
                 v -> setConfig("combatGeFoodType", v.name()));
         addSlider(bank, "GE food basisprijs (gp)", config.combatGeFoodBasePrice(), 1, 50000, v -> setConfig("combatGeFoodBasePrice", v));
+        addToggle(bank, "GE ranged ammo (Combat)", config.combatGeRangedAmmoEnabled(), v -> setConfig("combatGeRangedAmmoEnabled", v));
+        addTextField(bank, "GE ranged ammo itemnaam", config.combatGeRangedAmmoItem(), v -> setConfig("combatGeRangedAmmoItem", v));
+        addSlider(bank, "GE ranged ammo basisprijs (gp/stuk)", config.combatGeRangedAmmoBasePrice(), 1, 1000, v -> setConfig("combatGeRangedAmmoBasePrice", v));
         panel.add(bank);
         panel.add(Box.createVerticalStrut(6));
 
@@ -411,6 +461,7 @@ public class CombatBotPanel extends PluginPanel {
 
         // 🔄 Skill Rotation
         JPanel rotation = createSection("🔄 Skill Rotation", false);
+        addOverlayToggle(rotation, "Toon Starter train-gebied", config.showStarterOverlay(), "showStarterOverlay");
         addComboBox(rotation, "Starter train-gebied", CombatBotConfig.StarterTrainRegion.values(), config.starterTrainRegion(),
                 v -> setConfig("starterTrainRegion", v.name()));
         addComboBox(rotation, "Starter melee style", CombatBotConfig.MeleeTrainingStyle.values(), config.starterMeleeTrainingStyle(),
@@ -421,6 +472,7 @@ public class CombatBotPanel extends PluginPanel {
         addToggle(rotation, "🎯 Imps in rotatie", config.impsMode(), v -> setConfig("impsMode", v));
         addToggle(rotation, "🐟 Barb fishing loot skill", config.barbLootEnabled(), v -> setConfig("barbLootEnabled", v));
         addToggle(rotation, "Loot-wacht: bonfire", config.barbLootBonfireWait(), v -> setConfig("barbLootBonfireWait", v));
+        addSlider(rotation, "Barb loot: bank na X vis", config.barbLootBankFishCount(), 1, 28, v -> setConfig("barbLootBankFishCount", v));
         addSlider(rotation, "Barb loot: GE na X bank trips (0=uit)", config.barbLootGeAfterBanks(), 0, 30, v -> setConfig("barbLootGeAfterBanks", v));
         addSlider(rotation, "Barb GE: % onder markt", config.barbLootGePercentBelow(), 1, 50, v -> setConfig("barbLootGePercentBelow", v));
         addSlider(rotation, "Barb GE: min. cash reserve (gp)", config.barbLootGeMinCash(), 0, 50000, v -> setConfig("barbLootGeMinCash", v));
@@ -440,6 +492,8 @@ public class CombatBotPanel extends PluginPanel {
         addSlider(relog, "Pauze min (minuten)", config.reLogoutPauseMinMinutes(), 0, 60, v -> setConfig("reLogoutPauseMinMinutes", v));
         addSlider(relog, "Pauze max (minuten)", config.reLogoutPauseMaxMinutes(), 0, 90, v -> setConfig("reLogoutPauseMaxMinutes", v));
         addTextField(relog, "Account (email of jagex:path)", config.reLogoutAccount(), v -> setConfig("reLogoutAccount", v));
+        addTriggerToggle(relog, "🔐 Log in (nu)", "loginNow", onLoginRequested);
+        addTextField(relog, "Account lijst (geavanceerd)", config.accountList(), v -> setConfig("accountList", v));
         panel.add(relog);
         panel.add(Box.createVerticalStrut(6));
 
@@ -472,12 +526,41 @@ public class CombatBotPanel extends PluginPanel {
         addToggle(antiban, "Per-RSN gedragsprofiel", config.accountBehaviorProfileEnabled(),
                 v -> setConfig("accountBehaviorProfileEnabled", v));
         addSlider(antiban, "Frequentie (sec)", config.antiBanFrequency(), 10, 120, v -> setConfig("antiBanFrequency", v));
+        addComboBox(antiban, "Heftigheid", CombatBotConfig.AntiBanIntensity.values(), config.antiBanIntensity(),
+                v -> setConfig("antiBanIntensity", v.name()));
         addToggle(antiban, "Camera bewegingen", config.cameraMovement(), v -> setConfig("cameraMovement", v));
+        addSlider(antiban, "Camera min duur (ms)", config.cameraDurationMin(), 100, 5000, v -> setConfig("cameraDurationMin", v));
+        addSlider(antiban, "Camera max duur (ms)", config.cameraDurationMax(), 100, 8000, v -> setConfig("cameraDurationMax", v));
         addToggle(antiban, "Idle pauzes", config.idleChecks(), v -> setConfig("idleChecks", v));
         addToggle(antiban, "Muis bewegingen", config.randomMouseMovement(), v -> setConfig("randomMouseMovement", v));
+        addSlider(antiban, "Micro-move amplitude min (px)", config.mouseMicroMoveAmpMinPx(), 1, 300,
+                v -> setConfig("mouseMicroMoveAmpMinPx", v));
+        addSlider(antiban, "Micro-move amplitude max (px)", config.mouseMicroMoveAmpMaxPx(), 1, 300,
+                v -> setConfig("mouseMicroMoveAmpMaxPx", v));
+        addSlider(antiban, "Micro-move duur min (ms)", config.mouseMicroMoveDurMinMs(), 50, 2000,
+                v -> setConfig("mouseMicroMoveDurMinMs", v));
+        addSlider(antiban, "Micro-move duur max (ms)", config.mouseMicroMoveDurMaxMs(), 50, 2000,
+                v -> setConfig("mouseMicroMoveDurMaxMs", v));
+        addToggle(antiban, "Continuous muis-fidget", config.mouseFidgetEnabled(), v -> setConfig("mouseFidgetEnabled", v));
+        addSlider(antiban, "Fidget amplitude min (px)", config.mouseFidgetAmpMinPx(), 1, 200,
+                v -> setConfig("mouseFidgetAmpMinPx", v));
+        addSlider(antiban, "Fidget amplitude max (px)", config.mouseFidgetAmpMaxPx(), 1, 200,
+                v -> setConfig("mouseFidgetAmpMaxPx", v));
+        addSlider(antiban, "Fidget duur min (ms)", config.mouseFidgetDurMinMs(), 50, 2000,
+                v -> setConfig("mouseFidgetDurMinMs", v));
+        addSlider(antiban, "Fidget duur max (ms)", config.mouseFidgetDurMaxMs(), 50, 2000,
+                v -> setConfig("mouseFidgetDurMaxMs", v));
         addToggle(antiban, "Tab-wissel (inventory)", config.tabGlanceEnabled(), v -> setConfig("tabGlanceEnabled", v));
         addToggle(antiban, "Misclicks", config.misClickEnabled(), v -> setConfig("misClickEnabled", v));
         addSlider(antiban, "Misclick kans %", config.misClickPercent(), 1, 30, v -> setConfig("misClickPercent", v));
+        addToggle(antiban, "Speler lookup (rechtsklik)", config.playerLookupAntibanEnabled(),
+                v -> setConfig("playerLookupAntibanEnabled", v));
+        addToggle(antiban, "Skill hover (anti-ban)", config.skillHoverEnabled(),
+                v -> setConfig("skillHoverEnabled", v));
+        addSlider(antiban, "MMB stap snelheid min (ms)", config.mmbDragSpeedMin(), 5, 200, v -> setConfig("mmbDragSpeedMin", v));
+        addSlider(antiban, "MMB stap snelheid max (ms)", config.mmbDragSpeedMax(), 5, 300, v -> setConfig("mmbDragSpeedMax", v));
+        addSlider(antiban, "MMB drag afstand min (px)", config.mmbDragDistanceMin(), 10, 500, v -> setConfig("mmbDragDistanceMin", v));
+        addSlider(antiban, "MMB drag afstand max (px)", config.mmbDragDistanceMax(), 10, 800, v -> setConfig("mmbDragDistanceMax", v));
         panel.add(antiban);
         panel.add(Box.createVerticalStrut(6));
 
@@ -525,6 +608,12 @@ public class CombatBotPanel extends PluginPanel {
         addSlider(imps, "Rally point radius (tiles)", config.impsRallyPointRadius(), 1, 25, v -> setConfig("impsRallyPointRadius", v));
         addSlider(imps, "Arrival radius (tiles)", config.impsArrivalRadius(), 8, 20, v -> setConfig("impsArrivalRadius", v));
         addOverlayToggle(imps, "Toon rally radius overlay", config.impsShowRallyRadius(), "impsShowRallyRadius");
+        addToggle(imps, "Stay inside hunt radius", config.impsStayInsideRadius(), v -> setConfig("impsStayInsideRadius", v));
+        addSlider(imps, "Mage trip cast budget", config.impsMageTripCastBudget(), 1, 200, v -> setConfig("impsMageTripCastBudget", v));
+        addSlider(imps, "Imp NPC ID (Storm, 0=naam-only)", config.impsNpcId(), 0, 20000, v -> setConfig("impsNpcId", v));
+        addComboBox(imps, "Fallback combat style", CombatBotConfig.ImpsCombatStyle.values(), config.impsFallbackStyle(),
+                v -> setConfig("impsFallbackStyle", v.name()));
+        addSlider(imps, "Ammo/rune koopprijs (gp)", config.impsAmmoRestockPrice(), 1, 5000, v -> setConfig("impsAmmoRestockPrice", v));
         addTriggerToggle(imps, "🛒 Sell now (start GE verkoop)", "impsSellNow", onSellNowRequested);
         panel.add(imps);
         panel.add(Box.createVerticalStrut(6));
@@ -657,12 +746,35 @@ public class CombatBotPanel extends PluginPanel {
         }));
         panel.add(Box.createVerticalStrut(6));
 
-        panel.add(createCollapsibleSection("🏹 Pijlen & runes & lamp", false, false, c -> {
+        panel.add(createCollapsibleSection("🏹 Pijlen & runes", false, false, c -> {
             addSlider(c, "Arrow min (bank onder)", config.combatArrowMin(), 0, 500, v -> setConfig("combatArrowMin", v));
             addSlider(c, "Arrow target (ophalen)", config.combatArrowTarget(), 1, 1000, v -> setConfig("combatArrowTarget", v));
             addSlider(c, "Rune min (bank onder)", config.combatRuneMin(), 0, 500, v -> setConfig("combatRuneMin", v));
             addSlider(c, "Rune target (ophalen)", config.combatRuneTarget(), 1, 1000, v -> setConfig("combatRuneTarget", v));
-            addComboBox(c, "Genie lamp skill", CombatBotConfig.GenieLampSkill.values(), config.genieLampSkill(), v -> setConfig("genieLampSkill", v.name()));
+        }));
+        panel.add(Box.createVerticalStrut(6));
+
+        panel.add(createCollapsibleSection("🧞 Genie lamp (random event)", false, false, c -> {
+            JLabel lampInfo = new JLabel("<html><i>Kies welke skill de lamp gebruikt. "
+                    + "Met de testknop hieronder wordt alleen gehoverd op Attack → Magic → Confirm (geen klik).</i></html>");
+            lampInfo.setFont(FONT_LABEL);
+            lampInfo.setForeground(TEXT_DIM);
+            lampInfo.setAlignmentX(Component.LEFT_ALIGNMENT);
+            lampInfo.setBorder(new EmptyBorder(0, 10, 6, 10));
+            c.add(lampInfo);
+
+            addComboBox(c, "Genie lamp skill", CombatBotConfig.GenieLampSkill.values(), config.genieLampSkill(),
+                    v -> setConfig("genieLampSkill", v.name()));
+
+            JPanel lampTestRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+            lampTestRow.setOpaque(false);
+            lampTestRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+            JButton lampTestBtn = new JButton("🧪 Test lamp hover");
+            styleSmallButton(lampTestBtn, new Color(65, 80, 120));
+            lampTestBtn.setToolTipText("Opent lamp en hovert op Attack, Magic en Confirm widgets (zonder klik).");
+            lampTestBtn.addActionListener(e -> onTestLampHoverRequested.run());
+            lampTestRow.add(lampTestBtn);
+            c.add(lampTestRow);
         }));
         panel.add(Box.createVerticalStrut(6));
 
@@ -677,6 +789,7 @@ public class CombatBotPanel extends PluginPanel {
             addSlider(c, "Kills vóór looten", config.lootDelayKills(), 0, 15, v -> setConfig("lootDelayKills", v));
             addSlider(c, "Min wacht (sec)", config.lootDelayMinSeconds(), 0, 30, v -> setConfig("lootDelayMinSeconds", v));
             addSlider(c, "Max wacht (sec)", config.lootDelayMaxSeconds(), 0, 60, v -> setConfig("lootDelayMaxSeconds", v));
+            addToggle(c, "Eet om ruimte te maken voor loot", config.eatToMakeSpaceForLoot(), v -> setConfig("eatToMakeSpaceForLoot", v));
         }));
 
         panel.add(Box.createVerticalGlue());
@@ -863,6 +976,20 @@ public class CombatBotPanel extends PluginPanel {
             addToggle(c, "Voorkeur Varrock ingang", config.giantsPreferVarrock(), v -> setConfig("giantsPreferVarrock", v));
             addOverlayToggle(c, "Toon Giants overlay", config.showGiantsOverlay(), "showGiantsOverlay");
         }));
+        panel.add(Box.createVerticalStrut(6));
+        panel.add(createCollapsibleSection("🍗 Food banking (onafhankelijk)", false, true, c -> {
+            JLabel info = new JLabel("<html><i>Werkt los van de globale 'Bank als food op'-switch.<br>"
+                    + "Zodra food in inventory onder de drempel komt → terug naar bank, "
+                    + "ongeacht HP. Voorkomt paniek-eat-loops.</i></html>");
+            info.setForeground(new Color(180, 180, 180));
+            info.setFont(info.getFont().deriveFont(11f));
+            info.setBorder(new EmptyBorder(2, 4, 6, 4));
+            c.add(info);
+            addToggle(c, "Giants: bank voor food", config.giantsBankForFood(),
+                    v -> setConfig("giantsBankForFood", v));
+            addSlider(c, "Giants: food drempel", config.giantsLowFoodBankThreshold(), 1, 10,
+                    v -> setConfig("giantsLowFoodBankThreshold", v));
+        }));
 
         panel.add(Box.createVerticalGlue());
         return wrapScroll(panel);
@@ -959,28 +1086,14 @@ public class CombatBotPanel extends PluginPanel {
         panel.setBackground(BG_DARK);
         panel.setBorder(new EmptyBorder(8, 8, 8, 8));
 
-        JLabel info = new JLabel("<html><b>Center locaties per skill</b><br>Rechtermuisklik in-game om toe te voegen.</html>");
+        JLabel info = new JLabel("<html><b>Center locaties per skill</b><br>Rechtermuisklik in-game om toe te voegen.<br>"
+                + "<span style='color:#a0a0b0;font-size:10px'>Of elk account alleen de volledige lijst hier volgt (zonder subset "
+                + "uit <b>Bewerken</b>), stel dat in per account op de tab <b>Accounts</b> → <b>Bewerken</b>.</span></html>");
         info.setFont(FONT_LABEL);
         info.setForeground(TEXT_DIM);
         info.setAlignmentX(Component.LEFT_ALIGNMENT);
         info.setBorder(new EmptyBorder(0, 0, 8, 0));
         panel.add(info);
-
-        JPanel accountsGlobal = createSection("👤 Accounts & centra", false);
-        addToggle(accountsGlobal,
-                "Alle accounts: alleen globale center-lijsten (negeer eigen locaties in Account bewerken)",
-                config.accountsUseGlobalCenterListsOnly(),
-                v -> setConfig("accountsUseGlobalCenterListsOnly", v));
-        JLabel agHint = new JLabel("<html><div style='color:#a0a0b0;font-size:10px;width:420px'>"
-                + "Staat dit <b>aan</b> dan volgt elk account bij inloggen/wissel de volledige lijst van deze tab voor elke "
-                + "aangevinkte skill — niet de subset uit <b>Bewerken… → Locaties</b>. Staat het <b>uit</b>, dan gelden je "
-                + "per-account locatiekiezen weer."
-                + "</div></html>");
-        agHint.setAlignmentX(Component.LEFT_ALIGNMENT);
-        agHint.setBorder(new EmptyBorder(0, 10, 4, 10));
-        accountsGlobal.add(agHint);
-        panel.add(accountsGlobal);
-        panel.add(Box.createVerticalStrut(6));
 
         JPanel defaultCentersRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 2));
         defaultCentersRow.setBackground(BG_DARK);
@@ -1050,7 +1163,7 @@ public class CombatBotPanel extends PluginPanel {
     private void addGiantsSection(JPanel parent) {
         JPanel section = createSection("🗡 Giants (Edgeville Dungeon)", false);
         addToggle(section, "Giants als skill kiezen (in rotatie / start skill)", config.giantsMode(), v -> setConfig("giantsMode", v));
-        JLabel info = new JLabel("<html><i>Hill Giants — Edgeville Dungeon (brass key vereist).</i></html>");
+        JLabel info = new JLabel("<html><i>Hill Giants — Edgeville Dungeon (brass key). Per account: Accounts → Bewerken (globale lijsten uit) → Giants combat + onderaan \"Giants — in rotatie\".</i></html>");
         info.setFont(FONT_LABEL);
         info.setForeground(TEXT_DIM);
         info.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -1225,6 +1338,31 @@ public class CombatBotPanel extends PluginPanel {
         b.setBackground(bg);
         b.setForeground(Color.WHITE);
         b.setFocusPainted(false);
+    }
+
+    /** RuneLite / embedded Swing: parent voor modale dialoog (getWindowAncestor kan null zijn). */
+    private static Window resolveSwingOwner(Component c) {
+        Window w = SwingUtilities.getWindowAncestor(c);
+        if (w != null && w.isDisplayable()) {
+            return w;
+        }
+        Window fw = KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusedWindow();
+        if (fw != null && fw.isDisplayable()) {
+            return fw;
+        }
+        for (Frame fr : Frame.getFrames()) {
+            if (fr != null && fr.isDisplayable() && fr.isVisible()) {
+                return fr;
+            }
+        }
+        return w;
+    }
+
+    private static String escapeForHtmlLabel(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>");
     }
 
     private void exportSettingsToFile(Component parent) {
@@ -1455,6 +1593,26 @@ public class CombatBotPanel extends PluginPanel {
         } finally {
             syncingMirroredToggles = false;
         }
+    }
+
+    /**
+     * Plain action knop. Voor "fire-and-forget" config-triggers (bv. tile preset save/load) waar de
+     * plugin zelf de config-flag terug op false zet. We zetten hier alleen true/start de Runnable.
+     */
+    private void addActionButton(JPanel section, String label, Runnable onClick) {
+        JPanel row = new JPanel(new BorderLayout());
+        row.setBackground(BG_SECTION);
+        row.setBorder(new EmptyBorder(5, 10, 5, 10));
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 36));
+        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        JButton btn = new JButton(label);
+        btn.setFont(FONT_LABEL);
+        btn.setForeground(Color.WHITE);
+        btn.setBackground(new Color(60, 65, 80));
+        btn.setFocusPainted(false);
+        btn.addActionListener(e -> { if (onClick != null) onClick.run(); });
+        row.add(btn, BorderLayout.CENTER);
+        section.add(row);
     }
 
     /** Toggle die na activatie direct weer uitvinkt (voor Switch Now / Sell now). */
@@ -2039,6 +2197,36 @@ public class CombatBotPanel extends PluginPanel {
         return section;
     }
 
+    private synchronized List<ManagedJagexAccountsStore.ManagedJagexAccountRow> managedAccountRowsShared() {
+        if (sharedManagedAccountRows == null) {
+            sharedManagedAccountRows = new ArrayList<>(ManagedJagexAccountsStore.parseRows(config.managedJagexAccountsBlob()));
+            if (sharedManagedAccountRows.isEmpty()) {
+                sharedManagedAccountRows.addAll(buildRowsFromPastedFallback());
+            }
+        }
+        return sharedManagedAccountRows;
+    }
+
+    private void registerAccountTableRefill(Runnable refillTable) {
+        accountTableRefillCallbacks.removeIf(wr -> wr.get() == null);
+        accountTableRefillCallbacks.add(new WeakReference<>(refillTable));
+    }
+
+    /** Alle open Accounts-tabellen (zijpaneel + los venster) opnieuw vullen vanuit de gedeelde accountlijst. */
+    private void refreshAllAccountTables() {
+        accountTableRefillCallbacks.removeIf(wr -> wr.get() == null);
+        for (WeakReference<Runnable> wr : accountTableRefillCallbacks) {
+            Runnable r = wr.get();
+            if (r != null) {
+                try {
+                    r.run();
+                } catch (Throwable t) {
+                    DebugLog.log("StormImport", "Account-tabel verversen: " + t.getMessage());
+                }
+            }
+        }
+    }
+
     private JPanel createAccountsManagerTab() {
         JPanel root = new JPanel(new BorderLayout());
         root.setBackground(BG_DARK);
@@ -2056,11 +2244,7 @@ public class CombatBotPanel extends PluginPanel {
         northStack.add(Box.createVerticalStrut(8));
         root.add(northStack, BorderLayout.NORTH);
 
-        final List<ManagedJagexAccountsStore.ManagedJagexAccountRow> accountRows = new ArrayList<>(
-                ManagedJagexAccountsStore.parseRows(config.managedJagexAccountsBlob()));
-        if (accountRows.isEmpty()) {
-            accountRows.addAll(buildRowsFromPastedFallback());
-        }
+        final List<ManagedJagexAccountsStore.ManagedJagexAccountRow> accountRows = managedAccountRowsShared();
 
         String[] colNames = {
                 "Rotatie", "Volgende", "ℹ", "Gebruikersnaam", "GP ~", "Cmb", "A/S/D", "WC", "Min", "Fish", "Pray", "Magic", "Quests", "Skill", "Timer", "Centers", "Laatst"
@@ -2186,6 +2370,8 @@ public class CombatBotPanel extends PluginPanel {
             }
         };
 
+        registerAccountTableRefill(refillTable);
+
         final Timer[] accountPersistDebounce = new Timer[1];
         Runnable runPersistManagedAccounts = () -> {
             List<ManagedJagexAccountsStore.ManagedJagexAccountRow> save = new ArrayList<>();
@@ -2196,7 +2382,7 @@ public class CombatBotPanel extends PluginPanel {
             }
             ManagedJagexAccountsStore.persist(configManager, save);
             onManagedAccountsSaved.run();
-            refillTable.run();
+            refreshAllAccountTables();
         };
         Runnable schedulePersistManagedAccounts = () -> {
             if (accountPersistDebounce[0] != null) {
@@ -2351,7 +2537,7 @@ public class CombatBotPanel extends PluginPanel {
                 return;
             }
             if (showAccountEditDialog(SwingUtilities.getWindowAncestor(root), sel)) {
-                refillTable.run();
+                refreshAllAccountTables();
                 schedulePersistManagedAccounts.run();
             }
         };
@@ -2363,7 +2549,7 @@ public class CombatBotPanel extends PluginPanel {
             }
             if (sel != null) {
                 accountRows.remove(sel);
-                refillTable.run();
+                refreshAllAccountTables();
                 schedulePersistManagedAccounts.run();
             }
         };
@@ -2433,7 +2619,7 @@ public class CombatBotPanel extends PluginPanel {
             }
         });
 
-        refillTable.run();
+        refreshAllAccountTables();
         JScrollPane scroll = new JScrollPane(table);
         scroll.setBorder(null);
         JPanel tableToolbar = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 4));
@@ -2444,7 +2630,7 @@ public class CombatBotPanel extends PluginPanel {
         cbHideSuspectBanned.setBackground(BG_DARK);
         cbHideSuspectBanned.addActionListener(e -> {
             setConfig("accountsTableHideSuspectBanned", cbHideSuspectBanned.isSelected());
-            refillTable.run();
+            refreshAllAccountTables();
         });
         tableToolbar.add(cbHideSuspectBanned);
         JPanel centerWrap = new JPanel(new BorderLayout());
@@ -2460,6 +2646,11 @@ public class CombatBotPanel extends PluginPanel {
         styleSmallButton(addBtn, new Color(50, 100, 60));
         JButton importBtn = new JButton("Importeer plak-tekst");
         styleSmallButton(importBtn, new Color(55, 75, 120));
+        JButton importStormJsonBtn = new JButton("Importeer Storm JSON…");
+        styleSmallButton(importStormJsonBtn, new Color(55, 95, 120));
+        importStormJsonBtn.setToolTipText("<html>Bulk: kies een <code>storm-accounts.json</code> (velden <code>character_id</code>, "
+                + "<code>session_id</code>, <code>display_name</code>, optioneel <code>world</code>). "
+                + "Accounts die al bestaan (zelfde character id, session id of displaynaam) worden overgeslagen.</html>");
         JButton editBtn = new JButton("Bewerken…");
         styleSmallButton(editBtn, new Color(70, 70, 95));
         JButton delBtn = new JButton("Verwijder");
@@ -2470,17 +2661,30 @@ public class CombatBotPanel extends PluginPanel {
                 + "Breekt hangende account-wissel/re-log en handler-stuck-state af, huidige skill blijft behouden.");
         btns.add(addBtn);
         btns.add(importBtn);
+        btns.add(importStormJsonBtn);
         btns.add(editBtn);
         btns.add(delBtn);
         btns.add(resetStateBtn);
-        root.add(btns, BorderLayout.SOUTH);
+
+        JLabel lblStormImportStatus = new JLabel(" ");
+        lblStormImportStatus.setFont(FONT_LABEL);
+        lblStormImportStatus.setForeground(TEXT_DIM);
+        lblStormImportStatus.setAlignmentX(Component.LEFT_ALIGNMENT);
+        lblStormImportStatus.setBorder(new EmptyBorder(2, 4, 6, 4));
+
+        JPanel south = new JPanel();
+        south.setLayout(new BoxLayout(south, BoxLayout.Y_AXIS));
+        south.setOpaque(false);
+        south.add(btns);
+        south.add(lblStormImportStatus);
+        root.add(south, BorderLayout.SOUTH);
 
         addBtn.addActionListener(e -> {
             ManagedJagexAccountsStore.ManagedJagexAccountRow r = new ManagedJagexAccountsStore.ManagedJagexAccountRow();
             r.displayName = "account" + (accountRows.size() + 1);
             r.rotationEnabled = true;
             accountRows.add(r);
-            refillTable.run();
+            refreshAllAccountTables();
             schedulePersistManagedAccounts.run();
         });
 
@@ -2516,9 +2720,73 @@ public class CombatBotPanel extends PluginPanel {
                 }
                 row.rotationEnabled = enabled.contains(dn);
             }
-            refillTable.run();
+            refreshAllAccountTables();
             schedulePersistManagedAccounts.run();
             JOptionPane.showMessageDialog(root, "Geïmporteerd uit huidige geplakte credentials.", "Accounts", JOptionPane.INFORMATION_MESSAGE);
+        });
+
+        importStormJsonBtn.addActionListener(e -> {
+            Window w = resolveSwingOwner(root);
+            JFileChooser fc = new JFileChooser();
+            fc.setDialogTitle("Storm accounts JSON (storm-accounts.json)");
+            fc.setFileFilter(new FileNameExtensionFilter("JSON (*.json)", "json"));
+            if (fc.showOpenDialog(w) != JFileChooser.APPROVE_OPTION) {
+                return;
+            }
+            File f = fc.getSelectedFile();
+            if (f == null || !f.isFile()) {
+                return;
+            }
+            try {
+                String json = Files.readString(f.toPath(), StandardCharsets.UTF_8);
+                StormAccountsBulkImport.Result res = StormAccountsBulkImport.importInto(accountRows, json);
+
+                Runnable showDlg = () -> {
+                    try {
+                        Window owner = resolveSwingOwner(root);
+                        if (res.fatalError != null) {
+                            JOptionPane.showMessageDialog(owner,
+                                    res.fatalError,
+                                    "Storm JSON import",
+                                    JOptionPane.ERROR_MESSAGE);
+                        } else {
+                            JOptionPane.showMessageDialog(owner,
+                                    res.summary() + "\n\nBestand:\n" + f.getAbsolutePath(),
+                                    "Storm JSON import",
+                                    JOptionPane.INFORMATION_MESSAGE);
+                        }
+                    } catch (Throwable t) {
+                        DebugLog.log("StormImport", "Dialoog mislukt: " + t.getMessage());
+                    }
+                };
+
+                if (res.fatalError != null) {
+                    String t = res.fatalError + "\n\n" + f.getAbsolutePath();
+                    lblStormImportStatus.setText("<html><body width='440'><font color='#ff8888'>"
+                            + escapeForHtmlLabel(t) + "</font></body></html>");
+                    refreshAllAccountTables();
+                    DebugLog.log("StormImport", "fatal: " + res.fatalError);
+                    SwingUtilities.invokeLater(showDlg);
+                    return;
+                }
+
+                refreshAllAccountTables();
+                if (res.added > 0) {
+                    schedulePersistManagedAccounts.run();
+                }
+                String summaryLine = res.summary() + "\n\n" + f.getAbsolutePath();
+                lblStormImportStatus.setText("<html><body width='440'>" + escapeForHtmlLabel(summaryLine) + "</body></html>");
+                DebugLog.log("StormImport", res.summary().replace('\n', ' '));
+                SwingUtilities.invokeLater(showDlg);
+            } catch (Exception ex) {
+                lblStormImportStatus.setText("<html><body width='440'><font color='#ff8888'>"
+                        + escapeForHtmlLabel("Fout: " + ex.getMessage()) + "</font></body></html>");
+                DebugLog.log("StormImport", "exception: " + ex.getMessage());
+                SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(resolveSwingOwner(root),
+                        "Kon niet importeren: " + ex.getMessage(),
+                        "Import mislukt",
+                        JOptionPane.ERROR_MESSAGE));
+            }
         });
 
         editBtn.addActionListener(e -> runEditSelectedAccount.run());
@@ -2537,10 +2805,10 @@ public class CombatBotPanel extends PluginPanel {
 
         resetStateBtn.addActionListener(e -> {
             onResetAllBotState.run();
-            refillTable.run();
+            refreshAllAccountTables();
         });
 
-        Timer refreshTimer = new Timer(8000, e2 -> refillTable.run());
+        Timer refreshTimer = new Timer(8000, e2 -> refreshAllAccountTables());
         refreshTimer.start();
 
         return root;
@@ -2575,6 +2843,133 @@ public class CombatBotPanel extends PluginPanel {
         return out;
     }
 
+    /** Compacte ⓘ-knop: volledige uitleg in een dialoog (account-bewerken). */
+    private static JButton createAccountInfoButton(Window owner, String title, String htmlBody) {
+        JButton b = new JButton("ⓘ");
+        b.setFont(new Font("SansSerif", Font.BOLD, 13));
+        b.setForeground(new Color(130, 170, 230));
+        b.setBackground(BG_DARK);
+        b.setBorderPainted(false);
+        b.setContentAreaFilled(false);
+        b.setFocusPainted(false);
+        b.setMargin(new Insets(0, 2, 0, 2));
+        b.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        b.setToolTipText("Uitleg");
+        b.addActionListener(e -> JOptionPane.showMessageDialog(owner,
+                "<html><body style='width:400px;font-family:sans-serif;font-size:12px'>" + htmlBody + "</body></html>",
+                title,
+                JOptionPane.INFORMATION_MESSAGE));
+        return b;
+    }
+
+    private static JPanel accountSectionHeader(String title, JButton infoButton) {
+        JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        row.setOpaque(false);
+        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        JLabel lab = new JLabel(title);
+        lab.setFont(FONT_SECTION);
+        lab.setForeground(TEXT);
+        row.add(lab);
+        row.add(infoButton);
+        return row;
+    }
+
+    /**
+     * Per-account "GE inkoop" blok: per categorie een vinkje (mag bot kopen?) + spinner (max-cap).
+     * State wordt geserializeerd als compact blob via {@link GeShopPolicy#serializeBlob}.
+     */
+    private static final class GeShopBlock {
+        final JPanel root;
+        final java.util.LinkedHashMap<GeShopPolicy.Category, JCheckBox> checkboxes = new java.util.LinkedHashMap<>();
+        final java.util.LinkedHashMap<GeShopPolicy.Category, JSpinner> caps = new java.util.LinkedHashMap<>();
+
+        GeShopBlock(JPanel root) { this.root = root; }
+
+        void applyToRow(ManagedJagexAccountsStore.ManagedJagexAccountRow r) {
+            java.util.LinkedHashMap<GeShopPolicy.Category, GeShopPolicy.CategoryRule> rules =
+                    new java.util.LinkedHashMap<>();
+            for (GeShopPolicy.Category c : GeShopPolicy.Category.values()) {
+                JCheckBox cb = checkboxes.get(c);
+                JSpinner sp = caps.get(c);
+                boolean on = cb == null || cb.isSelected();
+                int cap = sp == null ? 0 : ((Number) sp.getValue()).intValue();
+                rules.put(c, new GeShopPolicy.CategoryRule(on, cap));
+            }
+            r.geBuyTogglesBlob = GeShopPolicy.serializeBlob(rules);
+        }
+    }
+
+    private GeShopBlock buildGeShopBlock(Window parent,
+                                         ManagedJagexAccountsStore.ManagedJagexAccountRow r) {
+        java.util.Map<GeShopPolicy.Category, GeShopPolicy.CategoryRule> rules =
+                GeShopPolicy.parseBlob(r.geBuyTogglesBlob);
+
+        JPanel root = new JPanel();
+        root.setLayout(new BoxLayout(root, BoxLayout.Y_AXIS));
+        root.setBackground(BG_DARK);
+        root.setAlignmentX(Component.LEFT_ALIGNMENT);
+        root.setBorder(new EmptyBorder(8, 0, 4, 0));
+
+        String helpHtml = "<p>Vink uit wat dit account <b>niet</b> mag kopen in de Grand Exchange. "
+                + "Per categorie kan je optioneel een <b>cap</b> zetten (0 = geen extra cap, gebruik wat de handler vraagt).</p>"
+                + "<p>Voorbeeld: <b>Dure runes</b> cap = 30 → de bot koopt nooit meer dan 30 Law/Death/Nature/...&nbsp;per restock-call. "
+                + "Goed tegen het 'koopt 160 Law runes'-probleem.</p>"
+                + "<p>Bestaande accounts zonder instellingen starten met <b>alle vinkjes aan</b> en <b>Dure runes cap = 30</b> als veilige default.</p>"
+                + "<p>Een geblokkeerde aankoop verschijnt in de log als <code>[GeRestock] BLOKKADE per-account policy: '...'</code>.</p>";
+        JPanel head = accountSectionHeader(
+                "📦 GE inkoop (per account)",
+                createAccountInfoButton(parent, "GE inkoop", helpHtml));
+        head.setBorder(new EmptyBorder(0, 0, 6, 0));
+        root.add(head);
+
+        GeShopBlock block = new GeShopBlock(root);
+
+        JPanel grid = new JPanel(new GridBagLayout());
+        grid.setBackground(BG_DARK);
+        grid.setAlignmentX(Component.LEFT_ALIGNMENT);
+        GridBagConstraints g = new GridBagConstraints();
+        g.anchor = GridBagConstraints.WEST;
+        g.insets = new Insets(2, 4, 2, 8);
+
+        int row = 0;
+        for (GeShopPolicy.Category cat : GeShopPolicy.Category.values()) {
+            GeShopPolicy.CategoryRule rule = rules.getOrDefault(cat,
+                    new GeShopPolicy.CategoryRule(true, 0));
+
+            JCheckBox cb = new JCheckBox(cat.label);
+            cb.setFont(FONT_LABEL);
+            cb.setBackground(BG_DARK);
+            cb.setForeground(TEXT);
+            cb.setSelected(rule.allowed);
+            cb.setToolTipText(
+                    "Aan: bot mag deze categorie in de GE kopen. "
+                            + "Uit: élke buy van een item in deze categorie wordt geweigerd (FAILED → handler valt terug).");
+            block.checkboxes.put(cat, cb);
+
+            JLabel capLab = new JLabel("max:");
+            capLab.setFont(FONT_LABEL);
+            capLab.setForeground(TEXT_DIM);
+
+            JSpinner cap = new JSpinner(new javax.swing.SpinnerNumberModel(
+                    Math.max(0, rule.cap), 0, 100_000, 1));
+            cap.setPreferredSize(new Dimension(72, 22));
+            cap.setToolTipText(
+                    "Cap op totale hoeveelheid per restock-call. 0 = geen extra cap (handler-default). "
+                            + "Voor dure runes raden we 20–40 aan.");
+            block.caps.put(cat, cap);
+
+            g.gridx = 0; g.gridy = row; g.weightx = 1.0; g.fill = GridBagConstraints.HORIZONTAL;
+            grid.add(cb, g);
+            g.gridx = 1; g.weightx = 0; g.fill = GridBagConstraints.NONE;
+            grid.add(capLab, g);
+            g.gridx = 2;
+            grid.add(cap, g);
+            row++;
+        }
+        root.add(grid);
+        return block;
+    }
+
     private boolean showAccountEditDialog(Window parent, ManagedJagexAccountsStore.ManagedJagexAccountRow r) {
         JPanel form = new JPanel(new BorderLayout(0, 10));
         JPanel top = new JPanel(new GridLayout(0, 2, 6, 4));
@@ -2600,6 +2995,11 @@ public class CombatBotPanel extends PluginPanel {
         JCheckBox cbMagicAutoUpdate = new JCheckBox();
         cbMagicAutoUpdate.setSelected(r.magicAutoUpdate);
         cbMagicAutoUpdate.setToolTipText("Auto: bij Magic 13+ in Imps MAGE naar Fire Strike upgraden; bij coin-tekort eerst loot verkopen.");
+        JCheckBox cbGlobalCenterListsOnly = new JCheckBox();
+        cbGlobalCenterListsOnly.setSelected(r.useGlobalCenterListsOnly);
+        cbGlobalCenterListsOnly.setToolTipText(
+                "Aan: dit account gebruikt altijd de center-lijsten van de tab Centers + globale skill-vinken. "
+                        + "Uit: welke skills meetellen en Imps-combat/Giants zie je hieronder (zelfde idee als de dropdowns bovenin).");
         ManagedJagexAccountsStore.AccountStatSnapshot statSnap =
                 ManagedJagexAccountsStore.snapshotForRow(
                         ManagedJagexAccountsStore.parseSnapshots(config.accountStatSnapshotsBlob()),
@@ -2609,6 +3009,9 @@ public class CombatBotPanel extends PluginPanel {
                 : "nog onbekend";
         AccountStateJsonStore.AccountEntry accountState = AccountStateJsonStore.getEntry(r.displayName);
         long lastCalibMs = accountState != null ? accountState.lastBankCalibrationMs : 0L;
+        String antiBanSummary = formatAntiBanSummary(accountState);
+        String antiBanLast = formatAntiBanLastAction(accountState);
+        String bankSnapshotSummary = formatBankSnapshotSummary(accountState);
         cbWorldHop.setToolTipText("Aan: bij rotatie naar dit account eerst hoppen (willekeurig F2P of vak hiernaast). Uit: geen hop.");
         Runnable syncWorldField = () -> fWorld.setEnabled(cbWorldHop.isSelected());
         cbWorldHop.addActionListener(e -> syncWorldField.run());
@@ -2620,13 +3023,131 @@ public class CombatBotPanel extends PluginPanel {
         addFormRow(top, "Target Attack lvl (account)", fAttTarget);
         addFormRow(top, "Target Strength lvl (account)", fStrTarget);
         addFormRow(top, "Target Defence lvl (account)", fDefTarget);
+
+        // Melee prioriteit: welke stat eerst getraind wordt zolang die onder z'n target zit.
+        JComboBox<MeleePriorityOption> meleePriorityCombo = new JComboBox<>(MeleePriorityOption.values());
+        meleePriorityCombo.setSelectedItem(MeleePriorityOption.fromKey(r.targetMeleePriority));
+        meleePriorityCombo.setMaximumSize(new Dimension(Integer.MAX_VALUE, 28));
+        meleePriorityCombo.setToolTipText(
+                "Volgorde waarin de bot Att/Str/Def naar hun target traint zolang ze nog niet bereikt zijn. "
+                        + "Lowest-varianten kiezen dynamisch (laagste lvl of laagste % van target).");
+        top.add(new JLabel("Melee prioriteit (volgorde)"));
+        top.add(meleePriorityCombo);
         top.add(new JLabel("Huidig Att / Str / Def"));
         top.add(new JLabel(currentMeleeLevels));
         String calibSuffix = lastCalibMs > 0 ? " (laatste: " + formatDateTime(lastCalibMs) + ")" : " (nog niet)";
         top.add(new JLabel("Bank calibreren bij login" + calibSuffix));
         top.add(cbCalibrateBank);
+        top.add(new JLabel("Bank snapshot (account)"));
+        top.add(new JLabel(bankSnapshotSummary));
+        top.add(new JLabel("Anti-ban acties (account)"));
+        top.add(new JLabel(antiBanSummary));
+        top.add(new JLabel("Laatste anti-ban actie"));
+        top.add(new JLabel(antiBanLast));
         top.add(new JLabel("Magic auto update (Imps)"));
         top.add(cbMagicAutoUpdate);
+        top.add(new JLabel("Centers: alleen globale lijsten"));
+        top.add(cbGlobalCenterListsOnly);
+
+        JComboBox<Object> startSkillAccountCombo = new JComboBox<>();
+        startSkillAccountCombo.addItem(null);
+        for (CombatBotConfig.StartSkill sk : CombatBotConfig.StartSkill.values()) {
+            startSkillAccountCombo.addItem(sk);
+        }
+        startSkillAccountCombo.setMaximumSize(new Dimension(Integer.MAX_VALUE, 28));
+        startSkillAccountCombo.setAlignmentX(Component.LEFT_ALIGNMENT);
+        startSkillAccountCombo.setToolTipText(
+                "Alleen als \"Centers: alleen globale lijsten\" hierboven UIT staat: "
+                        + "start skill voor dit account i.p.v. de globale keuze op de Rotation-tab. "
+                        + "Staat globale lijsten AAN, dan geldt altijd de Rotation-tab (opgeslagen keuze blijft bewaard).");
+        startSkillAccountCombo.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index,
+                    boolean isSelected, boolean cellHasFocus) {
+                Object disp = value;
+                if (value instanceof CombatBotConfig.StartSkill) {
+                    disp = ((CombatBotConfig.StartSkill) value).toString();
+                } else if (value == null) {
+                    disp = "Globaal (Rotation-tab)";
+                }
+                return super.getListCellRendererComponent(list, disp, index, isSelected, cellHasFocus);
+            }
+        });
+        String sso = r.startSkillOverride != null ? r.startSkillOverride.trim() : "";
+        if (sso.isEmpty()) {
+            startSkillAccountCombo.setSelectedIndex(0);
+        } else {
+            CombatBotConfig.StartSkill found = null;
+            try {
+                found = CombatBotConfig.StartSkill.valueOf(sso.toUpperCase(Locale.ROOT));
+            } catch (IllegalArgumentException ignored) {
+            }
+            if (found != null) {
+                startSkillAccountCombo.setSelectedItem(found);
+            } else {
+                startSkillAccountCombo.setSelectedIndex(0);
+            }
+        }
+        final JPanel[] perAccountSkillBlockHolder = new JPanel[1];
+        Runnable syncPerAccountBlocks = () -> {
+            boolean perAccount = !cbGlobalCenterListsOnly.isSelected();
+            startSkillAccountCombo.setEnabled(perAccount);
+            JPanel b = perAccountSkillBlockHolder[0];
+            if (b != null) {
+                b.setVisible(perAccount);
+            }
+        };
+        cbGlobalCenterListsOnly.addActionListener(e -> syncPerAccountBlocks.run());
+        syncPerAccountBlocks.run();
+        top.add(new JLabel("Start skill (alleen als globale lijsten uit staan)"));
+        top.add(startSkillAccountCombo);
+
+        top.add(new JLabel("Wereld (account-wissel)"));
+        JPanel worldHopRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        worldHopRow.setOpaque(false);
+        worldHopRow.add(cbWorldHop);
+        worldHopRow.add(fWorld);
+        top.add(worldHopRow);
+        form.add(top, BorderLayout.NORTH);
+
+        JPanel centers = new JPanel();
+        centers.setLayout(new BoxLayout(centers, BoxLayout.Y_AXIS));
+        centers.setBackground(BG_DARK);
+        centers.setBorder(new EmptyBorder(0, 4, 0, 0));
+
+        String centersHelpHtml = "<p><b>Centers: alleen globale lijsten</b> (bovenaan dit venster)</p>"
+                + "<p>Staat dit <b>aan</b>: dit account gebruikt altijd de center-lijsten van de tab <b>Centers</b> "
+                + "en de globale rotatie (Rotation-tab).</p>"
+                + "<p>Staat het <b>uit</b>: je stelt hieronder per skill in of je de volledige globale lijst gebruikt "
+                + "of zelf locaties aan/uit zet.</p>"
+                + "<p><b>Dubbelklik login</b> (Accounts-tab): vul <i>Profiel credentials.properties</i> in "
+                + "(of <code>jagex:pad</code> in de accountlijst) zodat RuneLite geen \"mist username/session\" geeft.</p>";
+        JPanel centersHead = accountSectionHeader("Centers & account", createAccountInfoButton(parent, "Centers & account", centersHelpHtml));
+        centersHead.setBorder(new EmptyBorder(0, 0, 8, 0));
+        centers.add(centersHead);
+
+        JPanel perAccountSkillBlock = new JPanel();
+        perAccountSkillBlock.setLayout(new BoxLayout(perAccountSkillBlock, BoxLayout.Y_AXIS));
+        perAccountSkillBlock.setOpaque(true);
+        perAccountSkillBlock.setBackground(BG_SECTION);
+        perAccountSkillBlock.setAlignmentX(Component.LEFT_ALIGNMENT);
+        perAccountSkillBlock.setBorder(BorderFactory.createCompoundBorder(
+                new LineBorder(new Color(52, 56, 72), 1),
+                new EmptyBorder(10, 12, 12, 12)));
+        perAccountSkillBlockHolder[0] = perAccountSkillBlock;
+
+        String skillsHelpHtml = "<p>Alleen zichtbaar als <b>Centers: alleen globale lijsten</b> <b>uit</b> staat.</p>"
+                + "<p><b>Gebruik globale lijst</b> per skill: aan = alle locaties van de tab Centers; uit = vink hieronder "
+                + "welke locaties dit account gebruikt (minstens één = skill aan).</p>"
+                + "<p><b>Imps (Karamja)</b>: de globale lijst is <i>exact</i> wat je op de tab <b>Centers</b> onder "
+                + "<b>🎯 Imps (Karamja)</b> → <b>Imps hunting centers</b> hebt staan (zelfde data als in de plugin-instellingen).</p>"
+                + "<p><b>Imps combat</b> en <b>Giants combat</b>: zelfde idee als op de skill-tabs (Globaal of vast MELEE/RANGED/MAGE).</p>"
+                + "<p><b>Giants — in rotatie</b>: uit = dit account doet nooit Giants; aan = volgens Giants-tab "
+                + "(of vast \"aan\" als je dat eerder zo had opgeslagen).</p>";
+        JPanel skillsHead = accountSectionHeader("Skills, locaties & Giants", createAccountInfoButton(parent, "Skills, locaties & Giants", skillsHelpHtml));
+        skillsHead.setBorder(new EmptyBorder(0, 0, 10, 0));
+        perAccountSkillBlock.add(skillsHead);
+
         JComboBox<String> impsStyleCombo = new JComboBox<>(new String[] {
                 "Globaal (Imps-tab)",
                 "MELEE",
@@ -2649,52 +3170,233 @@ public class CombatBotPanel extends PluginPanel {
             }
             impsStyleCombo.setSelectedIndex(sel);
         }
-        top.add(new JLabel("Imps combat (per account)"));
-        top.add(impsStyleCombo);
-        top.add(new JLabel("Wereld (account-wissel)"));
-        JPanel worldHopRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        worldHopRow.setOpaque(false);
-        worldHopRow.add(cbWorldHop);
-        worldHopRow.add(fWorld);
-        top.add(worldHopRow);
-        form.add(top, BorderLayout.NORTH);
 
-        JPanel centers = new JPanel();
-        centers.setLayout(new BoxLayout(centers, BoxLayout.Y_AXIS));
-        centers.setBackground(BG_DARK);
-        JLabel cHead = new JLabel("<html><div style='width:360px;color:#c8c8d8'>"
-                + "<b>Centers</b><br>"
-                + "Globale lijsten staan op de tab <b>Centers</b>. Vink een skill aan en kies via <b>Locaties…</b> "
-                + "welke locaties dit account gebruikt. <b>Geen</b> sub-locatie aangevinkt = skill telt niet mee in rotatie.<br><br>"
-                + "<b>Dubbelklik login</b>: op de <b>Accounts-tab</b>, vul <i>Profiel credentials.properties</i> "
-                + "in (of zet <code>jagex:pad</code> in Account lijst) zodat RuneLite geen \"mist username/session\" meer geeft."
-                + "</div></html>");
-        cHead.setAlignmentX(Component.LEFT_ALIGNMENT);
-        cHead.setBorder(new EmptyBorder(0, 0, 6, 0));
-        centers.add(cHead);
+        JComboBox<String> giantsCombatCombo = new JComboBox<>(new String[] {
+                "Globaal (Giants-tab)",
+                "MELEE",
+                "RANGED",
+                "MAGE"
+        });
+        giantsCombatCombo.setToolTipText(
+                "Giants combat: Globaal = Combat style op de Giants-tab; anders alleen dit account (MELEE / RANGED / MAGE).");
+        String gcOv = r.giantsCombatStyleOverride != null ? r.giantsCombatStyleOverride.trim() : "";
+        if (gcOv.isEmpty()) {
+            giantsCombatCombo.setSelectedIndex(0);
+        } else {
+            String upG = gcOv.toUpperCase(Locale.ROOT);
+            int selG = 0;
+            for (int i = 1; i < giantsCombatCombo.getItemCount(); i++) {
+                if (upG.equals(giantsCombatCombo.getItemAt(i))) {
+                    selG = i;
+                    break;
+                }
+            }
+            giantsCombatCombo.setSelectedIndex(selG);
+        }
 
-        AccountCenterUiState stCombat = new AccountCenterUiState(config.combatCenters(), r.combatCenters, r.useGlobalCombatCenters);
-        AccountCenterUiState stWc = new AccountCenterUiState(config.wcCenters(), r.wcCenters, r.useGlobalWcCenters);
-        AccountCenterUiState stMine = new AccountCenterUiState(config.miningCenters(), r.miningCenters, r.useGlobalMiningCenters);
-        AccountCenterUiState stFish = new AccountCenterUiState(config.fishingCenters(), r.fishingCenters, r.useGlobalFishingCenters);
-        AccountCenterUiState stImps = new AccountCenterUiState(config.impsCenters(), r.impsCenters, r.useGlobalImpsCenters);
+        // Per-account "Imps Mode (zonder radius)" toggle — uiterlijk bij het Imps (Karamja) blok.
+        JCheckBox cbImpsModeForceOn = new JCheckBox("Imps Mode (zonder radius) — voor dit account");
+        cbImpsModeForceOn.setFont(FONT_LABEL);
+        cbImpsModeForceOn.setBackground(BG_SECTION);
+        cbImpsModeForceOn.setForeground(TEXT);
+        cbImpsModeForceOn.setToolTipText(
+                "Aan: forceer Imps voor dit account, ook zonder Imps-centers (gebruikt Hunting X/Y van de Imps-tab). "
+                        + "Uit: geen override; het Imps (Karamja) blok hieronder en globale instellingen bepalen of Imps draait.");
+        {
+            String imOv = r.impsModeOverride != null ? r.impsModeOverride.trim() : "";
+            cbImpsModeForceOn.setSelected("1".equals(imOv));
+        }
 
-        centers.add(buildAccountSkillCenterRow(parent, "Combat", stCombat));
+        JPanel comboGrid = new JPanel(new GridBagLayout());
+        comboGrid.setOpaque(false);
+        comboGrid.setAlignmentX(Component.LEFT_ALIGNMENT);
+        Dimension comboPref = new Dimension(210, 26);
+        impsStyleCombo.setPreferredSize(comboPref);
+        giantsCombatCombo.setPreferredSize(comboPref);
+        GridBagConstraints cg = new GridBagConstraints();
+        cg.anchor = GridBagConstraints.WEST;
+        cg.insets = new Insets(0, 0, 8, 10);
+        JLabel limps = new JLabel("Imps combat (per account)");
+        limps.setFont(FONT_LABEL);
+        limps.setForeground(TEXT);
+        limps.setPreferredSize(new Dimension(200, 26));
+        cg.gridx = 0;
+        cg.gridy = 0;
+        comboGrid.add(limps, cg);
+        cg.gridx = 1;
+        cg.weightx = 1.0;
+        cg.fill = GridBagConstraints.HORIZONTAL;
+        comboGrid.add(impsStyleCombo, cg);
+        JLabel lGiantC = new JLabel("Giants combat (per account)");
+        lGiantC.setFont(FONT_LABEL);
+        lGiantC.setForeground(TEXT);
+        lGiantC.setPreferredSize(new Dimension(200, 26));
+        cg.gridx = 0;
+        cg.gridy = 1;
+        cg.weightx = 0;
+        cg.fill = GridBagConstraints.NONE;
+        comboGrid.add(lGiantC, cg);
+        cg.gridx = 1;
+        cg.weightx = 1.0;
+        cg.fill = GridBagConstraints.HORIZONTAL;
+        comboGrid.add(giantsCombatCombo, cg);
+        perAccountSkillBlock.add(comboGrid);
+
+        perAccountSkillBlock.add(Box.createVerticalStrut(6));
+        JSeparator sepCombatSkills = new JSeparator(SwingConstants.HORIZONTAL);
+        sepCombatSkills.setForeground(new Color(60, 64, 80));
+        sepCombatSkills.setMaximumSize(new Dimension(Integer.MAX_VALUE, 8));
+        perAccountSkillBlock.add(sepCombatSkills);
+        perAccountSkillBlock.add(Box.createVerticalStrut(8));
+
+        AccountCenterUiState stCombat = accountCenterStateFromRow(config.combatCenters(), r.combatCenters, r.useGlobalCombatCenters);
+        AccountCenterUiState stWc = accountCenterStateFromRow(config.wcCenters(), r.wcCenters, r.useGlobalWcCenters);
+        AccountCenterUiState stMine = accountCenterStateFromRow(config.miningCenters(), r.miningCenters, r.useGlobalMiningCenters);
+        AccountCenterUiState stFish = accountCenterStateFromRow(config.fishingCenters(), r.fishingCenters, r.useGlobalFishingCenters);
+        AccountCenterUiState stImps = accountCenterStateFromRow(
+                impsMasterCentersForAccountEditor(config.impsCenters(), r.impsCenters),
+                r.impsCenters,
+                r.useGlobalImpsCenters);
+
+        AccountSkillBlock blkCombat = buildAccountSkillCenterBlock("Combat", stCombat);
+        perAccountSkillBlock.add(blkCombat.root);
+        perAccountSkillBlock.add(Box.createVerticalStrut(4));
+        AccountSkillBlock blkWc = buildAccountSkillCenterBlock("Woodcutting", stWc);
+        perAccountSkillBlock.add(blkWc.root);
+        perAccountSkillBlock.add(Box.createVerticalStrut(4));
+        AccountSkillBlock blkMine = buildAccountSkillCenterBlock("Mining", stMine);
+        perAccountSkillBlock.add(blkMine.root);
+        perAccountSkillBlock.add(Box.createVerticalStrut(4));
+        AccountSkillBlock blkFish = buildAccountSkillCenterBlock("Fishing", stFish);
+        perAccountSkillBlock.add(blkFish.root);
+        perAccountSkillBlock.add(Box.createVerticalStrut(4));
+        cbImpsModeForceOn.setAlignmentX(Component.LEFT_ALIGNMENT);
+        cbImpsModeForceOn.setBorder(new EmptyBorder(2, 2, 4, 2));
+        perAccountSkillBlock.add(cbImpsModeForceOn);
+        AccountSkillBlock blkImps = buildAccountSkillCenterBlock("Imps (Karamja)", stImps);
+        perAccountSkillBlock.add(blkImps.root);
+
+        centers.add(perAccountSkillBlock);
+
+        // "Giants — in rotatie" hoort niet onder het per-account skillblok thuis: dat blok wordt
+        // verborgen als "Centers: alleen globale lijsten" AAN staat, terwijl Giants-rotatie ook
+        // onafhankelijk van dat toggle moet kunnen worden aan/uit gezet. Vandaar buiten het blok.
+        String prevGiantsOvSnapshot = r.giantsModeOverride != null ? r.giantsModeOverride.trim() : "";
+        JCheckBox cbGiantsInRotation = new JCheckBox("Giants — in rotatie");
+        cbGiantsInRotation.setFont(FONT_LABEL);
+        cbGiantsInRotation.setBackground(BG_DARK);
+        cbGiantsInRotation.setForeground(TEXT);
+        cbGiantsInRotation.setToolTipText("Uit = dit account doet nooit Giants. Aan = volgens Giants-tab (of vast 'aan' als je dat eerder zo had).");
+        {
+            String gOv = prevGiantsOvSnapshot;
+            boolean giantsOff = "0".equals(gOv) || "false".equalsIgnoreCase(gOv) || "off".equalsIgnoreCase(gOv);
+            cbGiantsInRotation.setSelected(!giantsOff);
+        }
+        cbGiantsInRotation.setAlignmentX(Component.LEFT_ALIGNMENT);
+        cbGiantsInRotation.setBorder(new EmptyBorder(8, 4, 0, 0));
+        centers.add(cbGiantsInRotation);
+
+        // Per-account "📦 GE inkoop" blok (allow-list + caps).
+        GeShopBlock geShopBlock = buildGeShopBlock(parent, r);
+        centers.add(Box.createVerticalStrut(10));
+        JSeparator sepGe = new JSeparator(SwingConstants.HORIZONTAL);
+        sepGe.setForeground(new Color(60, 64, 80));
+        sepGe.setMaximumSize(new Dimension(Integer.MAX_VALUE, 8));
+        centers.add(sepGe);
         centers.add(Box.createVerticalStrut(4));
-        centers.add(buildAccountSkillCenterRow(parent, "Woodcutting", stWc));
-        centers.add(Box.createVerticalStrut(4));
-        centers.add(buildAccountSkillCenterRow(parent, "Mining", stMine));
-        centers.add(Box.createVerticalStrut(4));
-        centers.add(buildAccountSkillCenterRow(parent, "Fishing", stFish));
-        centers.add(Box.createVerticalStrut(4));
-        centers.add(buildAccountSkillCenterRow(parent, "Imps", stImps));
+        centers.add(geShopBlock.root);
+
+        // Per-account "📜 Chronicle teleport (Diango)" toggle.
+        centers.add(Box.createVerticalStrut(10));
+        JSeparator sepChron = new JSeparator(SwingConstants.HORIZONTAL);
+        sepChron.setForeground(new Color(60, 64, 80));
+        sepChron.setMaximumSize(new Dimension(Integer.MAX_VALUE, 8));
+        centers.add(sepChron);
+
+        String chronicleHelpHtml = "<p>Aan: gebruik <b>Chronicle</b> (boek van Diango) om naar Varrock te teleporteren "
+                + "in plaats van de Magic 25 Varrock-spell. Werkt zowel met chronicle in <b>inventory</b> als "
+                + "<b>equipped</b> (rechtermuisknop → Teleport).</p>"
+                + "<p>De bot houdt zelf in de account-JSON bij hoeveel <b>charges</b> er nog op staan en "
+                + "hoeveel losse <b>Teleport cards</b> in inv/bank liggen — zo hoeft hij niet onnodig te "
+                + "banken om dat te checken. Charge-decrement gebeurt na elke teleport-actie.</p>"
+                + "<p><b>Volgende update</b>: bot kan zelf naar Diango lopen om 1 chronicle + cards te kopen "
+                + "(3–10 cards normaal, 10–30 als coins ≥ 100k).</p>";
+        JPanel chronHead = accountSectionHeader(
+                "📜 Chronicle teleport (Diango)",
+                createAccountInfoButton(parent, "Chronicle teleport", chronicleHelpHtml));
+        chronHead.setBorder(new EmptyBorder(4, 0, 4, 0));
+        centers.add(chronHead);
+
+        JCheckBox cbChronicle = new JCheckBox("Gebruik Chronicle in plaats van Magic 25 Varrock-tp");
+        cbChronicle.setFont(FONT_LABEL);
+        cbChronicle.setBackground(BG_DARK);
+        cbChronicle.setForeground(TEXT);
+        cbChronicle.setSelected(r.useChronicleForVarrock);
+        cbChronicle.setAlignmentX(Component.LEFT_ALIGNMENT);
+        cbChronicle.setBorder(new EmptyBorder(2, 4, 2, 0));
+        cbChronicle.setToolTipText(
+                "Aan: bot teleport via chronicle (rechts-klik → Teleport, in inv of equipped). "
+                        + "Uit: gewone Magic-25 Varrock-tp / walk.");
+        centers.add(cbChronicle);
+
+        // Toon huidige bekende chronicle-state uit JSON, zodat de user weet of de bot al weet
+        // hoeveel charges/cards er liggen of dat er nog gesynced moet worden.
+        AccountStateJsonStore.AccountEntry chronEntry = AccountStateJsonStore.getEntry(r.displayName);
+        String chronStatusText;
+        if (chronEntry == null) {
+            chronStatusText = "Status: nog geen JSON-entry voor dit account.";
+        } else {
+            chronStatusText = String.format(
+                    "Status (uit JSON): chronicle=%s | charges=%d | cards inv=%d | cards bank=%d",
+                    chronEntry.chronicleOwned ? "ja" : "nee",
+                    Math.max(0, chronEntry.chronicleCharges),
+                    Math.max(0, chronEntry.chronicleCardsInv),
+                    Math.max(0, chronEntry.chronicleCardsBank));
+        }
+        JLabel chronStatus = new JLabel(chronStatusText);
+        chronStatus.setFont(new Font("SansSerif", Font.PLAIN, 11));
+        chronStatus.setForeground(TEXT_DIM);
+        chronStatus.setAlignmentX(Component.LEFT_ALIGNMENT);
+        chronStatus.setBorder(new EmptyBorder(0, 6, 0, 0));
+        centers.add(chronStatus);
+
+        syncPerAccountBlocks.run();
 
         JScrollPane centersScroll = new JScrollPane(centers);
         centersScroll.setBorder(null);
+        centersScroll.getViewport().setBackground(BG_DARK);
         centersScroll.getVerticalScrollBar().setUnitIncrement(16);
+        // Vaste minimum hoogte zodat ALLE accounts dezelfde dialooggrootte krijgen, ook
+        // wanneer "Centers: alleen globale lijsten" aan staat en het skillblok verborgen is.
+        // Anders scaalt JOptionPane elke keer een andere hoogte op basis van de zichtbare content.
+        centersScroll.setPreferredSize(new Dimension(880, 380));
+        centersScroll.setMinimumSize(new Dimension(640, 200));
         form.add(centersScroll, BorderLayout.CENTER);
 
-        int ok = JOptionPane.showConfirmDialog(parent, form, "Account bewerken", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+        // Vaste preferred-size voor de hele form. Voorkomt dat het venster verschilt per account
+        // (bv. klein bij accounts zonder per-account skill-overrides, groot bij accounts met alles
+        // ingevuld). Resizable dialog (zie hieronder) staat nog steeds toe dat de user 'm aanpast.
+        form.setPreferredSize(new Dimension(920, 720));
+        form.setMinimumSize(new Dimension(720, 520));
+
+        // Manueel JOptionPane bouwen i.p.v. showConfirmDialog → we kunnen de dialog resizable maken,
+        // 'm relatief aan parent positioneren en de vaste preferred-size respecteren.
+        JOptionPane optionPane = new JOptionPane(
+                form,
+                JOptionPane.PLAIN_MESSAGE,
+                JOptionPane.OK_CANCEL_OPTION);
+        JDialog editDialog = optionPane.createDialog(parent, "Account bewerken");
+        editDialog.setResizable(true);
+        editDialog.pack();
+        // Zet de minimum size NA pack zodat OS-window-decoraties al meegerekend zijn.
+        editDialog.setMinimumSize(new Dimension(720, 520));
+        if (parent != null) {
+            editDialog.setLocationRelativeTo(parent);
+        }
+        editDialog.setVisible(true);
+        editDialog.dispose();
+        Object selVal = optionPane.getValue();
+        int ok = (selVal instanceof Integer) ? ((Integer) selVal).intValue() : JOptionPane.CLOSED_OPTION;
         if (ok != JOptionPane.OK_OPTION) {
             return false;
         }
@@ -2705,20 +3407,78 @@ public class CombatBotPanel extends PluginPanel {
         r.targetAttackLevel = parseNonNegativeInt(fAttTarget.getText());
         r.targetStrengthLevel = parseNonNegativeInt(fStrTarget.getText());
         r.targetDefenceLevel = parseNonNegativeInt(fDefTarget.getText());
+        Object meleePrioSelected = meleePriorityCombo.getSelectedItem();
+        if (meleePrioSelected instanceof MeleePriorityOption) {
+            r.targetMeleePriority = ((MeleePriorityOption) meleePrioSelected).key;
+        } else {
+            r.targetMeleePriority = "";
+        }
         r.calibrateBankOnNextLogin = cbCalibrateBank.isSelected();
         r.magicAutoUpdate = cbMagicAutoUpdate.isSelected();
+        r.useGlobalCenterListsOnly = cbGlobalCenterListsOnly.isSelected();
+        if (!r.useGlobalCenterListsOnly) {
+            Object ssobj = startSkillAccountCombo.getSelectedItem();
+            if (ssobj instanceof CombatBotConfig.StartSkill) {
+                r.startSkillOverride = ((CombatBotConfig.StartSkill) ssobj).name();
+            } else {
+                r.startSkillOverride = "";
+            }
+        } else {
+            r.startSkillOverride = "";
+        }
         if (impsStyleCombo.getSelectedIndex() <= 0) {
             r.impsCombatStyleOverride = "";
         } else {
             r.impsCombatStyleOverride = Objects.requireNonNull(impsStyleCombo.getSelectedItem()).toString();
         }
-        r.accountSwitchWorldHopEnabled = cbWorldHop.isSelected();
-        r.accountSwitchWorld = fWorld.getText().trim();
+        if (giantsCombatCombo.getSelectedIndex() <= 0) {
+            r.giantsCombatStyleOverride = "";
+        } else {
+            r.giantsCombatStyleOverride = Objects.requireNonNull(giantsCombatCombo.getSelectedItem()).toString();
+        }
+        if (!cbGiantsInRotation.isSelected()) {
+            r.giantsModeOverride = "0";
+        } else if ("1".equals(prevGiantsOvSnapshot) || "true".equalsIgnoreCase(prevGiantsOvSnapshot)
+                || "on".equalsIgnoreCase(prevGiantsOvSnapshot)) {
+            r.giantsModeOverride = "1";
+        } else {
+            r.giantsModeOverride = "";
+        }
+        // Aan/uit checkbox semantiek: aangevinkt = forceer Imps Mode aan voor dit account ("1");
+        // uitgevinkt = geen override ("") zodat het Imps-centers blok / globale instellingen weer leiden.
+        r.impsModeOverride = cbImpsModeForceOn.isSelected() ? "1" : "";
+        if (r.useGlobalCenterListsOnly) {
+            r.rotationUseCustomProfile = false;
+        } else {
+            r.rotationUseCustomProfile = true;
+        }
+        blkCombat.syncUiToState();
+        blkWc.syncUiToState();
+        blkMine.syncUiToState();
+        blkFish.syncUiToState();
+        blkImps.syncUiToState();
         applyAccountCenterUiState(stCombat, r, (row, s) -> row.combatCenters = s, (row, u) -> row.useGlobalCombatCenters = u);
         applyAccountCenterUiState(stWc, r, (row, s) -> row.wcCenters = s, (row, u) -> row.useGlobalWcCenters = u);
         applyAccountCenterUiState(stMine, r, (row, s) -> row.miningCenters = s, (row, u) -> row.useGlobalMiningCenters = u);
         applyAccountCenterUiState(stFish, r, (row, s) -> row.fishingCenters = s, (row, u) -> row.useGlobalFishingCenters = u);
         applyAccountCenterUiState(stImps, r, (row, s) -> row.impsCenters = s, (row, u) -> row.useGlobalImpsCenters = u);
+        if (r.rotationUseCustomProfile) {
+            r.rotationPickCombat = r.useGlobalCombatCenters;
+            r.rotationPickWc = r.useGlobalWcCenters;
+            r.rotationPickMining = r.useGlobalMiningCenters;
+            r.rotationPickFishing = r.useGlobalFishingCenters;
+            r.rotationPickImps = r.useGlobalImpsCenters;
+            r.rotationPickGiants = cbGiantsInRotation.isSelected();
+            r.impsGiantsFocus = "";
+        }
+        r.accountSwitchWorldHopEnabled = cbWorldHop.isSelected();
+        r.accountSwitchWorld = fWorld.getText().trim();
+        geShopBlock.applyToRow(r);
+        r.useChronicleForVarrock = cbChronicle.isSelected();
+        // Spiegel toggle naar JSON zodat handlers/helpers het ook zonder ManagedRow lookup weten.
+        if (r.displayName != null && !r.displayName.trim().isEmpty()) {
+            AccountStateJsonStore.setChronicleTeleportEnabled(r.displayName.trim(), r.useChronicleForVarrock);
+        }
         return true;
     }
 
@@ -2731,99 +3491,245 @@ public class CombatBotPanel extends PluginPanel {
                 .format(DATE_TIME_FMT);
     }
 
+    private static String formatAntiBanSummary(AccountStateJsonStore.AccountEntry e) {
+        if (e == null || e.antiBanActionsTotal <= 0) {
+            return "nog geen acties";
+        }
+        String top = "-";
+        if (e.antiBanActionCounts != null && !e.antiBanActionCounts.isEmpty()) {
+            top = e.antiBanActionCounts.entrySet().stream()
+                    .sorted((a, b) -> Integer.compare(Math.max(0, b.getValue()), Math.max(0, a.getValue())))
+                    .limit(3)
+                    .map(en -> en.getKey() + "=" + Math.max(0, en.getValue()))
+                    .collect(java.util.stream.Collectors.joining(", "));
+        }
+        return e.antiBanActionsTotal + " totaal | top: " + top;
+    }
+
+    private static String formatAntiBanLastAction(AccountStateJsonStore.AccountEntry e) {
+        if (e == null || e.antiBanLastAction == null || e.antiBanLastAction.trim().isEmpty()) {
+            return "-";
+        }
+        String when = e.antiBanLastActionMs > 0 ? formatDateTime(e.antiBanLastActionMs) : "-";
+        return e.antiBanLastAction + " (" + when + ")";
+    }
+
+    private static String formatBankSnapshotSummary(AccountStateJsonStore.AccountEntry e) {
+        if (e == null || !e.bankCalibrated) {
+            return "nog niet gekalibreerd";
+        }
+        int trackedItems = AccountStateJsonStore.knownBankQtyMap(e).size();
+        long totalCoins = AccountStateJsonStore.knownCoinsApprox(e);
+        return "bank=" + Math.max(0L, e.knownBankCoins)
+                + " gp, inv=" + Math.max(0L, e.knownInventoryCoins)
+                + " gp, items=" + trackedItems
+                + ", totaal≈" + totalCoins + " gp";
+    }
+
     /** Tijdelijke UI-state voor subset per skill in account-dialoog. */
     private static final class AccountCenterUiState {
-        final String masterBlob;
-        String accountSubsetBlob;
+        String masterBlob = "";
+        String accountSubsetBlob = "";
+        /** Skill actief (na {@link AccountSkillBlock#syncUiToState()}). */
         boolean mainOn;
+        /** Checkbox: volledige globale lijst i.p.v. eigen locaties. */
+        boolean useGlobalFullList;
+    }
 
-        AccountCenterUiState(String master, String accountSubset, boolean useGlobal) {
-            this.masterBlob = master != null ? master : "";
-            this.accountSubsetBlob = accountSubset != null ? accountSubset : "";
-            this.mainOn = useGlobal;
+    private static AccountCenterUiState accountCenterStateFromRow(String master, String centersBlob,
+            boolean useGlobalCenters) {
+        AccountCenterUiState st = new AccountCenterUiState();
+        st.masterBlob = master != null ? master : "";
+        st.accountSubsetBlob = centersBlob != null ? centersBlob : "";
+        List<CenterManager.Center> masterList = CenterManager.parse(st.masterBlob);
+        if (!useGlobalCenters) {
+            st.mainOn = false;
+            st.useGlobalFullList = false;
+            return st;
+        }
+        if (masterList.isEmpty()) {
+            // Geen master-centers; alleen "gebruik globale lijst" maakt nog zin.
+            st.mainOn = true;
+            st.useGlobalFullList = true;
+            return st;
+        }
+        String sub = st.accountSubsetBlob.trim();
+        if (sub.isEmpty()) {
+            // useGlobal=true zonder subset = expliciete keuze "gebruik globale lijst".
+            st.mainOn = true;
+            st.useGlobalFullList = true;
+            return st;
+        }
+        // Belangrijk: NIET auto-collapsen naar "gebruik globale lijst" wanneer de subset toevallig
+        // alle masters dekt. Dat zou ervoor zorgen dat de user-UI bij OK + heropenen anders staat
+        // dan wat de user zelf had aangevinkt. Houd subset-modus aan; user heeft expliciet
+        // individuele locaties gekozen.
+        st.mainOn = true;
+        st.useGlobalFullList = false;
+        return st;
+    }
+
+    private static String impsMasterCentersForAccountEditor(String currentConfigCenters, String accountSubsetCenters) {
+        String cur = currentConfigCenters != null ? currentConfigCenters.trim() : "";
+        if (CenterManager.countActive(cur) > 0) {
+            return currentConfigCenters;
+        }
+        String subset = accountSubsetCenters != null ? accountSubsetCenters.trim() : "";
+        if (CenterManager.countActive(subset) > 0) {
+            return accountSubsetCenters;
+        }
+        // applyManagedCentersForDisplayName() mag impsCenters tijdelijk leeg zetten voor een account
+        // waar Imps uit staat. Het accountvenster mag die runtime-leegte niet als "er bestaan geen
+        // Imps centers" behandelen, anders springt de Imps-vink bij heropenen terug uit.
+        return DEFAULT_IMPS_CENTERS;
+    }
+
+    private static final class AccountSkillBlock {
+        final AccountCenterUiState st;
+        final JCheckBox useGlobalListCb;
+        final JCheckBox[] locationCbs;
+        final JLabel statusLbl;
+        final JPanel locPanel;
+        final JPanel root;
+
+        AccountSkillBlock(AccountCenterUiState st, JCheckBox useGlobalListCb, JCheckBox[] locationCbs,
+                JLabel statusLbl, JPanel locPanel, JPanel root) {
+            this.st = st;
+            this.useGlobalListCb = useGlobalListCb;
+            this.locationCbs = locationCbs;
+            this.statusLbl = statusLbl;
+            this.locPanel = locPanel;
+            this.root = root;
+        }
+
+        void refreshStatus() {
+            List<CenterManager.Center> master = CenterManager.parse(st.masterBlob);
+            if (master.isEmpty()) {
+                statusLbl.setText("geen centers");
+                return;
+            }
+            if (useGlobalListCb.isSelected()) {
+                statusLbl.setText("globaal (" + master.size() + " loc.)");
+                return;
+            }
+            int n = 0;
+            for (JCheckBox cb : locationCbs) {
+                if (cb.isSelected()) {
+                    n++;
+                }
+            }
+            if (n == 0) {
+                statusLbl.setText("(uit)");
+            } else if (n == master.size()) {
+                statusLbl.setText("alle " + master.size() + " loc.");
+            } else {
+                statusLbl.setText(n + "/" + master.size() + " loc.");
+            }
+        }
+
+        void syncUiToState() {
+            List<CenterManager.Center> master = CenterManager.parse(st.masterBlob);
+            boolean global = useGlobalListCb.isSelected();
+            st.useGlobalFullList = global;
+            if (master.isEmpty()) {
+                // Zonder master-centers: alleen de globale-list checkbox kan een "aan"-betekenis hebben.
+                st.mainOn = global;
+                st.accountSubsetBlob = "";
+                return;
+            }
+            if (global) {
+                // User koos expliciet "gebruik globale lijst" → subset leeg betekent "auto-grow met master".
+                st.accountSubsetBlob = "";
+                st.mainOn = true;
+                return;
+            }
+            boolean[] sel = new boolean[locationCbs.length];
+            for (int i = 0; i < locationCbs.length; i++) {
+                sel[i] = locationCbs[i].isSelected();
+            }
+            String built = CenterManager.buildSubsetFromSelection(st.masterBlob, sel);
+            int picked = CenterManager.parse(built).size();
+            st.mainOn = picked > 0;
+            // Bewust GEEN subsetCoversAllGlobal-collapse: als de user zelf elke location apart
+            // aanvinkt (bv. omdat er maar 1 is), respecteren we die expliciete keuze. Anders
+            // veranderen toggles bij OK + heropenen "vanzelf" van uiterlijk.
+            st.accountSubsetBlob = st.mainOn ? built : "";
         }
     }
 
-    private JPanel buildAccountSkillCenterRow(Window parent, String skillLabel, AccountCenterUiState st) {
-        JPanel row = new JPanel(new BorderLayout(8, 0));
-        row.setBackground(BG_DARK);
-        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, 30));
-        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+    private AccountSkillBlock buildAccountSkillCenterBlock(String skillLabel, AccountCenterUiState st) {
+        JPanel root = new JPanel();
+        root.setLayout(new BoxLayout(root, BoxLayout.Y_AXIS));
+        root.setBackground(BG_DARK);
+        root.setAlignmentX(Component.LEFT_ALIGNMENT);
+        root.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(new Color(46, 50, 64), 1),
+                new EmptyBorder(6, 8, 8, 8)));
 
-        JCheckBox mainCb = new JCheckBox(skillLabel + " — gebruik globale lijst");
-        mainCb.setSelected(st.mainOn);
-        mainCb.setFont(FONT_LABEL);
-        mainCb.setBackground(BG_DARK);
-        mainCb.setForeground(TEXT);
+        JPanel header = new JPanel(new BorderLayout(8, 0));
+        header.setOpaque(false);
+        header.setAlignmentX(Component.LEFT_ALIGNMENT);
+        header.setMaximumSize(new Dimension(Integer.MAX_VALUE, 34));
+
+        JCheckBox useGlobalListCb = new JCheckBox(skillLabel + " — gebruik globale lijst");
+        useGlobalListCb.setSelected(st.mainOn && st.useGlobalFullList);
+        useGlobalListCb.setFont(FONT_LABEL);
+        useGlobalListCb.setBackground(BG_DARK);
+        useGlobalListCb.setForeground(TEXT);
+        boolean impsKaramjaRow = "Imps (Karamja)".equals(skillLabel);
+        useGlobalListCb.setToolTipText(impsKaramjaRow
+                ? "Aan: exact de center-lijst van de tab Centers → sectie 🎯 Imps (Karamja) → Imps hunting centers "
+                        + "(dezelfde locaties als in je plugin-instellingen). Uit: vink daarvan een deel aan voor dit account."
+                : "Aan: alle locaties van de tab Centers voor deze skill. Uit: vink hieronder welke locaties dit account gebruikt (minstens één = aan).");
 
         JLabel statusLbl = new JLabel();
         statusLbl.setFont(FONT_LABEL);
         statusLbl.setForeground(TEXT_DIM);
-        Runnable refreshStatus = () -> updateAccountCenterStatusLabel(statusLbl, st);
-        refreshStatus.run();
 
-        JButton locBtn = new JButton("Locaties…");
-        styleSmallButton(locBtn, new Color(55, 75, 110));
-        locBtn.setEnabled(st.mainOn);
-        locBtn.addActionListener(e -> {
-            if (openAccountCenterSubsetDialog(parent, skillLabel, st)) {
-                refreshStatus.run();
-            }
-        });
-        mainCb.addActionListener(e -> {
-            st.mainOn = mainCb.isSelected();
-            locBtn.setEnabled(st.mainOn);
-            if (!st.mainOn) {
-                st.accountSubsetBlob = "";
-            }
-            refreshStatus.run();
-        });
+        JPanel statusWrap = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+        statusWrap.setOpaque(false);
+        statusWrap.add(statusLbl);
 
-        JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 0));
-        right.setOpaque(false);
-        right.add(statusLbl);
-        right.add(locBtn);
+        header.add(useGlobalListCb, BorderLayout.WEST);
+        header.add(statusWrap, BorderLayout.EAST);
+        root.add(header);
 
-        row.add(mainCb, BorderLayout.WEST);
-        row.add(right, BorderLayout.EAST);
-        return row;
-    }
+        List<CenterManager.Center> master = CenterManager.parse(st.masterBlob);
+        if (master.isEmpty()) {
+            String emptyHtml = impsKaramjaRow
+                    ? "<html><div style='width:340px;color:#a8a8c0'>Nog geen Imps-locaties in de config. Ga naar de tab "
+                    + "<b>Centers</b>, open <b>🎯 Imps (Karamja)</b> en vul <b>Imps hunting centers</b> in — "
+                    + "met <b>gebruik globale lijst</b> aan gebruikt dit account precies die lijst.</div></html>"
+                    : "<html><div style='width:320px;color:#a8a8c0'>Nog geen centers voor deze skill op de tab "
+                    + "<b>Centers</b>. Voeg daar eerst locaties toe.</div></html>";
+            JLabel emptyLbl = new JLabel(emptyHtml);
+            emptyLbl.setFont(FONT_LABEL);
+            emptyLbl.setForeground(TEXT_DIM);
+            emptyLbl.setAlignmentX(Component.LEFT_ALIGNMENT);
+            emptyLbl.setBorder(new EmptyBorder(0, 2, 6, 2));
+            root.add(emptyLbl);
+        }
 
-    private static void updateAccountCenterStatusLabel(JLabel statusLbl, AccountCenterUiState st) {
+        JPanel locPanel = new JPanel();
+        locPanel.setLayout(new BoxLayout(locPanel, BoxLayout.Y_AXIS));
+        locPanel.setOpaque(true);
+        locPanel.setBackground(new Color(34, 36, 46));
+        locPanel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(1, 0, 0, 0, new Color(52, 56, 70)),
+                new EmptyBorder(6, 18, 4, 4)));
+        locPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        JCheckBox[] locationCbs = new JCheckBox[master.size()];
+        boolean[] mask;
         if (!st.mainOn) {
-            statusLbl.setText("(uit)");
-            return;
+            mask = new boolean[master.size()];
+        } else if (st.useGlobalFullList) {
+            mask = new boolean[master.size()];
+            Arrays.fill(mask, true);
+        } else {
+            mask = CenterManager.selectionMaskFromSubset(st.masterBlob, st.accountSubsetBlob);
         }
-        List<CenterManager.Center> master = CenterManager.parse(st.masterBlob);
-        if (master.isEmpty()) {
-            statusLbl.setText("geen globale centers");
-            return;
-        }
-        if (st.accountSubsetBlob == null || st.accountSubsetBlob.trim().isEmpty()) {
-            statusLbl.setText("alle " + master.size() + " loc.");
-            return;
-        }
-        int n = CenterManager.parse(st.accountSubsetBlob).size();
-        statusLbl.setText(n + "/" + master.size() + " loc.");
-    }
 
-    /**
-     * Opent subdialoog met checkboxes per globale locatie. Retourneert true bij OK.
-     */
-    private boolean openAccountCenterSubsetDialog(Window parent, String skillLabel, AccountCenterUiState st) {
-        List<CenterManager.Center> master = CenterManager.parse(st.masterBlob);
-        if (master.isEmpty()) {
-            JOptionPane.showMessageDialog(parent,
-                    "Geen centers op de tab Centers voor " + skillLabel + ".",
-                    "Geen locaties",
-                    JOptionPane.INFORMATION_MESSAGE);
-            return false;
-        }
-        boolean[] mask = CenterManager.selectionMaskFromSubset(st.masterBlob, st.accountSubsetBlob);
-        JPanel grid = new JPanel();
-        grid.setLayout(new BoxLayout(grid, BoxLayout.Y_AXIS));
-        grid.setBackground(BG_DARK);
-        JCheckBox[] boxes = new JCheckBox[master.size()];
         for (int i = 0; i < master.size(); i++) {
             CenterManager.Center c = master.get(i);
             String lab = (c.name != null && !c.name.isEmpty()) ? c.name
@@ -2831,39 +3737,36 @@ public class CombatBotPanel extends PluginPanel {
             JCheckBox cb = new JCheckBox(lab + "  r=" + c.radius);
             cb.setSelected(mask[i]);
             cb.setFont(FONT_LABEL);
-            cb.setBackground(BG_DARK);
+            cb.setBackground(new Color(34, 36, 46));
             cb.setForeground(TEXT);
-            boxes[i] = cb;
-            grid.add(cb);
+            locationCbs[i] = cb;
+            locPanel.add(cb);
         }
-        JScrollPane sp = new JScrollPane(grid);
-        sp.setPreferredSize(new Dimension(340, Math.min(280, 40 + master.size() * 28)));
-        int ok = JOptionPane.showConfirmDialog(parent, sp,
-                skillLabel + " — locaties",
-                JOptionPane.OK_CANCEL_OPTION,
-                JOptionPane.PLAIN_MESSAGE);
-        if (ok != JOptionPane.OK_OPTION) {
-            return false;
+
+        AccountSkillBlock block = new AccountSkillBlock(st, useGlobalListCb, locationCbs, statusLbl, locPanel, root);
+
+        Runnable refreshAll = () -> {
+            boolean hideLocs = useGlobalListCb.isSelected();
+            locPanel.setVisible(!hideLocs);
+            block.refreshStatus();
+        };
+
+        useGlobalListCb.addActionListener(e -> {
+            if (useGlobalListCb.isSelected()) {
+                for (JCheckBox cb : locationCbs) {
+                    cb.setSelected(true);
+                }
+            }
+            refreshAll.run();
+        });
+        for (JCheckBox cb : locationCbs) {
+            cb.addActionListener(e -> refreshAll.run());
         }
-        boolean[] sel = new boolean[boxes.length];
-        for (int i = 0; i < boxes.length; i++) {
-            sel[i] = boxes[i].isSelected();
-        }
-        String built = CenterManager.buildSubsetFromSelection(st.masterBlob, sel);
-        int picked = CenterManager.parse(built).size();
-        if (picked == 0) {
-            JOptionPane.showMessageDialog(parent,
-                    "Kies minstens één locatie, of zet de skill uit.",
-                    "Geen locatie",
-                    JOptionPane.WARNING_MESSAGE);
-            return false;
-        }
-        if (CenterManager.subsetCoversAllGlobal(st.masterBlob, built)) {
-            st.accountSubsetBlob = "";
-        } else {
-            st.accountSubsetBlob = built;
-        }
-        return true;
+
+        root.add(locPanel);
+        refreshAll.run();
+
+        return block;
     }
 
     private void applyAccountCenterUiState(AccountCenterUiState st,
@@ -2910,6 +3813,41 @@ public class CombatBotPanel extends PluginPanel {
         }
     }
 
+    /**
+     * Beschikbare keuzes voor het account-veld "Melee prioriteit (volgorde)".
+     * De {@code key} wordt opgeslagen op {@link ManagedJagexAccountsStore.ManagedJagexAccountRow#targetMeleePriority}
+     * en gelezen door {@code CombatBotPlugin#pickMeleeStyleByPriority}.
+     */
+    private enum MeleePriorityOption {
+        ATT_STR_DEF("ATT_STR_DEF", "Att → Str → Def (klassiek)"),
+        STR_ATT_DEF("STR_ATT_DEF", "Str → Att → Def (Strength eerst)"),
+        DEF_ATT_STR("DEF_ATT_STR", "Def → Att → Str (Defence eerst)"),
+        LOWEST_FIRST("LOWEST_FIRST", "Laagste lvl eerst (absoluut)"),
+        LOWEST_PCT_FIRST("LOWEST_PCT_FIRST", "Laagste % onder target eerst");
+
+        final String key;
+        final String label;
+
+        MeleePriorityOption(String key, String label) {
+            this.key = key;
+            this.label = label;
+        }
+
+        static MeleePriorityOption fromKey(String key) {
+            if (key == null || key.trim().isEmpty()) return ATT_STR_DEF;
+            String norm = key.trim().toUpperCase();
+            for (MeleePriorityOption o : values()) {
+                if (o.key.equals(norm)) return o;
+            }
+            return ATT_STR_DEF;
+        }
+
+        @Override
+        public String toString() {
+            return label;
+        }
+    }
+
     // ===================== DEBUG TAB =====================
 
     private static void ensureLogFileExistsForOpen(File f) throws java.io.IOException {
@@ -2949,6 +3887,131 @@ public class CombatBotPanel extends PluginPanel {
         }
     }
 
+    /**
+     * Korte status-tekst voor het human-profile in de Widget inspector header.
+     * Toont: niet aanwezig | leeftijd + sample-grootte + medianen.
+     */
+    private String humanProfileStatusText() {
+        HumanProfile hp = HumanProfile.getOrLoad();
+        if (hp == null) {
+            return "Profiel: (geen — klik 'Bouw human-profiel')";
+        }
+        long ageMs = Math.max(0, System.currentTimeMillis() - hp.generatedAtMs);
+        long ageMin = ageMs / 60_000L;
+        String age;
+        if (ageMin < 1) age = "<1m oud";
+        else if (ageMin < 60) age = ageMin + "m oud";
+        else if (ageMin < 1440) age = (ageMin / 60) + "h oud";
+        else age = (ageMin / 1440) + "d oud";
+        double moveDt = hp.moveDtMs != null ? hp.moveDtMs.p50 : 0.0;
+        double dwell = hp.pressReleaseDwellMs != null ? hp.pressReleaseDwellMs.p50 : 0.0;
+        double clickGap = hp.interClickGapMs != null ? hp.interClickGapMs.p50 : 0.0;
+        return String.format("Profiel: %s · samples=%d · moveDt p50=%.0fms · dwell p50=%.0fms · clickGap p50=%.0fms",
+                age, hp.usedSamples, moveDt, dwell, clickGap);
+    }
+
+    /** Opent {@link DebugLog#getMouseTraceFilePath()} (move/click/drag trace, NDJSON). */
+    private void openMouseTraceFileForExternalShare() {
+        try {
+            File f = DebugLog.getMouseTraceFilePath();
+            ensureLogFileExistsForOpen(f);
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+                Desktop.getDesktop().open(f);
+            }
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+    }
+
+    /** Opent {@link DebugLog#getWalkTilesFilePath()} (auto-log van walk-clicks/traversals). */
+    private void openWalkTilesFileForExternalShare() {
+        try {
+            File f = DebugLog.getWalkTilesFilePath();
+            ensureLogFileExistsForOpen(f);
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+                Desktop.getDesktop().open(f);
+            }
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+    }
+
+    /**
+     * Logt de top-{@code n} click- en pad-tiles naar de Debug-tab onder bron <b>WalkHotspot</b>.
+     * Werkt ook als de overlay zelf uitgeschakeld is, maar de aggregaten zijn dan vaak leeg.
+     */
+    private void dumpTopWalkHotspots(int n) {
+        java.util.List<MovementHelper.WalkClickInfo> clicks = MovementHelper.topClickHotspots(n);
+        java.util.List<MovementHelper.WalkClickInfo> paths = MovementHelper.topPathHotspots(n);
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        lines.add("─── Top " + n + " click-hotspots ───");
+        if (clicks.isEmpty()) {
+            lines.add("(geen click-tiles geregistreerd)");
+        } else {
+            int i = 1;
+            for (MovementHelper.WalkClickInfo info : clicks) {
+                lines.add(String.format("#%-2d (%4d,%4d,p%d) clicks=%d  traversals=%d",
+                        i++, info.point.getX(), info.point.getY(), info.point.getPlane(),
+                        info.count, info.traversals));
+            }
+        }
+        lines.add("─── Top " + n + " path-hotspots ───");
+        if (paths.isEmpty()) {
+            lines.add("(geen pad-tiles geregistreerd)");
+        } else {
+            int i = 1;
+            for (MovementHelper.WalkClickInfo info : paths) {
+                lines.add(String.format("#%-2d (%4d,%4d,p%d) traversals=%d  clicks=%d",
+                        i++, info.point.getX(), info.point.getY(), info.point.getPlane(),
+                        info.traversals, info.count));
+            }
+        }
+        DebugLog.logBlock("WalkHotspot", lines);
+    }
+
+    /**
+     * Logt een complete diagnose van de walk-tile opslag naar bron <b>WalkClickDbg</b>:
+     * totaal opgeslagen, in-scene vs out-of-scene, distance-histogram, en hint over wat te
+     * verwachten als er niets rendert. Werkt op elke locatie — gebruik dit om uit te zoeken
+     * waarom de overlay op een specifieke plek niets tekent.
+     */
+    private void diagnoseWalkTiles() {
+        try {
+            net.storm.api.domain.actors.IPlayer lp = net.storm.sdk.entities.Players.getLocal();
+            net.runelite.api.coords.WorldPoint pos = lp != null ? lp.getWorldLocation() : null;
+            java.util.List<String> lines = MovementHelper.diagnoseWalkTiles(pos);
+            DebugLog.logBlock("WalkClickDbg", lines);
+        } catch (Throwable ex) {
+            DebugLog.log("WalkClickDbg", "Diagnose error: " + ex.getMessage());
+        }
+    }
+
+    /** Schrijft een one-shot snapshot van alle walk-tile-aggregaten naar een nieuw JSONL bestand. */
+    private void exportWalkTilesNow() {
+        try {
+            java.util.List<String> lines = MovementHelper.exportWalkTilesAsJsonl();
+            if (lines.isEmpty()) {
+                DebugLog.log("WalkHotspot", "Export: geen walk-tile data om te exporteren.");
+                return;
+            }
+            File out = DebugLog.exportWalkTilesSnapshot(lines);
+            if (out == null) {
+                DebugLog.log("WalkHotspot", "Export FAILED — kon bestand niet schrijven.");
+                return;
+            }
+            DebugLog.log("WalkHotspot", "Export OK: " + lines.size() + " tiles → " + out.getAbsolutePath());
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+                File parent = out.getParentFile();
+                if (parent != null && parent.exists()) {
+                    Desktop.getDesktop().open(parent);
+                }
+            }
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            DebugLog.log("WalkHotspot", "Export ERROR: " + ex.getMessage());
+        }
+    }
+
     /** Opent Verkenner / bestandsbeheer in {@code ~/.runelite/prive-logs} (beide logtypen staan hier). */
     private void openPriveLogsFolder() {
         try {
@@ -2967,13 +4030,28 @@ public class CombatBotPanel extends PluginPanel {
         }
     }
 
-    private JScrollPane createDebugTab() {
+    /**
+     * Debug-tab: één {@link BorderLayout}-paneel zonder extra buitenste scrollpane — anders blijft er een grijs
+     * leeg vlak onder de controls (viewport groter dan de voorkeurs-hoogte van de inhoud).
+     */
+    private JPanel createDebugTab() {
         JPanel panel = new JPanel(new BorderLayout());
         panel.setBackground(BG_DARK);
 
-        // Top controls
-        JPanel controls = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
+        // Top controls: responsief in 2 rijen zodat alles zichtbaar blijft op smalle vensters
+        JPanel controls = new JPanel();
+        controls.setLayout(new BoxLayout(controls, BoxLayout.Y_AXIS));
         controls.setBackground(BG_DARK);
+        controls.setAlignmentX(Component.LEFT_ALIGNMENT);
+        controls.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
+
+        JPanel controlButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
+        controlButtons.setBackground(BG_DARK);
+        controlButtons.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        JPanel checkToggles = new JPanel(new FlowLayout(FlowLayout.RIGHT, 6, 4));
+        checkToggles.setBackground(BG_DARK);
+        checkToggles.setAlignmentX(Component.LEFT_ALIGNMENT);
 
         JCheckBox enableCb = new JCheckBox("Debug Log Aan");
         enableCb.setSelected(DebugLog.isEnabled());
@@ -2984,7 +4062,7 @@ public class CombatBotPanel extends PluginPanel {
             DebugLog.setEnabled(enableCb.isSelected());
             refreshDebugLogViews();
         });
-        controls.add(enableCb);
+        checkToggles.add(enableCb);
 
         JCheckBox starterMeleeDbgCb = new JCheckBox("Starter melee-style debug");
         starterMeleeDbgCb.setSelected(config.starterMeleeStyleDebug());
@@ -2992,7 +4070,7 @@ public class CombatBotPanel extends PluginPanel {
         starterMeleeDbgCb.setForeground(TEXT);
         starterMeleeDbgCb.setBackground(BG_DARK);
         starterMeleeDbgCb.addActionListener(e -> setConfig("starterMeleeStyleDebug", starterMeleeDbgCb.isSelected()));
-        controls.add(starterMeleeDbgCb);
+        checkToggles.add(starterMeleeDbgCb);
 
         JCheckBox impsOpenerDbgCb = new JCheckBox("Imps melee-opener debug");
         impsOpenerDbgCb.setSelected(config.impsMeleeOpeningAirStrikeDebug());
@@ -3000,16 +4078,61 @@ public class CombatBotPanel extends PluginPanel {
         impsOpenerDbgCb.setForeground(TEXT);
         impsOpenerDbgCb.setBackground(BG_DARK);
         impsOpenerDbgCb.addActionListener(e -> setConfig("impsMeleeOpeningAirStrikeDebug", impsOpenerDbgCb.isSelected()));
-        controls.add(impsOpenerDbgCb);
+        checkToggles.add(impsOpenerDbgCb);
 
         JCheckBox walkClickDbgCb = new JCheckBox("Walk-klik tiles (overlay)");
         walkClickDbgCb.setSelected(config.debugWalkClickOverlay());
         walkClickDbgCb.setFont(FONT_LABEL);
         walkClickDbgCb.setForeground(TEXT);
         walkClickDbgCb.setBackground(BG_DARK);
-        walkClickDbgCb.setToolTipText("<html>Max. 1000 tiles, 24 uur TTL.<br>Plugin Config → Bot Control → zelfde optie.</html>");
+        walkClickDbgCb.setToolTipText("<html>Master-switch voor walk-overlay (max. 2000 tiles, 24u TTL).<br>Hieronder per laag: click-tiles (x{n}) en pad-tiles (·{n}).</html>");
         walkClickDbgCb.addActionListener(e -> setConfig("debugWalkClickOverlay", walkClickDbgCb.isSelected()));
-        controls.add(walkClickDbgCb);
+        checkToggles.add(walkClickDbgCb);
+
+        JCheckBox walkClickShowClicksCb = new JCheckBox("└ Toon click-tiles (x{n})");
+        walkClickShowClicksCb.setSelected(config.debugWalkOverlayShowClickTiles());
+        walkClickShowClicksCb.setFont(FONT_LABEL);
+        walkClickShowClicksCb.setForeground(TEXT);
+        walkClickShowClicksCb.setBackground(BG_DARK);
+        walkClickShowClicksCb.setToolTipText("<html>Tekent elke 'Walk here' klik (heatmap) met x{count} label.<br>Vereist master 'Walk-klik tiles' aan.</html>");
+        walkClickShowClicksCb.addActionListener(e -> setConfig("debugWalkOverlayShowClickTiles", walkClickShowClicksCb.isSelected()));
+        checkToggles.add(walkClickShowClicksCb);
+
+        JCheckBox walkClickShowPathsCb = new JCheckBox("└ Toon pad-tiles (·{n})");
+        walkClickShowPathsCb.setSelected(config.debugWalkOverlayShowPathTiles());
+        walkClickShowPathsCb.setFont(FONT_LABEL);
+        walkClickShowPathsCb.setForeground(TEXT);
+        walkClickShowPathsCb.setBackground(BG_DARK);
+        walkClickShowPathsCb.setToolTipText("<html>Tekent elke tile waar de speler overheen wandelt (groen).<br>Vereist master 'Walk-klik tiles' aan.</html>");
+        walkClickShowPathsCb.addActionListener(e -> setConfig("debugWalkOverlayShowPathTiles", walkClickShowPathsCb.isSelected()));
+        checkToggles.add(walkClickShowPathsCb);
+
+        JCheckBox walkAutoLogCb = new JCheckBox("└ Auto-log → JSONL");
+        walkAutoLogCb.setSelected(config.debugWalkAutoLogToDisk());
+        walkAutoLogCb.setFont(FONT_LABEL);
+        walkAutoLogCb.setForeground(TEXT);
+        walkAutoLogCb.setBackground(BG_DARK);
+        walkAutoLogCb.setToolTipText("<html>Schrijft elke walk-klik en pad-traversal naar<br><code>combat-bot-walk-tiles-YYYY-MM-DD.jsonl</code><br>Vereist master 'Walk-klik tiles' aan.</html>");
+        walkAutoLogCb.addActionListener(e -> setConfig("debugWalkAutoLogToDisk", walkAutoLogCb.isSelected()));
+        checkToggles.add(walkAutoLogCb);
+
+        JCheckBox walkHotspotCb = new JCheckBox("└ Hotspot-stuck waarschuwing");
+        walkHotspotCb.setSelected(config.debugWalkStuckHotspotEnabled());
+        walkHotspotCb.setFont(FONT_LABEL);
+        walkHotspotCb.setForeground(TEXT);
+        walkHotspotCb.setBackground(BG_DARK);
+        walkHotspotCb.setToolTipText("<html>Logt waarschuwing in Debug-tab als één tile binnen het tijdvenster<br>te vaak geklikt wordt. Drempel/venster: zie Settings > Bot Control.</html>");
+        walkHotspotCb.addActionListener(e -> setConfig("debugWalkStuckHotspotEnabled", walkHotspotCb.isSelected()));
+        checkToggles.add(walkHotspotCb);
+
+        JCheckBox mouseDbgCb = new JCheckBox("Toon muispositie (overlay)");
+        mouseDbgCb.setSelected(config.debugMouseOverlay());
+        mouseDbgCb.setFont(FONT_LABEL);
+        mouseDbgCb.setForeground(TEXT);
+        mouseDbgCb.setBackground(BG_DARK);
+        mouseDbgCb.setToolTipText("Tekent cursor-kruis + X/Y in-game.");
+        mouseDbgCb.addActionListener(e -> setConfig("debugMouseOverlay", mouseDbgCb.isSelected()));
+        checkToggles.add(mouseDbgCb);
 
         JButton resetWalkTilesBtn = new JButton("↺ Reset walk-tiles");
         resetWalkTilesBtn.setFont(new Font("Arial", Font.PLAIN, 10));
@@ -3019,7 +4142,41 @@ public class CombatBotPanel extends PluginPanel {
         resetWalkTilesBtn.setFocusPainted(false);
         resetWalkTilesBtn.setToolTipText("Wist alle getekende walk-klik tiles (overlay kan aan blijven).");
         resetWalkTilesBtn.addActionListener(e -> MovementHelper.clearDebugWalkHighlights());
-        controls.add(resetWalkTilesBtn);
+        controlButtons.add(resetWalkTilesBtn);
+
+        JButton topHotspotsBtn = new JButton("📊 Top hotspots");
+        topHotspotsBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        topHotspotsBtn.setPreferredSize(new Dimension(120, 24));
+        topHotspotsBtn.setBackground(new Color(60, 70, 120));
+        topHotspotsBtn.setForeground(Color.WHITE);
+        topHotspotsBtn.setFocusPainted(false);
+        topHotspotsBtn.setToolTipText("Logt top-10 click- én pad-tiles naar de Debug-tab (bron WalkHotspot).");
+        topHotspotsBtn.addActionListener(e -> dumpTopWalkHotspots(10));
+        controlButtons.add(topHotspotsBtn);
+
+        JButton diagWalkBtn = new JButton("🔬 Diagnose walk-tiles");
+        diagWalkBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        diagWalkBtn.setPreferredSize(new Dimension(160, 24));
+        diagWalkBtn.setBackground(new Color(80, 60, 120));
+        diagWalkBtn.setForeground(Color.WHITE);
+        diagWalkBtn.setFocusPainted(false);
+        diagWalkBtn.setToolTipText("<html>Logt naar Debug-tab (bron WalkClickDbg):<br>"
+                + "• totaal opgeslagen tiles<br>"
+                + "• in-scene vs out-of-scene<br>"
+                + "• speler-positie en scene-base<br>"
+                + "Gebruik dit ter plekke om te zien waarom tiles niet renderen.</html>");
+        diagWalkBtn.addActionListener(e -> diagnoseWalkTiles());
+        controlButtons.add(diagWalkBtn);
+
+        JButton exportWalkBtn = new JButton("💾 Export walk-tiles");
+        exportWalkBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        exportWalkBtn.setPreferredSize(new Dimension(146, 24));
+        exportWalkBtn.setBackground(new Color(35, 85, 55));
+        exportWalkBtn.setForeground(Color.WHITE);
+        exportWalkBtn.setFocusPainted(false);
+        exportWalkBtn.setToolTipText("<html>Exporteert huidige walk-tile-aggregaten naar<br><code>combat-bot-walk-tiles-export-YYYY-MM-DD-HHmmss.jsonl</code></html>");
+        exportWalkBtn.addActionListener(e -> exportWalkTilesNow());
+        controlButtons.add(exportWalkBtn);
 
         JButton clearBtn = new JButton("🗑 Clear");
         clearBtn.setFont(new Font("Arial", Font.PLAIN, 10));
@@ -3035,7 +4192,27 @@ public class CombatBotPanel extends PluginPanel {
                 }
             }
         });
-        controls.add(clearBtn);
+        controlButtons.add(clearBtn);
+
+        JButton lookupTestBtn = new JButton("🧪 Test lookup");
+        lookupTestBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        lookupTestBtn.setPreferredSize(new Dimension(106, 24));
+        lookupTestBtn.setBackground(new Color(60, 70, 120));
+        lookupTestBtn.setForeground(Color.WHITE);
+        lookupTestBtn.setFocusPainted(false);
+        lookupTestBtn.setToolTipText("Test 1x anti-ban speler lookup (rechtsklik + Lookup).");
+        lookupTestBtn.addActionListener(e -> onTestPlayerLookupRequested.run());
+        controlButtons.add(lookupTestBtn);
+
+        JButton lampHoverTestBtn = new JButton("🧞 Test lamp hover");
+        lampHoverTestBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        lampHoverTestBtn.setPreferredSize(new Dimension(126, 24));
+        lampHoverTestBtn.setBackground(new Color(70, 85, 120));
+        lampHoverTestBtn.setForeground(Color.WHITE);
+        lampHoverTestBtn.setFocusPainted(false);
+        lampHoverTestBtn.setToolTipText("Klik lamp (Rub/Use) en hover daarna Attack, Magic en Confirm widgets (zonder klikken).");
+        lampHoverTestBtn.addActionListener(e -> onTestLampHoverRequested.run());
+        controlButtons.add(lampHoverTestBtn);
 
         JButton openFileBtn = new JButton("📂 Debug-log (.log)");
         openFileBtn.setFont(new Font("Arial", Font.PLAIN, 10));
@@ -3058,6 +4235,28 @@ public class CombatBotPanel extends PluginPanel {
                 + "Zelfde map als de debug-log.</html>");
         openMlBtn.addActionListener(e -> openMlClicksFileForExternalShare());
 
+        JButton openMouseTraceBtn = new JButton("📂 Muis-trace (.jsonl)");
+        openMouseTraceBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        openMouseTraceBtn.setPreferredSize(new Dimension(160, 24));
+        openMouseTraceBtn.setBackground(new Color(40, 70, 110));
+        openMouseTraceBtn.setForeground(Color.WHITE);
+        openMouseTraceBtn.setFocusPainted(false);
+        openMouseTraceBtn.setToolTipText("<html>Als <b>Record muis trace</b> aan staat:<br>"
+                + "<code>combat-bot-mouse-trace-YYYY-MM-DD.jsonl</code><br>"
+                + "Met move/click/drag + timing.</html>");
+        openMouseTraceBtn.addActionListener(e -> openMouseTraceFileForExternalShare());
+
+        JButton openWalkTilesBtn = new JButton("📂 Walk-tiles (.jsonl)");
+        openWalkTilesBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        openWalkTilesBtn.setPreferredSize(new Dimension(160, 24));
+        openWalkTilesBtn.setBackground(new Color(40, 70, 110));
+        openWalkTilesBtn.setForeground(Color.WHITE);
+        openWalkTilesBtn.setFocusPainted(false);
+        openWalkTilesBtn.setToolTipText("<html>Als <b>Auto-log walk-tiles</b> aan staat:<br>"
+                + "<code>combat-bot-walk-tiles-YYYY-MM-DD.jsonl</code><br>"
+                + "Per regel: type (click/traverse), x, y, plane, totaal counts.</html>");
+        openWalkTilesBtn.addActionListener(e -> openWalkTilesFileForExternalShare());
+
         JButton openFolderBtn = new JButton("📁 Map prive-logs");
         openFolderBtn.setFont(new Font("Arial", Font.PLAIN, 10));
         openFolderBtn.setPreferredSize(new Dimension(130, 24));
@@ -3067,18 +4266,24 @@ public class CombatBotPanel extends PluginPanel {
         openFolderBtn.setToolTipText("Opent de map met beide bestanden van vandaag (en eerdere dagen).");
         openFolderBtn.addActionListener(e -> openPriveLogsFolder());
 
-        controls.add(openFileBtn);
-        controls.add(openMlBtn);
-        controls.add(openFolderBtn);
+        controlButtons.add(openFileBtn);
+        controlButtons.add(openMlBtn);
+        controlButtons.add(openMouseTraceBtn);
+        controlButtons.add(openWalkTilesBtn);
+        controlButtons.add(openFolderBtn);
+        controls.add(controlButtons);
+        controls.add(checkToggles);
 
-        JLabel debugHint = new JLabel("<html><div style='color:#a0a0b0;font-size:10px;width:460px'>"
+        JLabel debugHint = new JLabel("<html><div style='color:#a0a0b0;font-size:10px'>"
                 + "Staat <b>Debug Log Aan</b> uit, dan zie je hier geen nieuwe regels. "
                 + "Gebruik het <b>Combat Bot</b>-icoon in de RuneLite-zijbalk (tab 🔍 Debug).<br>"
                 + "<b>Naar AI/support:</b> knoppen hierboven → meestal het <b>.log</b>-bestand; bij widget/klik-problemen ook "
                 + "<b>.jsonl</b> (zet ML-log eerst aan)."
                 + "</div></html>");
-        debugHint.setBorder(new EmptyBorder(0, 4, 4, 4));
+        debugHint.setBorder(new EmptyBorder(0, 0, 4, 0));
         debugHint.setAlignmentX(Component.LEFT_ALIGNMENT);
+        debugHint.setHorizontalAlignment(SwingConstants.LEFT);
+        debugHint.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
         JPanel north = new JPanel();
         north.setLayout(new BoxLayout(north, BoxLayout.Y_AXIS));
         north.setBackground(BG_DARK);
@@ -3088,19 +4293,74 @@ public class CombatBotPanel extends PluginPanel {
         widgetInspectorBlock.setLayout(new BoxLayout(widgetInspectorBlock, BoxLayout.Y_AXIS));
         widgetInspectorBlock.setBackground(BG_DARK);
         widgetInspectorBlock.setAlignmentX(Component.LEFT_ALIGNMENT);
-        widgetInspectorBlock.setBorder(new EmptyBorder(6, 4, 10, 4));
-        addSectionTitle(widgetInspectorBlock, "🔎 Widget inspector");
-        JLabel wiHelp = new JLabel("<html><div style='color:#a8a8c0;font-size:10px;width:440px'>"
-                + "De dump verschijnt in het <b>groene logveld hieronder</b> (bron <b>WIDGET</b>). Zet <b>Debug Log Aan</b> en "
-                + "laat bron <b>WIDGET</b> niet uit staan in de vakjes erboven.<br>"
-                + "Ook naar stdout/logbestand zoals andere debug-regels. Interval: alleen als je <b>ingelogd</b> bent.<br>"
-                + "<b>Log menu-klikken (ML)</b>: bron <b>ML_CLICK</b> + bestand <code>prive-logs/combat-bot-ml-clicks-*.jsonl</code>.<br>"
-                + "Voor vaste widgets in code: zie <b>WidgetRegistry</b> (alias + id uit dump). "
-                + "Vink <b>Toon widget-info onder muis</b> voor een live tooltip (id/iface/naam). "
-                + "Zelfde opties staan ook onder RuneLite <i>Plugin Configuration</i> → <b>Combat Bot</b> → <b>Widget inspector</b>.</div></html>");
-        wiHelp.setAlignmentX(Component.LEFT_ALIGNMENT);
-        wiHelp.setBorder(new EmptyBorder(0, 0, 6, 0));
-        widgetInspectorBlock.add(wiHelp);
+        widgetInspectorBlock.setBorder(new EmptyBorder(6, 0, 10, 0));
+        JPanel wiHeader = new JPanel(new BorderLayout());
+        wiHeader.setOpaque(false);
+        wiHeader.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        // Body-panel met daarin de fields + buttons; toggle-knop opent/sluit dit.
+        JPanel wiBody = new JPanel();
+        wiBody.setLayout(new BoxLayout(wiBody, BoxLayout.Y_AXIS));
+        wiBody.setBackground(BG_DARK);
+        wiBody.setAlignmentX(Component.LEFT_ALIGNMENT);
+        wiBody.setVisible(false); // default ingeklapt — meer ruimte voor de log
+
+        JButton wiToggleBtn = new JButton("▶");
+        wiToggleBtn.setFont(new Font("Arial", Font.BOLD, 11));
+        wiToggleBtn.setPreferredSize(new Dimension(28, 22));
+        wiToggleBtn.setBackground(new Color(45, 60, 75));
+        wiToggleBtn.setForeground(Color.WHITE);
+        wiToggleBtn.setFocusPainted(false);
+        wiToggleBtn.setMargin(new Insets(0, 0, 0, 0));
+        wiToggleBtn.setToolTipText("Klap Widget inspector + tools open/dicht");
+
+        JLabel wiTitle = new JLabel("  🔎 Widget inspector + tools");
+        wiTitle.setFont(FONT_SECTION);
+        wiTitle.setForeground(GOLD);
+        wiTitle.setBorder(new EmptyBorder(6, 0, 3, 0));
+        wiTitle.setCursor(java.awt.Cursor.getPredefinedCursor(java.awt.Cursor.HAND_CURSOR));
+
+        JPanel wiHeaderLeft = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        wiHeaderLeft.setOpaque(false);
+        wiHeaderLeft.add(wiToggleBtn);
+        wiHeaderLeft.add(wiTitle);
+        wiHeader.add(wiHeaderLeft, BorderLayout.WEST);
+
+        Runnable wiToggle = () -> {
+            boolean now = !wiBody.isVisible();
+            wiBody.setVisible(now);
+            wiToggleBtn.setText(now ? "▼" : "▶");
+            widgetInspectorBlock.revalidate();
+            widgetInspectorBlock.repaint();
+        };
+        wiToggleBtn.addActionListener(e -> wiToggle.run());
+        wiTitle.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mouseClicked(java.awt.event.MouseEvent e) { wiToggle.run(); }
+        });
+
+        JButton wiInfoBtn = new JButton("ℹ Info");
+        wiInfoBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        wiInfoBtn.setPreferredSize(new Dimension(72, 22));
+        wiInfoBtn.setFocusPainted(false);
+        wiInfoBtn.setBackground(new Color(55, 75, 95));
+        wiInfoBtn.setForeground(Color.WHITE);
+        wiInfoBtn.addActionListener(e -> JOptionPane.showMessageDialog(
+                panel,
+                "<html><div style='width:360px;color:#e6e6f0;font-size:11px'>"
+                        + "De dump verschijnt in het <b>groene logveld</b> (bron <b>WIDGET</b>). Zet <b>Debug Log Aan</b> en "
+                        + "laat bron <b>WIDGET</b> niet uit staan.<br><br>"
+                        + "Ook naar stdout/logbestand zoals andere debug-regels. Interval werkt alleen als je <b>ingelogd</b> bent.<br><br>"
+                        + "<b>Log menu-klikken (ML)</b>: bron <b>ML_CLICK</b> + bestand "
+                        + "<code>prive-logs/combat-bot-ml-clicks-*.jsonl</code>.<br><br>"
+                        + "Voor vaste widgets in code: zie <b>WidgetRegistry</b>. "
+                        + "Vink <b>Toon widget-info onder muis</b> voor live tooltip (id/iface/naam).<br><br>"
+                        + "Zelfde opties staan ook onder RuneLite <i>Plugin Configuration</i> → <b>Combat Bot</b> → <b>Widget inspector</b>."
+                        + "</div></html>",
+                "Widget inspector info",
+                JOptionPane.INFORMATION_MESSAGE
+        ));
+        wiHeader.add(wiInfoBtn, BorderLayout.EAST);
+        widgetInspectorBlock.add(wiHeader);
 
         JPanel wiFields = new JPanel();
         wiFields.setLayout(new BoxLayout(wiFields, BoxLayout.Y_AXIS));
@@ -3120,7 +4380,13 @@ public class CombatBotPanel extends PluginPanel {
                 v -> setConfig("gameplayMlClickLog", v));
         addToggle(wiFields, "ML alleen handmatige klikken (geen bot)", config.gameplayMlClickLogOnlyAuthentic(),
                 v -> setConfig("gameplayMlClickLogOnlyAuthentic", v));
-        widgetInspectorBlock.add(wiFields);
+        addToggle(wiFields, "Record muis trace (move/click/drag) — jsonl", config.gameplayMouseTraceLog(),
+                v -> setConfig("gameplayMouseTraceLog", v));
+        addToggle(wiFields, "Mouse trace alleen met bot UIT", config.gameplayMouseTraceOnlyWhenBotOff(),
+                v -> setConfig("gameplayMouseTraceOnlyWhenBotOff", v));
+        addSlider(wiFields, "Mouse trace move sample (ms)", config.gameplayMouseTraceMoveSampleMs(), 10, 200,
+                v -> setConfig("gameplayMouseTraceMoveSampleMs", v));
+        wiBody.add(wiFields);
 
         JPanel wiBtnRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 4));
         wiBtnRow.setBackground(BG_DARK);
@@ -3154,7 +4420,113 @@ public class CombatBotPanel extends PluginPanel {
             }.execute();
         });
         wiBtnRow.add(wiDumpNow);
-        widgetInspectorBlock.add(wiBtnRow);
+
+        JButton buildHumanProfileBtn = new JButton("🧠 Bouw human-profiel");
+        buildHumanProfileBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        buildHumanProfileBtn.setBackground(new Color(70, 50, 100));
+        buildHumanProfileBtn.setForeground(Color.WHITE);
+        buildHumanProfileBtn.setFocusPainted(false);
+        buildHumanProfileBtn.setToolTipText("<html>Leest het muis-trace bestand en berekent percentielen voor "
+                + "muis-step / dwell / inter-click gap.<br>"
+                + "Schrijft <code>combat-bot-human-profile.json</code> en past het direct toe op de anti-ban "
+                + "micro-mouse cadence.</html>");
+        JLabel humanProfileStatus = new JLabel(humanProfileStatusText());
+        humanProfileStatus.setFont(new Font("Arial", Font.PLAIN, 10));
+        humanProfileStatus.setForeground(TEXT_DIM);
+        humanProfileStatus.setBorder(new EmptyBorder(0, 8, 0, 0));
+        buildHumanProfileBtn.addActionListener(e -> {
+            buildHumanProfileBtn.setEnabled(false);
+            humanProfileStatus.setText("Bezig…");
+            new SwingWorker<HumanProfileBuilder.BuildResult, Void>() {
+                @Override
+                protected HumanProfileBuilder.BuildResult doInBackground() {
+                    try {
+                        return HumanProfileBuilder.buildAndSaveFromTodayTrace();
+                    } catch (Throwable t) {
+                        return new HumanProfileBuilder.BuildResult(null, "Fout: " + t.getMessage(), false);
+                    }
+                }
+
+                @Override
+                protected void done() {
+                    buildHumanProfileBtn.setEnabled(true);
+                    HumanProfileBuilder.BuildResult res;
+                    try {
+                        res = get();
+                    } catch (Exception ex) {
+                        res = new HumanProfileBuilder.BuildResult(null, "Fout: " + ex.getMessage(), false);
+                    }
+                    humanProfileStatus.setText(humanProfileStatusText());
+                    JOptionPane.showMessageDialog(panel,
+                            new JScrollPane(new JTextArea(res.summary, 18, 60)),
+                            res.success ? "Human profile gebouwd" : "Human profile fout",
+                            res.success ? JOptionPane.INFORMATION_MESSAGE : JOptionPane.WARNING_MESSAGE);
+                }
+            }.execute();
+        });
+        wiBtnRow.add(buildHumanProfileBtn);
+
+        JButton openHumanProfileBtn = new JButton("📂 Profiel json");
+        openHumanProfileBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        openHumanProfileBtn.setBackground(new Color(40, 70, 110));
+        openHumanProfileBtn.setForeground(Color.WHITE);
+        openHumanProfileBtn.setFocusPainted(false);
+        openHumanProfileBtn.setToolTipText("Opent <code>combat-bot-human-profile.json</code> in je standaardprogramma.");
+        openHumanProfileBtn.addActionListener(e -> {
+            try {
+                File f = HumanProfile.getProfileFile();
+                if (f.exists() && Desktop.isDesktopSupported()
+                        && Desktop.getDesktop().isSupported(Desktop.Action.OPEN)) {
+                    Desktop.getDesktop().open(f);
+                } else {
+                    JOptionPane.showMessageDialog(panel,
+                            "Geen profiel-bestand gevonden. Klik eerst op 'Bouw human-profiel'.",
+                            "Profiel ontbreekt", JOptionPane.INFORMATION_MESSAGE);
+                }
+            } catch (Exception ex) {
+                ex.printStackTrace();
+            }
+        });
+        wiBtnRow.add(openHumanProfileBtn);
+
+        JButton testMicroBtn = new JButton("🧪 Test micro-mouse nu");
+        testMicroBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        testMicroBtn.setBackground(new Color(120, 70, 50));
+        testMicroBtn.setForeground(Color.WHITE);
+        testMicroBtn.setFocusPainted(false);
+        testMicroBtn.setToolTipText("<html>Forceert direct één micro-mouse beweging "
+                + "met human-profiel waardes.<br>Zo zie je in de console of het profiel actief is "
+                + "en hoeveel ms cooldown wordt toegepast.</html>");
+        testMicroBtn.addActionListener(e -> {
+            String status = onTestHumanMicroMouseRequested.get();
+            JOptionPane.showMessageDialog(panel,
+                    new JScrollPane(new JTextArea(status, 6, 60)),
+                    "Micro-mouse test",
+                    JOptionPane.INFORMATION_MESSAGE);
+            refreshDebugLogViews();
+        });
+        wiBtnRow.add(testMicroBtn);
+
+        JButton testFidgetBtn = new JButton("🐭 Test fidget burst");
+        testFidgetBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        testFidgetBtn.setBackground(new Color(50, 100, 70));
+        testFidgetBtn.setForeground(Color.WHITE);
+        testFidgetBtn.setFocusPainted(false);
+        testFidgetBtn.setToolTipText("<html>Forceert direct een fidget-burst (2-4 micro-bewegingen).<br>"
+                + "Werkt alleen als 'Continuous muis-fidget' aanstaat.</html>");
+        testFidgetBtn.addActionListener(e -> {
+            String status = onTestFidgetBurstRequested.get();
+            JOptionPane.showMessageDialog(panel,
+                    new JScrollPane(new JTextArea(status, 6, 60)),
+                    "Fidget burst test",
+                    JOptionPane.INFORMATION_MESSAGE);
+            refreshDebugLogViews();
+        });
+        wiBtnRow.add(testFidgetBtn);
+
+        wiBtnRow.add(humanProfileStatus);
+        wiBody.add(wiBtnRow);
+        widgetInspectorBlock.add(wiBody);
         north.add(widgetInspectorBlock);
 
         JPanel sourceToggles = new JPanel(new GridLayout(0, 3, 4, 2));
@@ -3176,7 +4548,7 @@ public class CombatBotPanel extends PluginPanel {
             sourceToggles.add(cbSrc);
         }
         JScrollPane sourceScroll = new JScrollPane(sourceToggles);
-        sourceScroll.setBorder(new EmptyBorder(0, 4, 2, 4));
+        sourceScroll.setBorder(new EmptyBorder(0, 0, 2, 0));
         sourceScroll.getViewport().setBackground(BG_DARK);
         sourceScroll.setBackground(BG_DARK);
         sourceScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
@@ -3204,15 +4576,21 @@ public class CombatBotPanel extends PluginPanel {
         scroll.getViewport().setBackground(new Color(20, 20, 30));
         scroll.setBorder(null);
         scroll.getVerticalScrollBar().setUnitIncrement(16);
+        panel.addHierarchyListener(e -> {
+            if ((e.getChangeFlags() & HierarchyEvent.SHOWING_CHANGED) != 0 && panel.isShowing()) {
+                SwingUtilities.invokeLater(() -> {
+                    refreshDebugLogViews();
+                    JScrollBar bar = scroll.getVerticalScrollBar();
+                    if (bar != null) {
+                        bar.setValue(bar.getMaximum());
+                    }
+                });
+            }
+        });
         panel.add(scroll, BorderLayout.CENTER);
 
         SwingUtilities.invokeLater(this::refreshDebugLogViews);
-
-        JScrollPane outerScroll = new JScrollPane(panel);
-        outerScroll.setBackground(BG_DARK);
-        outerScroll.getViewport().setBackground(BG_DARK);
-        outerScroll.setBorder(null);
-        return outerScroll;
+        return panel;
     }
 
     // ===================== STATS HELPERS =====================

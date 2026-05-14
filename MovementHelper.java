@@ -163,24 +163,67 @@ public final class MovementHelper {
     // ===================== DEBUG: walk-click tile highlight =====================
 
     private static volatile boolean debugWalkHighlightEnabled;
-    /** Rolling cap zodat zeldzame bank/GE-trips toch een lang spoor kunnen tonen. */
-    private static final int DEBUG_WALK_HIGHLIGHT_MAX = 1000;
+    /** Rolling cap zodat een lange sessie toch alle unieke walk-tiles toont. */
+    private static final int DEBUG_WALK_HIGHLIGHT_MAX = 2000;
     private static final long DEBUG_WALK_HIGHLIGHT_TTL_MS = 24L * 60L * 60L * 1000L;
 
-    private static final class TimedWorldPoint {
-        final WorldPoint point;
-        final long untilMs;
+    /**
+     * Per-tile aggregaat:
+     *  - {@code count}      = aantal "Walk here" klikken op deze tile
+     *  - {@code traversals} = aantal keer dat de speler over deze tile gewandeld is
+     *  - {@code lastClickMs}/{@code lastTraverseMs} = laatste tijdstempels per type
+     *  - {@code expireAtMs} = TTL — wordt bij elke nieuwe klik of traversal verlengd
+     */
+    public static final class WalkClickInfo {
+        public final WorldPoint point;
+        public int count;
+        public int traversals;
+        public long lastClickMs;
+        public long lastTraverseMs;
+        public long expireAtMs;
 
-        TimedWorldPoint(WorldPoint point, long untilMs) {
+        WalkClickInfo(WorldPoint point, long nowMs, long expireMs) {
             this.point = point;
-            this.untilMs = untilMs;
+            this.count = 0;
+            this.traversals = 0;
+            this.lastClickMs = nowMs;
+            this.lastTraverseMs = nowMs;
+            this.expireAtMs = expireMs;
         }
     }
 
-    private static final java.util.ArrayDeque<TimedWorldPoint> debugWalkHighlights = new java.util.ArrayDeque<>();
+    /**
+     * LinkedHashMap met access-order zodat we LRU-evictie krijgen wanneer we de
+     * cap raken. We synchronizen op de map zelf voor thread-safety.
+     */
+    private static final java.util.LinkedHashMap<WorldPoint, WalkClickInfo> debugWalkClicks =
+            new java.util.LinkedHashMap<>(64, 0.75f, true);
 
     private static volatile Consumer<String> debugWalkHighlightPersistFn;
     private static volatile Supplier<String> debugWalkHighlightLoadFn;
+
+    /**
+     * Optionele observer: krijgt elke click/traverse event door als één JSON-regel.
+     * Plugin koppelt dit aan {@link DebugLog#appendWalkTilesJsonLine} (gate'd op config toggle).
+     */
+    private static volatile Consumer<String> walkTileEventSink;
+
+    /**
+     * Optionele observer voor hotspot-stuck-detectie. Krijgt {@link WalkClickInfo} +
+     * windowMs door wanneer de drempel wordt overschreden. Plugin levert de drempel/window
+     * vanuit config en logt een waarschuwing naar de Debug-tab.
+     */
+    public interface StuckHotspotListener {
+        void onHotspotThresholdReached(WalkClickInfo info, int threshold, int windowSec);
+    }
+    private static volatile StuckHotspotListener stuckListener;
+    private static volatile int stuckThreshold = 0;        // 0/negatief = uit
+    private static volatile int stuckWindowSec = 120;
+    /** Track per-tile click-counts binnen het rollende venster. */
+    private static final java.util.HashMap<WorldPoint, java.util.ArrayDeque<Long>> stuckClickWindow =
+            new java.util.HashMap<>();
+    /** Per-tile timestamp van laatste warning, voorkomt spam. */
+    private static final java.util.HashMap<WorldPoint, Long> stuckLastWarnedAt = new java.util.HashMap<>();
 
     /**
      * Koppel profile-opslag voor walk-debug trail (plugin {@code startUp}).
@@ -190,17 +233,156 @@ public final class MovementHelper {
         debugWalkHighlightLoadFn = loadFn;
     }
 
+    /** Plugin → koppel auto-log sink (mag null zijn om uit te zetten). */
+    public static void setWalkTileEventSink(Consumer<String> sink) {
+        walkTileEventSink = sink;
+    }
+
+    /**
+     * Plugin → koppel een hook die elke keer aangeroepen wordt voordat we een walk-actie
+     * naar de SDK sturen. Hier kan bv. de anti-ban worker geïnformeerd worden zodat hij
+     * even pauzeert. Mag {@code null} zijn (= geen hook).
+     */
+    private static volatile Runnable preWalkActionHook;
+    public static void setPreWalkActionHook(Runnable hook) {
+        preWalkActionHook = hook;
+    }
+    private static void firePreWalkAction() {
+        Runnable r = preWalkActionHook;
+        if (r != null) {
+            try { r.run(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /**
+     * Plugin → koppel een check die {@code true} retourneert als een wereld-tile in de
+     * <i>huidige</i> RuneLite-scene zit (bv. via {@code LocalPoint.fromWorld != null}).
+     * Wordt door {@link #diagnoseWalkTiles} gebruikt om aan te tonen waarom tiles niet
+     * renderen op een bepaalde locatie. Mag {@code null} zijn — dan slaan we de
+     * scene-check over.
+     */
+    private static volatile java.util.function.Predicate<WorldPoint> sceneInBoundsCheck;
+    public static void setSceneInBoundsCheck(java.util.function.Predicate<WorldPoint> check) {
+        sceneInBoundsCheck = check;
+    }
+
+    /**
+     * Plugin → koppel een check die {@code true} retourneert als de overlay een geldig
+     * canvas-polygon kan tekenen voor de tile (Perspective.getCanvasTilePoly != null).
+     * Een tile kan in-scene zijn maar tóch geen polygon krijgen (camera off-screen, occlusie).
+     */
+    private static volatile java.util.function.Predicate<WorldPoint> polygonRenderableCheck;
+    public static void setPolygonRenderableCheck(java.util.function.Predicate<WorldPoint> check) {
+        polygonRenderableCheck = check;
+    }
+
+    /**
+     * Levert leesbare stats over de walk-tile opslag (totaal, click/path-tellers, scene-check).
+     * Output is een lijst regels, geschikt voor {@link DebugLog#logBlock}.
+     */
+    public static java.util.List<String> diagnoseWalkTiles(WorldPoint playerPos) {
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        java.util.List<WalkClickInfo> all = snapshotDebugWalkClickInfos();
+        int total = all.size();
+        int clickTiles = 0;
+        int pathTiles = 0;
+        int totalClicks = 0;
+        int totalTraversals = 0;
+        for (WalkClickInfo i : all) {
+            if (i.count > 0) clickTiles++;
+            if (i.traversals > 0) pathTiles++;
+            totalClicks += i.count;
+            totalTraversals += i.traversals;
+        }
+        int inScene = 0;
+        int outScene = 0;
+        int renderable = 0;
+        int sceneButNoPoly = 0;
+        java.util.function.Predicate<WorldPoint> chk = sceneInBoundsCheck;
+        java.util.function.Predicate<WorldPoint> polyChk = polygonRenderableCheck;
+        if (chk != null) {
+            for (WalkClickInfo i : all) {
+                boolean inS = chk.test(i.point);
+                if (inS) {
+                    inScene++;
+                    if (polyChk != null) {
+                        if (polyChk.test(i.point)) renderable++;
+                        else sceneButNoPoly++;
+                    }
+                } else {
+                    outScene++;
+                }
+            }
+        }
+
+        lines.add("─── Walk-tile diagnose ───");
+        lines.add("opslag: " + total + " unieke tiles  (cap=" + DEBUG_WALK_HIGHLIGHT_MAX
+                + ", TTL=" + (DEBUG_WALK_HIGHLIGHT_TTL_MS / 1000L / 60L / 60L) + "h)");
+        lines.add("click-tiles=" + clickTiles + " (sum=" + totalClicks
+                + "), pad-tiles=" + pathTiles + " (sum=" + totalTraversals + ")");
+        if (chk != null) {
+            lines.add("scene-check: in-scene=" + inScene + " | out-of-scene=" + outScene
+                    + (total > 0 ? "  (" + (inScene * 100 / Math.max(1, total)) + "% in-scene)" : ""));
+        } else {
+            lines.add("scene-check: (geen predicate gezet)");
+        }
+        if (polyChk != null) {
+            lines.add("polygon-check: renderbaar=" + renderable
+                    + " | in-scene maar GEEN polygon=" + sceneButNoPoly
+                    + (inScene > 0 ? "  (" + (renderable * 100 / Math.max(1, inScene)) + "% v/d in-scene tiles)" : ""));
+        }
+        if (playerPos != null) {
+            lines.add("speler-pos: " + playerPos.getX() + "," + playerPos.getY()
+                    + ",p" + playerPos.getPlane());
+            // Distance histogram naar speler — helpt zien of tiles ver weg liggen
+            int near = 0; int mid = 0; int far = 0; int veryFar = 0;
+            for (WalkClickInfo i : all) {
+                int d = i.point.distanceTo(playerPos);
+                if (d <= 15) near++;
+                else if (d <= 50) mid++;
+                else if (d <= 100) far++;
+                else veryFar++;
+            }
+            lines.add("afstand tot speler: ≤15=" + near + " | 16-50=" + mid
+                    + " | 51-100=" + far + " | >100=" + veryFar);
+        }
+        if (total == 0) {
+            lines.add("→ GEEN tiles geregistreerd. Check: master overlay aan? Bot loopt of klikt walk?");
+        } else if (chk != null && inScene == 0) {
+            lines.add("→ ALLE tiles vallen buiten de huidige scene → niets om te tekenen.");
+            lines.add("   (na teleport / lange wandeling / dungeon-overgang verdwijnen oude tiles uit scene)");
+        } else if (polyChk != null && inScene > 0 && renderable == 0) {
+            lines.add("→ Tiles zitten in scene MAAR krijgen geen polygon → camera/hoogte issue.");
+            lines.add("   (zoom uit, kantel camera omhoog, of beweeg muis: vaak komt overlay terug)");
+        } else if (polyChk != null && renderable > 0) {
+            lines.add("→ " + renderable + " tiles ZOUDEN nu zichtbaar moeten zijn op je scherm.");
+            lines.add("   Zie je niets? Check: andere overlays er overheen? Reset walk-tiles + maak handmatig 1 walk.");
+        }
+        return lines;
+    }
+
+    /** Plugin → configureer hotspot-stuck-detectie. threshold &le; 0 = uit. */
+    public static void setStuckHotspotConfig(StuckHotspotListener listener, int threshold, int windowSec) {
+        stuckListener = listener;
+        stuckThreshold = Math.max(0, threshold);
+        stuckWindowSec = Math.max(5, windowSec);
+        synchronized (stuckClickWindow) {
+            stuckClickWindow.clear();
+            stuckLastWarnedAt.clear();
+        }
+    }
+
     public static void setDebugWalkHighlightEnabled(boolean enabled) {
         debugWalkHighlightEnabled = enabled;
         if (!enabled) {
-            synchronized (debugWalkHighlights) {
-                debugWalkHighlights.clear();
+            synchronized (debugWalkClicks) {
+                debugWalkClicks.clear();
             }
             return;
         }
-        synchronized (debugWalkHighlights) {
+        synchronized (debugWalkClicks) {
             pruneExpiredDebugWalkHighlightsLocked();
-            if (debugWalkHighlights.isEmpty()) {
+            if (debugWalkClicks.isEmpty()) {
                 restoreDebugWalkHighlightsFromConfigLocked();
             }
         }
@@ -208,8 +390,8 @@ public final class MovementHelper {
 
     /** Verwijdert alle walk-debug tiles en wist opgeslagen trail in config. */
     public static void clearDebugWalkHighlights() {
-        synchronized (debugWalkHighlights) {
-            debugWalkHighlights.clear();
+        synchronized (debugWalkClicks) {
+            debugWalkClicks.clear();
         }
         persistDebugWalkHighlightsRaw("");
     }
@@ -221,15 +403,21 @@ public final class MovementHelper {
         }
         StringBuilder sb = new StringBuilder();
         int n = 0;
-        for (TimedWorldPoint t : debugWalkHighlights) {
+        for (WalkClickInfo info : debugWalkClicks.values()) {
             if (n++ >= DEBUG_WALK_HIGHLIGHT_MAX) {
                 break;
             }
             if (sb.length() > 0) {
                 sb.append(';');
             }
-            WorldPoint p = t.point;
-            sb.append(p.getX()).append(',').append(p.getY()).append(',').append(p.getPlane()).append(',').append(t.untilMs);
+            WorldPoint p = info.point;
+            // formaat v3: x,y,p,count,traversals,expire
+            sb.append(p.getX()).append(',')
+                    .append(p.getY()).append(',')
+                    .append(p.getPlane()).append(',')
+                    .append(info.count).append(',')
+                    .append(info.traversals).append(',')
+                    .append(info.expireAtMs);
         }
         fn.accept(sb.toString());
     }
@@ -251,76 +439,284 @@ public final class MovementHelper {
             return;
         }
         long now = System.currentTimeMillis();
-        debugWalkHighlights.clear();
+        debugWalkClicks.clear();
         for (String piece : raw.split(";")) {
             String seg = piece.trim();
             if (seg.isEmpty()) {
                 continue;
             }
             String[] pts = seg.split(",");
-            if (pts.length != 4) {
-                continue;
-            }
             try {
-                int x = Integer.parseInt(pts[0].trim());
-                int y = Integer.parseInt(pts[1].trim());
-                int plane = Integer.parseInt(pts[2].trim());
-                long until = Long.parseLong(pts[3].trim());
+                int x;
+                int y;
+                int plane;
+                int count;
+                int traversals = 0;
+                long until;
+                if (pts.length == 6) {
+                    // formaat v3: x,y,p,count,traversals,until
+                    x = Integer.parseInt(pts[0].trim());
+                    y = Integer.parseInt(pts[1].trim());
+                    plane = Integer.parseInt(pts[2].trim());
+                    count = Integer.parseInt(pts[3].trim());
+                    traversals = Integer.parseInt(pts[4].trim());
+                    until = Long.parseLong(pts[5].trim());
+                } else if (pts.length == 5) {
+                    // legacy v2: x,y,p,count,until
+                    x = Integer.parseInt(pts[0].trim());
+                    y = Integer.parseInt(pts[1].trim());
+                    plane = Integer.parseInt(pts[2].trim());
+                    count = Integer.parseInt(pts[3].trim());
+                    until = Long.parseLong(pts[4].trim());
+                } else if (pts.length == 4) {
+                    // legacy v1: x,y,p,until → count=1
+                    x = Integer.parseInt(pts[0].trim());
+                    y = Integer.parseInt(pts[1].trim());
+                    plane = Integer.parseInt(pts[2].trim());
+                    count = 1;
+                    until = Long.parseLong(pts[3].trim());
+                } else {
+                    continue;
+                }
                 if (until < now) {
                     continue;
                 }
-                debugWalkHighlights.addLast(new TimedWorldPoint(new WorldPoint(x, y, plane), until));
+                WorldPoint wp = new WorldPoint(x, y, plane);
+                WalkClickInfo info = new WalkClickInfo(wp, now, until);
+                info.count = Math.max(0, count);
+                info.traversals = Math.max(0, traversals);
+                debugWalkClicks.put(wp, info);
             } catch (NumberFormatException ignored) {
             }
         }
-        while (debugWalkHighlights.size() > DEBUG_WALK_HIGHLIGHT_MAX) {
-            debugWalkHighlights.removeLast();
+        while (debugWalkClicks.size() > DEBUG_WALK_HIGHLIGHT_MAX) {
+            java.util.Iterator<WorldPoint> it = debugWalkClicks.keySet().iterator();
+            if (!it.hasNext()) {
+                break;
+            }
+            it.next();
+            it.remove();
         }
-        if (debugWalkHighlights.isEmpty() && raw != null && !raw.trim().isEmpty()) {
+        if (debugWalkClicks.isEmpty() && raw != null && !raw.trim().isEmpty()) {
             persistDebugWalkHighlightsRaw("");
         }
     }
 
     private static void pruneExpiredDebugWalkHighlightsLocked() {
         long now = System.currentTimeMillis();
-        while (!debugWalkHighlights.isEmpty()) {
-            TimedWorldPoint last = debugWalkHighlights.getLast();
-            if (last.untilMs < now) {
-                debugWalkHighlights.removeLast();
-            } else {
-                break;
-            }
-        }
+        debugWalkClicks.values().removeIf(info -> info.expireAtMs < now);
     }
 
     private static void recordDebugWalkHighlight(WorldPoint wp) {
         if (!debugWalkHighlightEnabled || wp == null) {
             return;
         }
-        long until = System.currentTimeMillis() + DEBUG_WALK_HIGHLIGHT_TTL_MS;
-        synchronized (debugWalkHighlights) {
-            pruneExpiredDebugWalkHighlightsLocked();
-            debugWalkHighlights.addFirst(new TimedWorldPoint(wp, until));
-            while (debugWalkHighlights.size() > DEBUG_WALK_HIGHLIGHT_MAX) {
-                debugWalkHighlights.removeLast();
-            }
+        long now = System.currentTimeMillis();
+        long until = now + DEBUG_WALK_HIGHLIGHT_TTL_MS;
+        WalkClickInfo snapshot;
+        synchronized (debugWalkClicks) {
+            WalkClickInfo info = touchInfoLocked(wp, now, until);
+            info.count++;
+            info.lastClickMs = now;
             persistDebugWalkHighlightsLocked();
+            snapshot = info;
+        }
+        emitWalkTileEvent("click", wp, snapshot, now);
+        checkStuckHotspot(wp, now, snapshot);
+    }
+
+    /**
+     * Registreert dat de speler over een tile is gewandeld (path-traversal).
+     * Wordt typisch elke GameTick aangeroepen vanuit de plugin als de speler-positie
+     * is veranderd. Aparte teller dan {@link #recordDebugWalkHighlight}.
+     */
+    public static void recordPathTileTraversal(WorldPoint wp) {
+        if (!debugWalkHighlightEnabled || wp == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        long until = now + DEBUG_WALK_HIGHLIGHT_TTL_MS;
+        WalkClickInfo snapshot;
+        synchronized (debugWalkClicks) {
+            WalkClickInfo info = touchInfoLocked(wp, now, until);
+            info.traversals++;
+            info.lastTraverseMs = now;
+            persistDebugWalkHighlightsLocked();
+            snapshot = info;
+        }
+        emitWalkTileEvent("traverse", wp, snapshot, now);
+    }
+
+    /** Rolling-window hotspot-check. Geen-op als threshold &le; 0 of geen listener. */
+    private static void checkStuckHotspot(WorldPoint wp, long nowMs, WalkClickInfo snap) {
+        StuckHotspotListener listener = stuckListener;
+        int thr = stuckThreshold;
+        int winSec = stuckWindowSec;
+        if (listener == null || thr <= 0 || wp == null) {
+            return;
+        }
+        long windowMs = winSec * 1000L;
+        boolean fire = false;
+        int countInWindow;
+        synchronized (stuckClickWindow) {
+            java.util.ArrayDeque<Long> q = stuckClickWindow.computeIfAbsent(wp, k -> new java.util.ArrayDeque<>());
+            q.addLast(nowMs);
+            // Prune events ouder dan windowMs
+            while (!q.isEmpty() && (nowMs - q.peekFirst()) > windowMs) {
+                q.pollFirst();
+            }
+            countInWindow = q.size();
+            // Best-effort cleanup: zorg dat de map niet eindeloos groeit
+            if (stuckClickWindow.size() > 4096) {
+                stuckClickWindow.entrySet().removeIf(e ->
+                        e.getValue().isEmpty() || (nowMs - e.getValue().peekLast()) > windowMs * 2);
+            }
+            if (countInWindow >= thr) {
+                Long last = stuckLastWarnedAt.get(wp);
+                // Maximaal 1 waarschuwing per windowMs per tile
+                if (last == null || (nowMs - last) >= windowMs) {
+                    stuckLastWarnedAt.put(wp, nowMs);
+                    fire = true;
+                }
+            }
+        }
+        if (fire) {
+            try {
+                listener.onHotspotThresholdReached(snap, thr, winSec);
+            } catch (Throwable ignored) {
+            }
         }
     }
 
-    /** Recent walk-doelen (nieuwste eerst) voor debug-overlay; leeg als uitgeschakeld. */
-    public static java.util.List<WorldPoint> snapshotDebugWalkHighlightPoints() {
+    private static void emitWalkTileEvent(String type, WorldPoint wp, WalkClickInfo snap, long nowMs) {
+        Consumer<String> sink = walkTileEventSink;
+        if (sink == null || wp == null || snap == null) return;
+        // Compacte JSON, geen externe dep — zelfde stijl als andere ML-logs in DebugLog.
+        StringBuilder sb = new StringBuilder(160);
+        sb.append('{')
+                .append("\"t\":").append(nowMs).append(',')
+                .append("\"type\":\"").append(type).append("\",")
+                .append("\"x\":").append(wp.getX()).append(',')
+                .append("\"y\":").append(wp.getY()).append(',')
+                .append("\"plane\":").append(wp.getPlane()).append(',')
+                .append("\"clicks\":").append(snap.count).append(',')
+                .append("\"traversals\":").append(snap.traversals)
+                .append('}');
+        try {
+            sink.accept(sb.toString());
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Top-N tiles met meeste clicks (descending). Stabiel tegen externe modificaties.
+     */
+    public static java.util.List<WalkClickInfo> topClickHotspots(int n) {
+        if (n <= 0) return java.util.Collections.emptyList();
+        java.util.List<WalkClickInfo> all = snapshotDebugWalkClickInfos();
+        all.removeIf(i -> i.count <= 0);
+        all.sort((a, b) -> Integer.compare(b.count, a.count));
+        if (all.size() > n) all = all.subList(0, n);
+        return all;
+    }
+
+    /**
+     * Top-N tiles waar de speler het vaakst over gelopen is (descending).
+     */
+    public static java.util.List<WalkClickInfo> topPathHotspots(int n) {
+        if (n <= 0) return java.util.Collections.emptyList();
+        java.util.List<WalkClickInfo> all = snapshotDebugWalkClickInfos();
+        all.removeIf(i -> i.traversals <= 0);
+        all.sort((a, b) -> Integer.compare(b.traversals, a.traversals));
+        if (all.size() > n) all = all.subList(0, n);
+        return all;
+    }
+
+    /**
+     * Bouwt een lijst JSON-regels (één per tile) van de huidige walk-tile aggregaten,
+     * geschikt voor {@link DebugLog#exportWalkTilesSnapshot}.
+     */
+    public static java.util.List<String> exportWalkTilesAsJsonl() {
+        java.util.List<WalkClickInfo> all = snapshotDebugWalkClickInfos();
+        java.util.ArrayList<String> out = new java.util.ArrayList<>(all.size());
+        for (WalkClickInfo info : all) {
+            StringBuilder sb = new StringBuilder(180);
+            sb.append('{')
+                    .append("\"x\":").append(info.point.getX()).append(',')
+                    .append("\"y\":").append(info.point.getY()).append(',')
+                    .append("\"plane\":").append(info.point.getPlane()).append(',')
+                    .append("\"clicks\":").append(info.count).append(',')
+                    .append("\"traversals\":").append(info.traversals).append(',')
+                    .append("\"lastClickMs\":").append(info.lastClickMs).append(',')
+                    .append("\"lastTraverseMs\":").append(info.lastTraverseMs).append(',')
+                    .append("\"expireAtMs\":").append(info.expireAtMs)
+                    .append('}');
+            out.add(sb.toString());
+        }
+        return out;
+    }
+
+    /**
+     * Haalt of creëert de {@link WalkClickInfo} voor een tile, prunet expired entries en
+     * forceert LRU-evictie. CALLER MOET LOCK OP {@code debugWalkClicks} HOUDEN.
+     */
+    private static WalkClickInfo touchInfoLocked(WorldPoint wp, long nowMs, long expireMs) {
+        pruneExpiredDebugWalkHighlightsLocked();
+        WalkClickInfo info = debugWalkClicks.get(wp);
+        if (info == null) {
+            info = new WalkClickInfo(wp, nowMs, expireMs);
+            debugWalkClicks.put(wp, info);
+        }
+        info.expireAtMs = expireMs;
+        while (debugWalkClicks.size() > DEBUG_WALK_HIGHLIGHT_MAX) {
+            java.util.Iterator<WorldPoint> it = debugWalkClicks.keySet().iterator();
+            if (!it.hasNext()) {
+                break;
+            }
+            it.next();
+            it.remove();
+        }
+        return info;
+    }
+
+    /**
+     * Externe entry-point: Plugin kan elke "Walk here"-MenuOptionClicked direct hier
+     * doorzetten zodat we ook clicks vangen die de SDK intern doet (en dus niet via
+     * onze {@link #walkTo}/-{@link #walkToArea} fallbacks lopen).
+     */
+    public static void recordExternalWalkClick(WorldPoint wp) {
+        recordDebugWalkHighlight(wp);
+    }
+
+    /** Snapshot van actuele walk-click info per tile (TTL-pruned). */
+    public static java.util.List<WalkClickInfo> snapshotDebugWalkClickInfos() {
         if (!debugWalkHighlightEnabled) {
             return java.util.Collections.emptyList();
         }
-        synchronized (debugWalkHighlights) {
+        synchronized (debugWalkClicks) {
             pruneExpiredDebugWalkHighlightsLocked();
-            java.util.ArrayList<WorldPoint> out = new java.util.ArrayList<>(debugWalkHighlights.size());
-            for (TimedWorldPoint t : debugWalkHighlights) {
-                out.add(t.point);
+            java.util.ArrayList<WalkClickInfo> out = new java.util.ArrayList<>(debugWalkClicks.size());
+            for (WalkClickInfo info : debugWalkClicks.values()) {
+                WalkClickInfo copy = new WalkClickInfo(info.point, info.lastClickMs, info.expireAtMs);
+                copy.count = info.count;
+                copy.traversals = info.traversals;
+                copy.lastClickMs = info.lastClickMs;
+                copy.lastTraverseMs = info.lastTraverseMs;
+                out.add(copy);
             }
             return out;
         }
+    }
+
+    /** Backwards-compat (nog gebruikt door oudere overlay code). */
+    @Deprecated
+    public static java.util.List<WorldPoint> snapshotDebugWalkHighlightPoints() {
+        java.util.List<WalkClickInfo> infos = snapshotDebugWalkClickInfos();
+        java.util.ArrayList<WorldPoint> out = new java.util.ArrayList<>(infos.size());
+        for (WalkClickInfo i : infos) {
+            out.add(i.point);
+        }
+        return out;
     }
 
     private static boolean isSameWalkTarget(WorldPoint a, WorldPoint b) {
@@ -789,24 +1185,28 @@ public final class MovementHelper {
      */
     public static boolean walkToArea(WorldPoint center, int radius) {
         if (center == null || radius < 0) return false;
-        AccountBehaviorProfileStore.Profile prof = BankWalkPersonality.getActive();
-        WorldPoint c = AccountBehaviorProfileStore.personalizeApproachTile(prof, center);
+        // Geen personalisatie voor area-walks: de SDK kiest zelf al een willekeurige tile
+        // binnen de WorldArea, dus per-account ±1 shift voegt niets toe en zorgt voor een
+        // boundary-mismatch (handler ziet "buiten area", helper ziet "al binnen").
         IPlayer local = Players.getLocal();
         if (local != null) {
             WorldPoint pos = local.getWorldLocation();
-            if (pos != null && distanceToArea(pos, c, radius) <= 0) return true;
+            // Belangrijk: gebruik de ECHTE center voor de "al binnen?" check. Anders kan de
+            // bot 1 tile naast de boundary stilstaan terwijl de caller (handler) blijft denken
+            // dat we nog moeten lopen → infinite no-op loop.
+            if (pos != null && distanceToArea(pos, center, radius) <= 0) return true;
 
             // Lumbridge: als we op hogere verdieping staan en doel is plane 0, eerst trap af
-            if (pos != null && tryDescendLumbridgeStairs(pos, c)) return true;
+            if (pos != null && tryDescendLumbridgeStairs(pos, center)) return true;
 
             // Lumbridge Castle bypass check (plane 0)
-            if (pos != null && shouldBypassCastle(pos, c)) {
-                WorldPoint waypoint = getLumbridgeBypassWaypoint(pos, c);
+            if (pos != null && shouldBypassCastle(pos, center)) {
+                WorldPoint waypoint = getLumbridgeBypassWaypoint(pos, center);
                 DebugLog.log("MovementHelper", "walkToArea: Lumbridge bypass via " + waypoint);
                 return walkToInternal(waypoint);
             }
         }
-        return walkToAreaInternal(c, radius);
+        return walkToAreaInternal(center, radius);
     }
 
     /** Interne walkToArea zonder bypass-check (voorkomt recursie). */
@@ -815,6 +1215,8 @@ public final class MovementHelper {
         if (shouldSkipDuplicateAreaWalk(target, radius)) {
             return true;
         }
+        // Anti-ban hint: walk-actie op handen → fidget mag even niets doen.
+        firePreWalkAction();
         WorldArea area = toWorldArea(target, radius);
         boolean usedLargeStepTarget = target != null && !target.equals(center);
         try {
@@ -950,6 +1352,8 @@ public final class MovementHelper {
         if (shouldSkipDuplicatePointWalk(target)) {
             return true;
         }
+        // Anti-ban hint: walk-actie op handen → fidget mag even niets doen.
+        firePreWalkAction();
         try {
             IMovement movement = net.storm.api.Static.getMovement();
             if (movement != null) {
@@ -1010,17 +1414,35 @@ public final class MovementHelper {
 
         WorldPoint dest = (pointInRadius != null) ? pointInRadius : center;
 
-        // Poging 1: walkToArea (volledige pathfinding met transports + castle bypass)
-        try {
-            if (walkToArea(center, radius)) return true;
-        } catch (Exception ignored) {}
+        // Strategie: bij grote afstand laat de Storm pathfinder zelf transports/regions afhandelen
+        // via walkToArea. Maar zodra we dichtbij genoeg zijn dat de volgende klik onze
+        // eindbestemming wordt, klikken we exact op pointInRadius — anders kiest Storm
+        // de dichtstbijzijnde rand-tile en blijven we precies op de hoek hangen.
+        int distToArea = distanceToArea(myPos, center, radius);
+        int nearThreshold = Math.max(maxStep, radius * 2 + 4);
+        boolean preferExactPoint = pointInRadius != null && distToArea <= nearThreshold;
 
-        // Poging 2: walkTo naar het specifieke punt (met castle bypass)
-        try {
-            if (walkTo(dest)) return true;
-        } catch (Exception ignored) {}
+        if (preferExactPoint) {
+            // Poging 1a: klik EXACT op het inner-radius punt zodat we niet op de rand belanden.
+            try {
+                if (walkTo(dest)) return true;
+            } catch (Exception ignored) {}
+            // Poging 1b: vangnet via walkToArea (transports/castle bypass).
+            try {
+                if (walkToArea(center, radius)) return true;
+            } catch (Exception ignored) {}
+        } else {
+            // Poging 1a: lange afstand → walkToArea voor transports + castle bypass.
+            try {
+                if (walkToArea(center, radius)) return true;
+            } catch (Exception ignored) {}
+            // Poging 1b: anders direct naar het inner-radius punt.
+            try {
+                if (walkTo(dest)) return true;
+            } catch (Exception ignored) {}
+        }
 
-        // Poging 3: walkTo direct naar het center-punt (als verschilt van dest)
+        // Poging 2: walkTo direct naar het center-punt (als verschilt van dest)
         if (pointInRadius != null) {
             try {
                 if (walkTo(center)) return true;

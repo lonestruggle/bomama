@@ -104,6 +104,12 @@ public class WoodcutterHandler {
     private long lastTravelClickTime = 0;
 
     private static final long IDLE_TIMEOUT_MS = 30_000;
+    /**
+     * Kortere "geen boom in zicht" timeout wanneer we op de rand van het werkgebied staan
+     * (= verder dan innerWorkRadius van het center). Voorkomt dat de bot 30s op de hoek
+     * blijft hangen omdat Storm's pathfinder zelf voor een rand-tile koos.
+     */
+    private static final long IDLE_EDGE_TIMEOUT_MS = 2_500;
     private long idleStartTime = 0;
 
     private long lastInteractTime = 0;
@@ -118,6 +124,10 @@ public class WoodcutterHandler {
 
     // Pathfinding failure tracking
     private int walkToTreesFailCount = 0;
+    /** Anti-stuck: bot blijft net buiten area op zelfde tile staan (boundary corner-bug). */
+    private WorldPoint lastBoundaryStuckPos = null;
+    private long lastBoundaryStuckSinceMs = 0L;
+    private static final long BOUNDARY_STUCK_THRESHOLD_MS = 3500;
 
     // Cooking-only fire tile (niet gebruiken voor WC bonfire)
     private static final WorldPoint COOKING_ONLY_FIRE_TILE = new WorldPoint(3096, 3237, 0);
@@ -172,6 +182,8 @@ public class WoodcutterHandler {
         firemakingMoveTile = false;
         ownFireLocation = null;
         walkToTreesFailCount = 0;
+        lastBoundaryStuckPos = null;
+        lastBoundaryStuckSinceMs = 0L;
         isBurningLogs = false;
         bonfireInProgress = false;
         bonfireFailCount = 0;
@@ -205,6 +217,8 @@ public class WoodcutterHandler {
         this.walkToTreesFailCount = 0;
         this.centerWalkTarget = null;
         this.lastTravelClickTime = 0;
+        this.lastBoundaryStuckPos = null;
+        this.lastBoundaryStuckSinceMs = 0L;
     }
 
     /**
@@ -434,8 +448,8 @@ public class WoodcutterHandler {
             return WcState.WALKING_BACK_TO_SPOT;
         }
 
-        // --- STRIKTE AREA CHECK ---
-        // Bot MOET eerst in het center zijn voordat hij bomen scant
+        // Area is een werkgebied, geen harde center-bestemming. Zodra we binnen de radius zijn,
+        // mag de handler meteen bomen scannen en klikken; niet eerst naar de center/rand lopen.
         int areaThreshold = treeArea != null ? areaRadius : LOCATION_THRESHOLD;
         if (treeArea != null && !isAtLocationWithRange(treeArea, areaThreshold)) {
             idleStartTime = 0;
@@ -473,10 +487,25 @@ public class WoodcutterHandler {
 
         if (idleStartTime == 0) idleStartTime = System.currentTimeMillis();
 
-        if (treeArea != null && System.currentTimeMillis() - idleStartTime > IDLE_TIMEOUT_MS) {
-            idleStartTime = 0;
-            preBankPosition = null;
-            return WcState.WALKING_TO_TREES;
+        if (treeArea != null) {
+            long idleAge = System.currentTimeMillis() - idleStartTime;
+            // Edge-case: we zijn binnen de area maar in de outer-ring (= verder van center
+            // dan innerWorkRadius). Geen boom in zicht → snel doorlopen naar een nieuw inner
+            // punt i.p.v. 30s op de hoek blijven hangen. centerWalkTarget=null is al gezet
+            // bij area-arrival, dus handleWalkingToTrees() kiest een vers inner-punt.
+            IPlayer pIdle = Players.getLocal();
+            int innerR = innerWorkRadius(areaRadius);
+            int distFromCenter = pIdle != null && pIdle.getWorldLocation() != null
+                    ? pIdle.getWorldLocation().distanceTo(treeArea)
+                    : 0;
+            boolean onOuterRing = distFromCenter > innerR;
+            long effectiveTimeout = onOuterRing ? IDLE_EDGE_TIMEOUT_MS : IDLE_TIMEOUT_MS;
+            if (idleAge > effectiveTimeout) {
+                idleStartTime = 0;
+                preBankPosition = null;
+                centerWalkTarget = null;
+                return WcState.WALKING_TO_TREES;
+            }
         }
 
         return WcState.IDLE;
@@ -595,10 +624,8 @@ public class WoodcutterHandler {
             return false;
         }
 
-        // Snapshot-check: kijk of de gewenste level-axe in bekende bank-items staat.
-        String knownCsv = e.knownBankItemsCsv != null ? e.knownBankItemsCsv : "";
-        boolean hasDesiredInBankSnapshot = knownCsv.toLowerCase(Locale.ROOT)
-                .contains(bestByLevel.toLowerCase(Locale.ROOT));
+        // Snapshot-check: kijk via item->quantity JSON of de gewenste level-axe in de bank staat.
+        boolean hasDesiredInBankSnapshot = AccountStateJsonStore.hasKnownBankItem(e, bestByLevel);
         if (!hasDesiredInBankSnapshot) {
             return false;
         }
@@ -1148,10 +1175,6 @@ public class WoodcutterHandler {
             debug("skip anim-wacht: non-WC tail anim=" + anim + " zonder brandbare logs");
         }
 
-        if (local.isMoving()) {
-            return antiBan.varyDelay(randomDelay(400, 800));
-        }
-
         if (System.currentTimeMillis() - lastInteractTime < INTERACT_COOLDOWN_MS) {
             return antiBan.varyDelay(randomDelay(400, 800));
         }
@@ -1320,9 +1343,50 @@ public class WoodcutterHandler {
             return antiBan.varyDelay(TravelWalkHelper.shortWaitMs(random));
         }
 
-        // 1× per trip een punt in de radius kiezen
+        // 1× per trip een punt ruim BINNEN de radius kiezen. Niet de rand of exacte center
+        // forceren: zodra we in het gebied zijn en een boom zien, mag chopping starten.
+        // Anti-stuck: als bot al een tijdje op DEZELFDE tile net buiten de area staat,
+        // forceer een NIEUW target diep in de area en gooi de duplicate-walk suppression eruit
+        // door direct een walkTo naar dat tile te doen i.p.v. walkToArea.
+        WorldPoint myPos = local.getWorldLocation();
+        boolean justOutsideArea = myPos != null
+                && !isWithinArea(myPos)
+                && MovementHelper.distanceToArea(myPos, treeArea, areaRadius) <= 3;
+        boolean stuckOnBoundary = false;
+        if (justOutsideArea && !local.isMoving()) {
+            if (myPos.equals(lastBoundaryStuckPos)) {
+                if (lastBoundaryStuckSinceMs > 0L
+                        && travelNow - lastBoundaryStuckSinceMs >= BOUNDARY_STUCK_THRESHOLD_MS) {
+                    stuckOnBoundary = true;
+                }
+            } else {
+                lastBoundaryStuckPos = myPos;
+                lastBoundaryStuckSinceMs = travelNow;
+            }
+        } else {
+            lastBoundaryStuckPos = null;
+            lastBoundaryStuckSinceMs = 0L;
+        }
+
+        if (stuckOnBoundary) {
+            // Pak een tile DIEP binnen de area (centerwaarts), niet op de rand.
+            int innerRadius = Math.max(1, areaRadius / 2);
+            centerWalkTarget = MovementHelper.getRandomPointInRadius(treeArea, innerRadius);
+            debug("Boundary-stuck @ " + myPos + " → forceer walkTo(" + centerWalkTarget + ")");
+            paint.setLastAntiBanAction("⚠ Boundary stuck → diep in area");
+            boolean forced = MovementHelper.walkTo(centerWalkTarget);
+            if (!forced) {
+                forced = MovementHelper.walkTo(treeArea);
+            }
+            lastBoundaryStuckPos = null;
+            lastBoundaryStuckSinceMs = 0L;
+            walkToTreesFailCount = 0;
+            lastTravelClickTime = travelNow;
+            return antiBan.varyDelay(TravelWalkHelper.postClickDelayMs(config, random));
+        }
+
         if (centerWalkTarget == null) {
-            centerWalkTarget = MovementHelper.getRandomPointInRadius(treeArea, areaRadius);
+            centerWalkTarget = MovementHelper.getRandomPointInRadius(treeArea, innerWorkRadius(areaRadius));
         }
         boolean walkIssued = MovementHelper.walkTowardTarget(treeArea, areaRadius, centerWalkTarget, 25);
         if (!walkIssued) {
@@ -1369,6 +1433,11 @@ public class WoodcutterHandler {
         if (treeArea == null || point == null) return true;
         return Math.abs(point.getX() - treeArea.getX()) <= areaRadius
                 && Math.abs(point.getY() - treeArea.getY()) <= areaRadius;
+    }
+
+    private int innerWorkRadius(int radius) {
+        if (radius <= 2) return Math.max(1, radius);
+        return Math.max(1, Math.min(radius - 2, (int) Math.floor(radius * 0.70)));
     }
 
     private void saveBankPosition() {

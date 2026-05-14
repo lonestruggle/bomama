@@ -47,6 +47,12 @@ public class MiningHandler {
     private long lastTravelClickTime = 0;
 
     private static final long IDLE_TIMEOUT_MS = 30_000;
+    /**
+     * Kortere "geen rock in zicht" timeout wanneer we op de rand van het werkgebied staan
+     * (= verder dan innerWorkRadius van het center). Voorkomt dat de bot 30s op de hoek
+     * blijft hangen omdat Storm's pathfinder zelf voor een rand-tile koos.
+     */
+    private static final long IDLE_EDGE_TIMEOUT_MS = 2_500;
     private long idleStartTime = 0;
 
     private long lastInteractTime = 0;
@@ -189,9 +195,20 @@ public class MiningHandler {
 
         if (idleStartTime == 0) idleStartTime = System.currentTimeMillis();
 
-        if (miningSpot != null && System.currentTimeMillis() - idleStartTime > IDLE_TIMEOUT_MS) {
-            idleStartTime = 0;
-            return MiningState.WALKING_TO_SPOT;
+        if (miningSpot != null) {
+            long idleAge = System.currentTimeMillis() - idleStartTime;
+            IPlayer pIdle = Players.getLocal();
+            int innerR = innerWorkRadius(areaRadius);
+            int distFromCenter = pIdle != null && pIdle.getWorldLocation() != null
+                    ? pIdle.getWorldLocation().distanceTo(miningSpot)
+                    : 0;
+            boolean onOuterRing = distFromCenter > innerR;
+            long effectiveTimeout = onOuterRing ? IDLE_EDGE_TIMEOUT_MS : IDLE_TIMEOUT_MS;
+            if (idleAge > effectiveTimeout) {
+                idleStartTime = 0;
+                centerWalkTarget = null;
+                return MiningState.WALKING_TO_SPOT;
+            }
         }
 
         return MiningState.IDLE;
@@ -218,6 +235,11 @@ public class MiningHandler {
         if (miningSpot == null || point == null) return true;
         return Math.abs(point.getX() - miningSpot.getX()) <= areaRadius
                 && Math.abs(point.getY() - miningSpot.getY()) <= areaRadius;
+    }
+
+    private int innerWorkRadius(int radius) {
+        if (radius <= 2) return Math.max(1, radius);
+        return Math.max(1, Math.min(radius - 2, (int) Math.floor(radius * 0.70)));
     }
 
     private boolean isTileExcluded(WorldPoint point) {
@@ -259,9 +281,6 @@ public class MiningHandler {
 
         if (local.isAnimating()) {
             return antiBan.varyDelay(randomDelay(600, 1200));
-        }
-        if (local.isMoving()) {
-            return antiBan.varyDelay(randomDelay(400, 800));
         }
         if (System.currentTimeMillis() - lastInteractTime < INTERACT_COOLDOWN_MS) {
             return antiBan.varyDelay(randomDelay(400, 800));
@@ -397,7 +416,9 @@ public class MiningHandler {
         }
 
         if (centerWalkTarget == null) {
-            centerWalkTarget = MovementHelper.getRandomPointInRadius(miningSpot, areaRadius);
+            // Kies geen rand/center als harde bestemming. Elke tile ruim binnen de radius is ok;
+            // zodra een rock klikbaar is mag mining starten, ook tijdens het lopen.
+            centerWalkTarget = MovementHelper.getRandomPointInRadius(miningSpot, innerWorkRadius(areaRadius));
         }
 
         // Gebruik gecentraliseerde walkTowardTarget

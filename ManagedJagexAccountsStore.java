@@ -47,6 +47,14 @@ public final class ManagedJagexAccountsStore {
         public int targetAttackLevel = 0;
         public int targetStrengthLevel = 0;
         public int targetDefenceLevel = 0;
+        /**
+         * Volgorde waarin Att/Str/Def naar hun target getraind worden zolang ze nog niet bereikt zijn.
+         * Leeg of {@code "ATT_STR_DEF"} = klassiek (Att eerst, dan Str, dan Def).
+         * Andere waardes: {@code "STR_ATT_DEF"}, {@code "DEF_ATT_STR"},
+         * {@code "LOWEST_FIRST"} (laagste absolute lvl eerst),
+         * {@code "LOWEST_PCT_FIRST"} (laagste % onder target eerst).
+         */
+        public String targetMeleePriority = "";
         /** Forceer bij volgende login een bank-open + snapshot update voor dit account. */
         public boolean calibrateBankOnNextLogin = false;
         /** Auto-upgrade MAGE naar Fire Strike (met GE-koop/sell loot indien nodig). */
@@ -56,6 +64,63 @@ public final class ManagedJagexAccountsStore {
          * anders {@code MELEE}, {@code RANGED} of {@code MAGE}.
          */
         public String impsCombatStyleOverride = "";
+        /**
+         * Giants combat style: leeg = volg globale {@link CombatBotConfig#giantsCombatStyle()};
+         * anders {@code MELEE}, {@code RANGED} of {@code MAGE}.
+         */
+        public String giantsCombatStyleOverride = "";
+        /**
+         * Aan (standaard): bij dit account altijd de volledige center-lijsten van de Centers-tab;
+         * subsets uit <b>Locaties…</b> worden genegeerd. Uit: per skill gelden de gekozen subset-locaties.
+         */
+        public boolean useGlobalCenterListsOnly = true;
+        /**
+         * Giants in rotatie: leeg = volg globale {@link CombatBotConfig#giantsMode()};
+         * {@code "1"} = altijd aan voor dit account; {@code "0"} = altijd uit.
+         */
+        public String giantsModeOverride = "";
+        /**
+         * Imps Mode (zonder radius — gebruikt {@link CombatBotConfig#impsHuntingX}/Y/radius):
+         * leeg = volg globale {@link CombatBotConfig#impsMode()};
+         * {@code "1"} = altijd aan voor dit account; {@code "0"} = altijd uit voor dit account.
+         * <p>Werkt los van het Imps-centers blok: je kunt centers uit hebben en hier "1" zetten,
+         * dan gebruikt de bot voor dit account de Hunting X/Y zone.
+         */
+        public String impsModeOverride = "";
+        /**
+         * Imps vs Giants in rotatie: leeg = beide mogen (volgens globale vinken + centers);
+         * {@code IMPS} = geen Giants voor dit account; {@code GIANTS} = geen Imps voor dit account.
+         */
+        public String impsGiantsFocus = "";
+        /**
+         * Als {@code true}: rotatie gebruikt alleen de aangevinkte skills hieronder (Combat t/m Giants),
+         * onafhankelijk van globale skill-vinken op andere tabs. Barbarian + Barb-loot blijven globaal.
+         */
+        public boolean rotationUseCustomProfile = false;
+        public boolean rotationPickCombat = true;
+        public boolean rotationPickWc = true;
+        public boolean rotationPickMining = true;
+        public boolean rotationPickFishing = true;
+        public boolean rotationPickImps = true;
+        public boolean rotationPickGiants = true;
+        /**
+         * Start skill voor dit account als {@link #useGlobalCenterListsOnly} uit staat (eigen center-subsets).
+         * Leeg = volg globale {@link CombatBotConfig#startSkill()}; anders {@link CombatBotConfig.StartSkill} name().
+         */
+        public String startSkillOverride = "";
+
+        /**
+         * Per-account GE-shop policy (welke categorieën mag de bot kopen + per-categorie cap).
+         * Compact format: zie {@link GeShopPolicy#serializeBlob}. Leeg = defaults (alles aan).
+         */
+        public String geBuyTogglesBlob = "";
+
+        /**
+         * Aan: gebruik Chronicle (Diango book) om naar Varrock te teleporteren in plaats van Magic 25
+         * teleport. Geldt vooral voor low-magic accounts. Aan/uit per account; default uit zodat huidig
+         * gedrag (alleen Magic-tp/walk) niet stiekem verandert.
+         */
+        public boolean useChronicleForVarrock = false;
 
         public boolean isEmpty() {
             return displayName == null || displayName.trim().isEmpty();
@@ -83,9 +148,25 @@ public final class ManagedJagexAccountsStore {
             r.targetAttackLevel = targetAttackLevel;
             r.targetStrengthLevel = targetStrengthLevel;
             r.targetDefenceLevel = targetDefenceLevel;
+            r.targetMeleePriority = targetMeleePriority != null ? targetMeleePriority : "";
             r.calibrateBankOnNextLogin = calibrateBankOnNextLogin;
             r.magicAutoUpdate = magicAutoUpdate;
             r.impsCombatStyleOverride = impsCombatStyleOverride != null ? impsCombatStyleOverride : "";
+            r.giantsCombatStyleOverride = giantsCombatStyleOverride != null ? giantsCombatStyleOverride : "";
+            r.useGlobalCenterListsOnly = useGlobalCenterListsOnly;
+            r.giantsModeOverride = giantsModeOverride != null ? giantsModeOverride : "";
+            r.impsModeOverride = impsModeOverride != null ? impsModeOverride : "";
+            r.impsGiantsFocus = impsGiantsFocus != null ? impsGiantsFocus : "";
+            r.rotationUseCustomProfile = rotationUseCustomProfile;
+            r.rotationPickCombat = rotationPickCombat;
+            r.rotationPickWc = rotationPickWc;
+            r.rotationPickMining = rotationPickMining;
+            r.rotationPickFishing = rotationPickFishing;
+            r.rotationPickImps = rotationPickImps;
+            r.rotationPickGiants = rotationPickGiants;
+            r.startSkillOverride = startSkillOverride != null ? startSkillOverride : "";
+            r.geBuyTogglesBlob = geBuyTogglesBlob != null ? geBuyTogglesBlob : "";
+            r.useChronicleForVarrock = useChronicleForVarrock;
             return r;
         }
     }
@@ -167,18 +248,97 @@ public final class ManagedJagexAccountsStore {
                 if (p.length >= 23) {
                     r.impsCombatStyleOverride = get(p, 22);
                 }
+                if (p.length >= 24) {
+                    r.useGlobalCenterListsOnly = "1".equals(get(p, 23));
+                } else {
+                    r.useGlobalCenterListsOnly = true;
+                }
+                if (p.length >= 25) {
+                    r.giantsModeOverride = get(p, 24);
+                } else {
+                    r.giantsModeOverride = "";
+                }
+                if (p.length >= 26) {
+                    r.impsGiantsFocus = get(p, 25);
+                } else {
+                    r.impsGiantsFocus = "";
+                }
+                if (p.length >= 27) {
+                    r.rotationUseCustomProfile = "1".equals(get(p, 26));
+                }
+                if (p.length >= 33) {
+                    r.rotationPickCombat = "1".equals(get(p, 27));
+                    r.rotationPickWc = "1".equals(get(p, 28));
+                    r.rotationPickMining = "1".equals(get(p, 29));
+                    r.rotationPickFishing = "1".equals(get(p, 30));
+                    r.rotationPickImps = "1".equals(get(p, 31));
+                    r.rotationPickGiants = "1".equals(get(p, 32));
+                }
+                if (p.length >= 34) {
+                    r.startSkillOverride = get(p, 33);
+                }
+                if (p.length >= 35) {
+                    r.giantsCombatStyleOverride = get(p, 34);
+                } else {
+                    r.giantsCombatStyleOverride = "";
+                }
+                if (p.length >= 36) {
+                    r.targetMeleePriority = get(p, 35);
+                }
+                if (p.length >= 37) {
+                    r.impsModeOverride = get(p, 36);
+                } else {
+                    r.impsModeOverride = "";
+                }
+                if (p.length >= 38) {
+                    r.geBuyTogglesBlob = get(p, 37);
+                } else {
+                    r.geBuyTogglesBlob = "";
+                }
+                if (p.length >= 39) {
+                    r.useChronicleForVarrock = "1".equals(get(p, 38));
+                } else {
+                    r.useChronicleForVarrock = false;
+                }
             } else {
                 r.useGlobalCombatCenters = !nonBlankCenter(r.combatCenters);
                 r.useGlobalWcCenters = !nonBlankCenter(r.wcCenters);
                 r.useGlobalMiningCenters = !nonBlankCenter(r.miningCenters);
                 r.useGlobalFishingCenters = !nonBlankCenter(r.fishingCenters);
                 r.useGlobalImpsCenters = !nonBlankCenter(r.impsCenters);
+                r.useGlobalCenterListsOnly = true;
+                r.giantsModeOverride = "";
+                r.impsModeOverride = "";
+                r.impsGiantsFocus = "";
+                r.rotationUseCustomProfile = false;
+                r.startSkillOverride = "";
+                r.giantsCombatStyleOverride = "";
+                r.geBuyTogglesBlob = "";
+                r.useChronicleForVarrock = false;
             }
             if (!r.isEmpty()) {
                 out.add(r);
             }
         }
         return out;
+    }
+
+    /** Zoekt accountrij op display name (zelfde normalisatie als account-switch). */
+    public static ManagedJagexAccountRow findRowForDisplayName(CombatBotConfig cfg, String displayName) {
+        if (cfg == null || displayName == null || displayName.trim().isEmpty()) {
+            return null;
+        }
+        String norm = JagexCredentialsHelper.normalizeDisplayNameForMatch(displayName.trim());
+        for (ManagedJagexAccountRow r : parseRows(cfg.managedJagexAccountsBlob())) {
+            if (r == null || r.displayName == null || r.displayName.trim().isEmpty()) {
+                continue;
+            }
+            String rn = JagexCredentialsHelper.normalizeDisplayNameForMatch(r.displayName);
+            if (rn.equalsIgnoreCase(norm)) {
+                return r;
+            }
+        }
+        return null;
     }
 
     private static String get(String[] p, int i) {
@@ -213,7 +373,23 @@ public final class ManagedJagexAccountsStore {
                     .append(Math.max(0, r.targetDefenceLevel)).append(D)
                     .append(r.calibrateBankOnNextLogin ? "1" : "0").append(D)
                     .append(r.magicAutoUpdate ? "1" : "0").append(D)
-                    .append(nz(r.impsCombatStyleOverride));
+                    .append(nz(r.impsCombatStyleOverride)).append(D)
+                    .append(offOn(r.useGlobalCenterListsOnly)).append(D)
+                    .append(nz(r.giantsModeOverride)).append(D)
+                    .append(nz(r.impsGiantsFocus)).append(D)
+                    .append(offOn(r.rotationUseCustomProfile)).append(D)
+                    .append(offOn(r.rotationPickCombat)).append(D)
+                    .append(offOn(r.rotationPickWc)).append(D)
+                    .append(offOn(r.rotationPickMining)).append(D)
+                    .append(offOn(r.rotationPickFishing)).append(D)
+                    .append(offOn(r.rotationPickImps)).append(D)
+                    .append(offOn(r.rotationPickGiants)).append(D)
+                    .append(nz(r.startSkillOverride)).append(D)
+                    .append(nz(r.giantsCombatStyleOverride)).append(D)
+                    .append(nz(r.targetMeleePriority)).append(D)
+                    .append(nz(r.impsModeOverride)).append(D)
+                    .append(nz(r.geBuyTogglesBlob)).append(D)
+                    .append(r.useChronicleForVarrock ? "1" : "0");
             sb.append('\n');
         }
         return sb.toString();
@@ -366,6 +542,35 @@ public final class ManagedJagexAccountsStore {
     /**
      * Imps-modus: per-account override op {@link CombatBotConfig#impsCombatStyle()} (RSN = display name in tabel).
      */
+    public static CombatBotConfig.ImpsCombatStyle resolveGiantsCombatStyleForDisplayName(
+            CombatBotConfig cfg, String displayName) {
+        if (cfg == null) {
+            return CombatBotConfig.ImpsCombatStyle.MELEE;
+        }
+        if (displayName == null || displayName.trim().isEmpty()) {
+            return cfg.giantsCombatStyle();
+        }
+        String key = displayName.trim();
+        for (ManagedJagexAccountRow r : parseRows(cfg.managedJagexAccountsBlob())) {
+            if (r == null || r.displayName == null) {
+                continue;
+            }
+            if (!r.displayName.trim().equalsIgnoreCase(key)) {
+                continue;
+            }
+            String o = r.giantsCombatStyleOverride;
+            if (o == null || o.trim().isEmpty()) {
+                return cfg.giantsCombatStyle();
+            }
+            try {
+                return CombatBotConfig.ImpsCombatStyle.valueOf(o.trim().toUpperCase(Locale.ROOT));
+            } catch (IllegalArgumentException ignored) {
+                return cfg.giantsCombatStyle();
+            }
+        }
+        return cfg.giantsCombatStyle();
+    }
+
     public static CombatBotConfig.ImpsCombatStyle resolveImpsCombatStyleForDisplayName(
             CombatBotConfig cfg, String displayName) {
         if (cfg == null) {
@@ -393,6 +598,105 @@ public final class ManagedJagexAccountsStore {
             }
         }
         return cfg.impsCombatStyle();
+    }
+
+    /**
+     * Imps in rotatie (normaal: {@code impsMode} + actieve imps-centers), tenzij dit account alleen Giants wil.
+     * Bij {@link ManagedJagexAccountRow#rotationUseCustomProfile} en aangevinkt Imps: standaard <b>aan</b> zonder
+     * globale Imps-tab; alleen het per-account rotatie-vinkje beslist dan.
+     */
+    public static boolean resolveImpsInRotationForDisplayName(CombatBotConfig cfg, String displayName) {
+        if (cfg == null) {
+            return false;
+        }
+        boolean base = CenterManager.countActive(cfg.impsCenters()) > 0 || cfg.impsMode();
+        if (displayName == null || displayName.trim().isEmpty()) {
+            return base;
+        }
+        String key = displayName.trim();
+        for (ManagedJagexAccountRow r : parseRows(cfg.managedJagexAccountsBlob())) {
+            if (r == null || r.displayName == null) {
+                continue;
+            }
+            if (!r.displayName.trim().equalsIgnoreCase(key)) {
+                continue;
+            }
+            // Per-account "Imps Mode (zonder radius)" override: leeg = volg verder de normale logica;
+            // "1" = forceer Imps aan voor dit account; "0" = forceer uit. Werkt zowel voor custom
+            // profile als voor accounts die globale lijsten volgen.
+            String impsOv = r.impsModeOverride != null ? r.impsModeOverride.trim() : "";
+            if ("1".equals(impsOv)) {
+                return true;
+            }
+            if ("0".equals(impsOv)) {
+                return false;
+            }
+            if (r.rotationUseCustomProfile) {
+                return r.rotationPickImps;
+            }
+            String focus = r.impsGiantsFocus != null ? r.impsGiantsFocus.trim() : "";
+            if ("GIANTS".equalsIgnoreCase(focus)) {
+                return false;
+            }
+            return base;
+        }
+        return base;
+    }
+
+    /**
+     * Giants-modus: per-account override op {@link CombatBotConfig#giantsMode()} (RSN = display name in tabel).
+     * Bij {@link ManagedJagexAccountRow#rotationUseCustomProfile}: “Giants uit” schakelt uit; “Giants aan” dwingt aan;
+     * lege override volgt de Giants-tab ({@link CombatBotConfig#giantsMode()}).
+     */
+    public static boolean resolveGiantsModeForDisplayName(CombatBotConfig cfg, String displayName) {
+        if (cfg == null) {
+            return false;
+        }
+        if (displayName == null || displayName.trim().isEmpty()) {
+            return cfg.giantsMode();
+        }
+        String key = displayName.trim();
+        for (ManagedJagexAccountRow r : parseRows(cfg.managedJagexAccountsBlob())) {
+            if (r == null || r.displayName == null) {
+                continue;
+            }
+            if (!r.displayName.trim().equalsIgnoreCase(key)) {
+                continue;
+            }
+            if (r.rotationUseCustomProfile) {
+                if (!r.rotationPickGiants) {
+                    return false;
+                }
+                String oCustom = r.giantsModeOverride;
+                if (oCustom != null && !oCustom.trim().isEmpty()) {
+                    String tc = oCustom.trim();
+                    if ("1".equals(tc) || "true".equalsIgnoreCase(tc) || "on".equalsIgnoreCase(tc)) {
+                        return true;
+                    }
+                    if ("0".equals(tc) || "false".equalsIgnoreCase(tc) || "off".equalsIgnoreCase(tc)) {
+                        return false;
+                    }
+                }
+                return cfg.giantsMode();
+            }
+            String focus = r.impsGiantsFocus != null ? r.impsGiantsFocus.trim() : "";
+            if ("IMPS".equalsIgnoreCase(focus)) {
+                return false;
+            }
+            String o = r.giantsModeOverride;
+            if (o == null || o.trim().isEmpty()) {
+                return cfg.giantsMode();
+            }
+            String t = o.trim();
+            if ("1".equals(t) || "true".equalsIgnoreCase(t) || "on".equalsIgnoreCase(t)) {
+                return true;
+            }
+            if ("0".equals(t) || "false".equalsIgnoreCase(t) || "off".equalsIgnoreCase(t)) {
+                return false;
+            }
+            return cfg.giantsMode();
+        }
+        return cfg.giantsMode();
     }
 
     private ManagedJagexAccountsStore() {}

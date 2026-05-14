@@ -2,6 +2,7 @@ package com.combatbot;
 
 import net.runelite.api.Skill;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.util.Text;
 import net.storm.api.domain.actors.INPC;
 import net.storm.api.domain.actors.IPlayer;
 import net.storm.api.domain.items.IInventoryItem;
@@ -109,7 +110,7 @@ public class GiantsHandler {
     /** Dynamische keep-list voor Giants (zoals Imps getFullKeepList): spell-runes + gear. */
     private List<String> getGiantsKeepList() {
         List<String> keep = new ArrayList<>(Arrays.asList(GIANTS_KEEP_BASE));
-        CombatBotConfig.ImpsCombatStyle style = config.giantsCombatStyle();
+        CombatBotConfig.ImpsCombatStyle style = giantsCombatStyleBaselineForAccount();
         if (style == CombatBotConfig.ImpsCombatStyle.MAGE) {
             CombatBotConfig.ImpsMageSpell spell = config.giantsMageSpell();
             if (!keep.contains(spell.getElementalRune())) keep.add(spell.getElementalRune());
@@ -228,10 +229,25 @@ public class GiantsHandler {
     private long lastLootPickupTime = 0;
     private static final long LOOT_PICKUP_COOLDOWN_MS = 2400;
     private static final int POST_KILL_WAIT_MS = 1200;
+    /**
+     * Anti-stuck: laatste keer dat de speler een combat-animatie liet zien (slaan/casten).
+     * Wordt gebruikt om los te breken uit een "giant target ons maar kan niet raken" deadlock —
+     * dan staat isInCombat() op true (NPC heeft ons als interacting target) maar gebeurt er niets.
+     * Als deze tijd langer dan {@link #combatStuckThresholdMs} achterloopt → forceer een Attack
+     * op de blokkerende giant zodat we ofwel verplaatsen ofwel daadwerkelijk gaan vechten.
+     */
+    private long lastPlayerCombatAnimMs = 0;
+    /** Random drempel 3-8s, opnieuw gegenereerd na elke succesvolle anti-stuck actie. */
+    private long combatStuckThresholdMs = 3000L + new Random().nextInt(5000);
+    private long lastCombatStuckBreakoutMs = 0;
+    private static final long COMBAT_STUCK_BREAKOUT_COOLDOWN_MS = 1800;
 
     // Banking state
     private WorldPoint preBankPosition = null;
     private boolean walkingBackAfterBank = false;
+    /** Bovengronds: korte prioriteit voor bank-route na needsBanking (voorkomt pingpong shed ↔ GE bij 1-tick inv/equip fluctuaties). */
+    private long giantsSurfaceBankRouteHoldUntilMs = 0;
+    private static final long GIANTS_SURFACE_BANK_ROUTE_HOLD_MS = 12_000L;
 
     // GE state
     private int geBuyStep = 0;
@@ -310,6 +326,27 @@ public class GiantsHandler {
         this.paint = paint;
     }
 
+    private String giantsLocalRsnOrNull() {
+        try {
+            IPlayer local = Players.getLocal();
+            if (local == null || local.getName() == null || local.getName().trim().isEmpty()) {
+                return null;
+            }
+            return Text.removeTags(local.getName()).trim();
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /** Globale Giants-stijl + optionele per-account override (Accounts → Bewerken). */
+    private CombatBotConfig.ImpsCombatStyle giantsCombatStyleBaselineForAccount() {
+        String rsn = giantsLocalRsnOrNull();
+        if (rsn == null || rsn.isEmpty()) {
+            return config.giantsCombatStyle();
+        }
+        return ManagedJagexAccountsStore.resolveGiantsCombatStyleForDisplayName(config, rsn);
+    }
+
     public void setTileMarkerManager(TileMarkerManager tileMarkerManager) {
         this.tileMarkerManager = tileMarkerManager;
     }
@@ -360,6 +397,7 @@ public class GiantsHandler {
         lastLootPickupTime = 0;
         preBankPosition = null;
         walkingBackAfterBank = false;
+        giantsSurfaceBankRouteHoldUntilMs = 0;
         geBuyStep = 0;
         lastGeInteraction = 0;
         geCollectedExisting = false;
@@ -476,8 +514,10 @@ public class GiantsHandler {
                     return Bank.isOpen() ? State.BANKING : State.WALKING_TO_BANK;
                 }
             } else if (geBuyStep == 1) {
-                // Extra safety: vóór GE aankoop altijd eerst één bankcheck uitvoeren.
-                return Bank.isOpen() ? State.BANKING : State.WALKING_TO_BANK;
+                // Fase 1 = withdraw food/coins/key + bank sluiten + naar GE. Dat hoort in
+                // {@link #handleBuyingKeyAtGe()}, niet in {@link #handleBanking()}: anders blijft de bank
+                // open met "key=false → bank open laten" en komt de GE-koop nooit van de grond.
+                return State.BUYING_KEY_AT_GE;
             }
             return State.BUYING_KEY_AT_GE;
         }
@@ -517,14 +557,28 @@ public class GiantsHandler {
 
         // Niet in dungeon — check brass key EERST, dan pas food
         if (!isInDungeon) {
-            // Alleen terug naar dungeon na bank als we niet opnieuw naar de bank moeten (food/gear/depot).
-            // Anders: pingpong ladder omhoog (bank) ↔ Varrock shed naar beneden (returning).
+            long nowMs = System.currentTimeMillis();
+            if (Bank.isOpen()) {
+                giantsSurfaceBankRouteHoldUntilMs = 0;
+                return State.BANKING;
+            }
+            if (needsBankingFromInvCheck()) {
+                giantsSurfaceBankRouteHoldUntilMs = nowMs + GIANTS_SURFACE_BANK_ROUTE_HOLD_MS;
+            }
+            boolean bankRoutePriority = needsBankingFromInvCheck() || nowMs < giantsSurfaceBankRouteHoldUntilMs;
+
+            // Bank-route vóór "terug naar dungeon": anders pingpong tussen Varrock shed (~3115,3452) en GE-bank
+            // wanneer needsBanking kort flipt of walkingBackAfterBank nog true is.
+            if (bankRoutePriority) {
+                if (walkingBackAfterBank) {
+                    walkingBackAfterBank = false;
+                    debug("Giants: bank-route heeft voorrang — terug naar dungeon uitgesteld");
+                }
+                return State.WALKING_TO_BANK;
+            }
+
             if (walkingBackAfterBank && !needsBankingFromInvCheck()) {
                 return State.RETURNING_TO_DUNGEON;
-            }
-            if (walkingBackAfterBank && needsBankingFromInvCheck()) {
-                walkingBackAfterBank = false;
-                debug("Terug naar dungeon uitgesteld: nog bank nodig (inv/food/gear)");
             }
 
             hasBrassKey = hasBrassKeyAnywhere();
@@ -551,10 +605,7 @@ public class GiantsHandler {
                 return State.BUYING_KEY_AT_GE;
             }
 
-            // Brass key aanwezig — op basis van inv-check: missen we iets? → dan eerst banken
-            if (needsBankingFromInvCheck()) {
-                return Bank.isOpen() ? State.BANKING : State.WALKING_TO_BANK;
-            }
+            // Brass key aanwezig — bank-route hierboven al afgehandeld (bankRoutePriority)
             // Geen food maar alleen weg als we echt moeten eten (hp onder drempel).
             if (config.disableCombatNoFood() && shouldEat() && !hasFoodToEat()) {
                 return State.PAUSED_NO_FOOD;
@@ -573,11 +624,21 @@ public class GiantsHandler {
             return State.FETCHING_BRASS_KEY;
         }
 
-        // Geen food:
-        // - alleen vluchten/pausen als we echt "moeten eten" (hp onder drempel)
-        // - als hp nog ok is, blijven vechten totdat we effectief eten nodig hebben
+        // Giants-eigen "bank voor food"-flow: onafhankelijk van globale bankWhenNoFood.
+        // Triggert proactief (ongeacht HP) zodra food in inv onder de drempel komt — zo
+        // voorkomen we paniek-eat-loops op lage HP en lange runs zonder food.
+        if (config.giantsBankForFood()) {
+            int threshold = Math.max(1, config.giantsLowFoodBankThreshold());
+            int foodNow = countFoodInInv();
+            if (foodNow < threshold) {
+                debug("[Giants] food=" + foodNow + " < drempel " + threshold + " → terug naar bank");
+                return Bank.isOpen() ? State.BANKING : State.WALKING_TO_BANK;
+            }
+        }
+
+        // Fallback: als we geen food hebben en HP onder drempel komt, gebruik de globale switches.
         if (!hasFoodToEat() && shouldEat()) {
-            if (config.bankWhenNoFood()) {
+            if (config.bankWhenNoFood() || config.giantsBankForFood()) {
                 return Bank.isOpen() ? State.BANKING : State.WALKING_TO_BANK;
             } else if (config.disableCombatNoFood()) {
                 return State.PAUSED_NO_FOOD;
@@ -585,7 +646,7 @@ public class GiantsHandler {
         }
 
         // MAGE: te weinig runes → naar bank (nooit casten zonder runes)
-        if (config.giantsCombatStyle() == CombatBotConfig.ImpsCombatStyle.MAGE) {
+        if (giantsCombatStyleBaselineForAccount() == CombatBotConfig.ImpsCombatStyle.MAGE) {
             String runeWarning = checkGiantsRuneSupply();
             if (runeWarning != null) {
                 debug(runeWarning + " → naar bank");
@@ -701,7 +762,13 @@ public class GiantsHandler {
         if (config.lootOnlyOwn()) {
             ITileItem mine = pickNearestFromMine(lootNames, myPos);
             if (mine != null) {
-                if (!canLootItemNow(mine)) return 300;
+                if (!canLootItemNow(mine)) {
+                    lootWindowEnd = 0;
+                    killsSinceLastLoot = 0;
+                    debug("Loot skip: " + mine.getName() + " niet lootbaar nu (invFull="
+                            + Inventory.isFull() + ", stackable=" + looksStackableByName(mine.getName()) + ")");
+                    return 600;
+                }
                 recordLootToPaint(mine);
                 mine.interact("Take");
                 lastLootPickupTime = now;
@@ -759,9 +826,24 @@ public class GiantsHandler {
         IPlayer player = Players.getLocal();
         if (player == null) return 600;
 
+        long nowFightTick = System.currentTimeMillis();
+
+        // Track laatste combat-animatie zodat we een "blocked giant"-deadlock kunnen detecteren.
+        if (player.getAnimation() != -1) {
+            lastPlayerCombatAnimMs = nowFightTick;
+        }
+
         // Al in combat?
         if (isInCombat()) {
             targetWasAlive = true;
+
+            // Anti-stuck: giant target ons maar kan ons niet raken (object ertussen, pad geblokkeerd).
+            // Symptoom: isInCombat()=true (NPC.getInteracting()==player) maar player.animation=-1
+            // langer dan onze random drempel. Forceer dan een Attack op de blokkerende giant —
+            // de bot loopt dan automatisch naar een tile waar hij wél kan slaan.
+            int stuckBreakDelay = maybeBreakOutOfStuckCombat(player, nowFightTick);
+            if (stuckBreakDelay > 0) return stuckBreakDelay;
+
             return 600 + random.nextInt(400);
         }
 
@@ -778,7 +860,7 @@ public class GiantsHandler {
         }
 
         // MAGE: eerst autocast instellen en staff equipen (eenmalig)
-        if (config.giantsCombatStyle() == CombatBotConfig.ImpsCombatStyle.MAGE) {
+        if (giantsCombatStyleBaselineForAccount() == CombatBotConfig.ImpsCombatStyle.MAGE) {
             if (!autocastSet) {
                 CombatBotConfig.ImpsMageSpell spell = config.giantsMageSpell();
                 if (Skills.getLevel(Skill.MAGIC) < spell.getLevelReq()) {
@@ -1490,10 +1572,12 @@ public class GiantsHandler {
         }
 
         // Stap 3: Gear (wapen/runes)
-        CombatBotConfig.ImpsCombatStyle style = config.giantsCombatStyle();
+        CombatBotConfig.ImpsCombatStyle style = giantsCombatStyleBaselineForAccount();
         if (!hasWeaponForStyle(style)) {
             withdrawAllGearForStyleInOneGo(style);
         }
+        // Stap 3b: Armor per style. Optioneel: als armor ontbreekt, gaan we niet loopen/blokkeren.
+        withdrawBestArmourForStyleInOneGo(style);
 
         // Stap 4: Brass key
         if (!Inventory.contains(BRASS_KEY) && Bank.contains(BRASS_KEY)) {
@@ -1506,11 +1590,65 @@ public class GiantsHandler {
             debug("[Bank] Brass key niet in bank gevonden → GE koopflow gestart");
         }
 
+        // Zodra we naar GE gaan voor de key: meteen alle coins meenemen. Anders blijft inv op bv. 90 gp
+        // terwijl er honduizenden op de bank staan — de log leek dan alsof er geen geld was.
+        if (geBuyStep == 1 && Bank.contains("Coins")) {
+            int needGp = Math.max(500, Math.max(config.giantsBrassKeyPriceMin(), config.giantsBrassKeyPriceMax()));
+            if (getInvCount("Coins") < needGp) {
+                Bank.withdrawAll("Coins");
+                sleep(400, 700);
+                debug("[Bank] GE brass key: withdrawAll Coins (inv < " + needGp + " gp, bank had stack)");
+            }
+        }
+
         // Stap 5: Amulet of power (gear prep voor elke style)
         if (!hasAmuletOfPowerEquippedOrInInv() && Bank.contains("Amulet of power")) {
             Bank.withdraw("Amulet of power", 1);
             sleep(500, 800);
         }
+
+        // Stap 5b: Melee — equip het beste melee-wapen uit inv zodra het strikt beter is dan wat
+        // we nu dragen (of als we niets dragen). Voorkomt dat handleBanking opnieuw deposits +
+        // withdraws van hetzelfde wapen doet (de eerdere loop) en regelt meteen "upgrade" als er
+        // een hoger-tier wapen uit de bank kwam.
+        if (style == CombatBotConfig.ImpsCombatStyle.MELEE) {
+            String equippedMelee = null;
+            for (String w : MELEE_TIER) {
+                if (Equipment.contains(item -> item != null && item.getName() != null
+                        && w.equalsIgnoreCase(item.getName()))) {
+                    equippedMelee = w;
+                    break;
+                }
+            }
+            String bestInvMelee = null;
+            IInventoryItem bestInvItem = null;
+            for (String w : MELEE_TIER) {
+                IInventoryItem hit = Inventory.getFirst(item -> item != null && item.getName() != null
+                        && w.equalsIgnoreCase(item.getName()));
+                if (hit != null) {
+                    bestInvMelee = w;
+                    bestInvItem = hit;
+                    break;
+                }
+            }
+            int equippedIdx = meleeTierIndexCi(equippedMelee);
+            int bestInvIdx = meleeTierIndexCi(bestInvMelee);
+            boolean shouldEquipFromInv = bestInvItem != null
+                    && (equippedIdx < 0 || bestInvIdx < equippedIdx);
+            if (shouldEquipFromInv) {
+                String action = bestInvItem.hasAction("Wield") ? "Wield"
+                        : (bestInvItem.hasAction("Wear") ? "Wear" : null);
+                if (action != null) {
+                    bestInvItem.interact(action);
+                    debug("[Bank] " + action + " " + bestInvMelee
+                            + (equippedMelee != null ? " (swap " + equippedMelee + " → " + bestInvMelee + ")" : " (auto-equip)"));
+                    sleep(500, 800);
+                }
+            }
+        }
+
+        // Stap 5c: Style-armor direct aantrekken (melee/ranged/mage), net als wapen/staff/amulet.
+        equipBestArmourFromInventory(style);
 
         // Stap 6: Staff direct aantrekken als we die in inv hebben (MAGE)
         if (style == CombatBotConfig.ImpsCombatStyle.MAGE) {
@@ -1525,10 +1663,13 @@ public class GiantsHandler {
             }
         }
 
-        // Stap 7: Amulet of power aantrekken als in inv
-        boolean amuletEquipped = Equipment.contains(i -> i != null && i.getName() != null && i.getName().equalsIgnoreCase("Amulet of power"));
-        if (!amuletEquipped && Inventory.contains(i -> i != null && i.getName() != null && i.getName().equalsIgnoreCase("Amulet of power"))) {
-            IInventoryItem amulet = Inventory.getFirst(item -> item != null && item.getName() != null && item.getName().equalsIgnoreCase("Amulet of power"));
+        // Stap 7: fallback amulet equippen als armor-tiering nog geen amulet heeft gedragen.
+        boolean amuletEquipped = Equipment.contains(i -> i != null && i.getName() != null
+                && i.getName().toLowerCase().contains("amulet"));
+        if (!amuletEquipped && Inventory.contains(i -> i != null && i.getName() != null
+                && i.getName().toLowerCase().contains("amulet"))) {
+            IInventoryItem amulet = Inventory.getFirst(item -> item != null && item.getName() != null
+                    && item.getName().toLowerCase().contains("amulet"));
             if (amulet != null) {
                 amulet.interact(amulet.hasAction("Wear") ? "Wear" : "Wield");
                 sleep(500, 800);
@@ -1555,6 +1696,7 @@ public class GiantsHandler {
             chatLog("✅ Gear klaar! Op naar Hill Giants!");
         }
         walkingBackAfterBank = true;
+        giantsSurfaceBankRouteHoldUntilMs = 0;
         return 800;
     }
 
@@ -1565,6 +1707,7 @@ public class GiantsHandler {
 
         if (pos.getY() > 9000) {
             walkingBackAfterBank = false;
+            giantsSurfaceBankRouteHoldUntilMs = 0;
             isInDungeon = true;
             return 300;
         }
@@ -1575,6 +1718,7 @@ public class GiantsHandler {
 
         if (Players.getLocal() != null && Players.getLocal().getWorldLocation().getY() > 9000) {
             walkingBackAfterBank = false;
+            giantsSurfaceBankRouteHoldUntilMs = 0;
             isInDungeon = true;
         }
         return 1200;
@@ -1739,6 +1883,26 @@ public class GiantsHandler {
         return itemName != null && tryGeRestockFoodOneItem(itemName);
     }
 
+    /**
+     * Log-context voor coins: alleen inv is misleidend als er veel op de bank ligt.
+     * {@link AccountStateJsonStore} wordt bij bank-open geüpdatet ({@code knownBankCoins}).
+     */
+    private String coinsContextForDebugLog() {
+        int inv = getInvCount("Coins");
+        if (Bank.isOpen()) {
+            return "inv=" + inv + " (bank open — live data)";
+        }
+        String rsn = giantsLocalRsnOrNull();
+        if (rsn == null || rsn.isEmpty()) {
+            return "inv=" + inv;
+        }
+        AccountStateJsonStore.AccountEntry e = AccountStateJsonStore.getEntry(rsn);
+        if (e == null || !e.bankCalibrated || e.knownBankCoins <= 0) {
+            return "inv=" + inv;
+        }
+        return "inv=" + inv + ", laatste bank-snapshot(JSON)≈" + e.knownBankCoins + " gp";
+    }
+
     /** Inv-check aan het begin van Giants (bovengronds): kijk wat we hebben en wat we nodig hebben; log (throttled). Bank hoeft niet open. */
     private void doInventoryCheckAtStart() {
         long now = System.currentTimeMillis();
@@ -1748,15 +1912,15 @@ public class GiantsHandler {
         int foodHave = countFoodInInv();
         int foodNeed = getFoodAmount();
         boolean haveKey = Inventory.contains(BRASS_KEY);
-        CombatBotConfig.ImpsCombatStyle style = config.giantsCombatStyle();
+        CombatBotConfig.ImpsCombatStyle style = giantsCombatStyleBaselineForAccount();
         boolean haveGear = hasWeaponForStyle(style);
-        int coins = getInvCount("Coins");
-        debug("[Inv] (begin Giants) Hebben: food=" + foodHave + ", brass key=" + haveKey + ", gear " + style + "=" + haveGear + ", coins=" + coins);
+        debug("[Inv] (begin Giants) Hebben: food=" + foodHave + ", brass key=" + haveKey + ", gear " + style + "=" + haveGear
+                + ", coins " + coinsContextForDebugLog());
         debug("[Inv] Nodig: food=" + foodNeed + ", key=1, gear=" + style + " (uit instellingen)");
         if (foodHave < foodNeed) debug("[Inv] → moet banken: food ophalen (" + (foodNeed - foodHave) + ")");
         if (!haveKey) debug("[Inv] → brass key ophalen (GE of grond)");
         if (!haveGear) debug("[Inv] → moet banken: wapen/runes ophalen voor " + style);
-        if (config.giantsCombatStyle() == CombatBotConfig.ImpsCombatStyle.MAGE) {
+        if (giantsCombatStyleBaselineForAccount() == CombatBotConfig.ImpsCombatStyle.MAGE) {
             String r = checkGiantsRuneSupply();
             if (r != null) debug("[Inv] → moet banken: " + r);
         }
@@ -1769,10 +1933,15 @@ public class GiantsHandler {
         if (hasForeignItemsForGiants()) return true;
         // Altijd eerst het ingestelde food-aantal meenemen (ook bij volle HP — anders liep de bot bij herstart zonder food naar de dungeon).
         if (countFoodInInv() < getFoodAmount()) return true;
-        // Bank/uitwijken zonder food enkel als we echt moeten eten.
-        if (shouldEat() && !hasFoodToEat() && config.bankWhenNoFood()) return true;
-        if (!hasWeaponForStyle(config.giantsCombatStyle())) return true;
-        if (config.giantsCombatStyle() == CombatBotConfig.ImpsCombatStyle.MAGE && checkGiantsRuneSupply() != null) return true;
+        // Giants-eigen drempel of globale "bank als food op"-switch — beide kunnen los aan.
+        if (config.giantsBankForFood()) {
+            int threshold = Math.max(1, config.giantsLowFoodBankThreshold());
+            if (countFoodInInv() < threshold) return true;
+        }
+        if (shouldEat() && !hasFoodToEat()
+                && (config.bankWhenNoFood() || config.giantsBankForFood())) return true;
+        if (!hasWeaponForStyle(giantsCombatStyleBaselineForAccount())) return true;
+        if (giantsCombatStyleBaselineForAccount() == CombatBotConfig.ImpsCombatStyle.MAGE && checkGiantsRuneSupply() != null) return true;
         if (Inventory.isFull()) return true;
         return false;
     }
@@ -1801,10 +1970,10 @@ public class GiantsHandler {
         int foodHave = countFoodInInv();
         int foodNeed = getFoodAmount();
         boolean haveKey = Inventory.contains(BRASS_KEY);
-        CombatBotConfig.ImpsCombatStyle style = config.giantsCombatStyle();
+        CombatBotConfig.ImpsCombatStyle style = giantsCombatStyleBaselineForAccount();
         boolean haveGear = hasWeaponForStyle(style);
-        int coins = getInvCount("Coins");
-        debug("[Inv] Hebben: food=" + foodHave + ", brass key=" + haveKey + ", gear " + style + "=" + haveGear + ", coins=" + coins);
+        debug("[Inv] Hebben: food=" + foodHave + ", brass key=" + haveKey + ", gear " + style + "=" + haveGear
+                + ", coins " + coinsContextForDebugLog());
         debug("[Inv] Nodig: food=" + foodNeed + ", key=1, gear=" + style + " (uit instellingen)");
         if (foodHave < foodNeed) debug("[Inv] → food ophalen: " + (foodNeed - foodHave));
         if (!haveKey) debug("[Inv] → brass key ophalen");
@@ -1827,20 +1996,349 @@ public class GiantsHandler {
         return existingFood != null ? existingFood.getName() : null;
     }
 
+    /**
+     * Tier-volgorde van melee-wapens van best (lage index) → slechtst (hoge index).
+     * Wordt gebruikt voor zowel "wat heb ik nu best" als "is er een upgrade in de bank".
+     */
+    private static final String[] MELEE_TIER = {
+            "Rune scimitar", "Adamant scimitar", "Mithril scimitar",
+            "Steel scimitar", "Iron scimitar", "Bronze scimitar", "Scimitar"
+    };
+
+    /** Attack-level vereist per item in {@link #MELEE_TIER}. Geen entry = 1 (geen vereiste). */
+    private static final java.util.Map<String, Integer> MELEE_TIER_ATTACK_REQ;
+    static {
+        java.util.Map<String, Integer> m = new java.util.HashMap<>();
+        m.put("Rune scimitar", 40);
+        m.put("Adamant scimitar", 30);
+        m.put("Mithril scimitar", 20);
+        m.put("Steel scimitar", 5);
+        m.put("Iron scimitar", 1);
+        m.put("Bronze scimitar", 1);
+        m.put("Scimitar", 1);
+        MELEE_TIER_ATTACK_REQ = java.util.Collections.unmodifiableMap(m);
+    }
+
+    /** Index in {@link #MELEE_TIER} (-1 als geen match). Lager = beter. */
+    private int meleeTierIndexCi(String name) {
+        if (name == null) return -1;
+        for (int i = 0; i < MELEE_TIER.length; i++) {
+            if (MELEE_TIER[i].equalsIgnoreCase(name)) return i;
+        }
+        return -1;
+    }
+
+    private int safeAttackLevel() {
+        try {
+            return Skills.getLevel(Skill.ATTACK);
+        } catch (Throwable ignored) {
+            return 1;
+        }
+    }
+
+    /** Mag deze speler dit melee-wapen daadwerkelijk wielden (Attack-level)? */
+    private boolean canWieldMelee(String name) {
+        if (name == null) return false;
+        Integer req = MELEE_TIER_ATTACK_REQ.get(name);
+        if (req == null) {
+            for (java.util.Map.Entry<String, Integer> e : MELEE_TIER_ATTACK_REQ.entrySet()) {
+                if (e.getKey().equalsIgnoreCase(name)) {
+                    req = e.getValue();
+                    break;
+                }
+            }
+        }
+        if (req == null) req = 1;
+        try {
+            int lvl = Skills.getLevel(Skill.ATTACK);
+            return lvl >= req;
+        } catch (Throwable ignored) {
+            return req <= 1;
+        }
+    }
+
+    /** Beste melee-wapen dat we al hebben (in inventory of aangetrokken). {@code null} als geen. */
+    private String bestOwnedMeleeWeaponName() {
+        for (String w : MELEE_TIER) {
+            boolean owned =
+                    Inventory.contains(item -> item != null && item.getName() != null && w.equalsIgnoreCase(item.getName()))
+                    || Equipment.contains(item -> item != null && item.getName() != null && w.equalsIgnoreCase(item.getName()));
+            if (owned) return w;
+        }
+        return null;
+    }
+
+    /**
+     * Beste melee-wapen in de bank dat we ook daadwerkelijk kunnen wielden (Attack-level check).
+     * Voorkomt dat de bot een Rune scimitar pakt op een 1 Attack-account → wield faalt → bank → loop.
+     * {@code null} als niets in bank past.
+     */
+    private String bestBankMeleeWeaponName() {
+        for (String w : MELEE_TIER) {
+            if (!canWieldMelee(w)) continue;
+            if (Bank.contains(w)) return w;
+        }
+        return null;
+    }
+
+    private int safeDefenseLevel() {
+        try {
+            return Skills.getLevel(Skill.DEFENCE);
+        } catch (Throwable ignored) {
+            return 1;
+        }
+    }
+
+    private int safeRangedLevel() {
+        try {
+            return Skills.getLevel(Skill.RANGED);
+        } catch (Throwable ignored) {
+            return 1;
+        }
+    }
+
+    private int safeMagicLevel() {
+        try {
+            return Skills.getLevel(Skill.MAGIC);
+        } catch (Throwable ignored) {
+            return 1;
+        }
+    }
+
+    private static final class GearPiece {
+        final String slot;
+        final String name;
+        final int defenseReq;
+        final int rangedReq;
+        final int magicReq;
+
+        GearPiece(String slot, String name, int defenseReq, int rangedReq, int magicReq) {
+            this.slot = slot;
+            this.name = name;
+            this.defenseReq = defenseReq;
+            this.rangedReq = rangedReq;
+            this.magicReq = magicReq;
+        }
+    }
+
+    private static GearPiece gp(String slot, String name, int def, int range, int magic) {
+        return new GearPiece(slot, name, def, range, magic);
+    }
+
+    /** Best → worst per slot. Alleen armor, geen wapen/ammo. */
+    private static final GearPiece[] MELEE_ARMOUR_TIER = {
+            gp("HEAD", "Rune full helm", 40, 0, 0), gp("HEAD", "Rune med helm", 40, 0, 0),
+            gp("HEAD", "Adamant full helm", 30, 0, 0), gp("HEAD", "Adamant med helm", 30, 0, 0),
+            gp("HEAD", "Mithril full helm", 20, 0, 0), gp("HEAD", "Mithril med helm", 20, 0, 0),
+            gp("HEAD", "Steel full helm", 5, 0, 0), gp("HEAD", "Steel med helm", 5, 0, 0),
+            gp("HEAD", "Iron full helm", 1, 0, 0), gp("HEAD", "Bronze full helm", 1, 0, 0),
+
+            // Rune platebody heeft Dragon Slayer nodig; chainbody is veiliger voor fresh accounts.
+            gp("BODY", "Rune chainbody", 40, 0, 0), gp("BODY", "Adamant platebody", 30, 0, 0),
+            gp("BODY", "Adamant chainbody", 30, 0, 0), gp("BODY", "Mithril platebody", 20, 0, 0),
+            gp("BODY", "Mithril chainbody", 20, 0, 0), gp("BODY", "Steel platebody", 5, 0, 0),
+            gp("BODY", "Steel chainbody", 5, 0, 0), gp("BODY", "Iron platebody", 1, 0, 0),
+            gp("BODY", "Bronze platebody", 1, 0, 0),
+
+            gp("LEGS", "Rune platelegs", 40, 0, 0), gp("LEGS", "Rune plateskirt", 40, 0, 0),
+            gp("LEGS", "Adamant platelegs", 30, 0, 0), gp("LEGS", "Adamant plateskirt", 30, 0, 0),
+            gp("LEGS", "Mithril platelegs", 20, 0, 0), gp("LEGS", "Mithril plateskirt", 20, 0, 0),
+            gp("LEGS", "Steel platelegs", 5, 0, 0), gp("LEGS", "Iron platelegs", 1, 0, 0),
+            gp("LEGS", "Bronze platelegs", 1, 0, 0),
+
+            gp("SHIELD", "Rune kiteshield", 40, 0, 0), gp("SHIELD", "Rune sq shield", 40, 0, 0),
+            gp("SHIELD", "Adamant kiteshield", 30, 0, 0), gp("SHIELD", "Adamant sq shield", 30, 0, 0),
+            gp("SHIELD", "Mithril kiteshield", 20, 0, 0), gp("SHIELD", "Mithril sq shield", 20, 0, 0),
+            gp("SHIELD", "Steel kiteshield", 5, 0, 0), gp("SHIELD", "Iron kiteshield", 1, 0, 0),
+            gp("SHIELD", "Bronze kiteshield", 1, 0, 0),
+
+            gp("HANDS", "Leather gloves", 1, 0, 0),
+            gp("FEET", "Fighting boots", 1, 0, 0), gp("FEET", "Fancy boots", 1, 0, 0),
+            gp("FEET", "Leather boots", 1, 0, 0),
+            gp("AMULET", "Amulet of strength", 1, 0, 0), gp("AMULET", "Amulet of power", 1, 0, 0),
+            gp("AMULET", "Amulet of accuracy", 1, 0, 0), gp("AMULET", "Amulet of defence", 1, 0, 0)
+    };
+
+    private static final GearPiece[] RANGED_ARMOUR_TIER = {
+            gp("HEAD", "Coif", 1, 20, 0), gp("HEAD", "Leather cowl", 1, 1, 0),
+            gp("BODY", "Studded body", 20, 20, 0), gp("BODY", "Hardleather body", 10, 1, 0),
+            gp("BODY", "Leather body", 1, 1, 0),
+            gp("LEGS", "Green d'hide chaps", 1, 40, 0), gp("LEGS", "Studded chaps", 1, 20, 0),
+            gp("LEGS", "Leather chaps", 1, 1, 0),
+            gp("HANDS", "Green d'hide vambraces", 1, 40, 0), gp("HANDS", "Leather vambraces", 1, 1, 0),
+            gp("FEET", "Fighting boots", 1, 0, 0), gp("FEET", "Fancy boots", 1, 0, 0),
+            gp("FEET", "Leather boots", 1, 0, 0),
+            gp("AMULET", "Amulet of power", 1, 0, 0), gp("AMULET", "Amulet of accuracy", 1, 0, 0),
+            gp("AMULET", "Amulet of defence", 1, 0, 0)
+    };
+
+    private static final GearPiece[] MAGE_ARMOUR_TIER = {
+            gp("HEAD", "Mystic hat", 20, 0, 20), gp("HEAD", "Wizard hat", 1, 0, 1),
+            gp("HEAD", "Blue wizard hat", 1, 0, 1),
+            gp("BODY", "Mystic robe top", 20, 0, 20), gp("BODY", "Wizard robe", 1, 0, 1),
+            gp("BODY", "Blue wizard robe", 1, 0, 1),
+            gp("LEGS", "Mystic robe bottom", 20, 0, 20), gp("LEGS", "Zamorak monk bottom", 1, 0, 1),
+            gp("LEGS", "Monk's robe", 1, 0, 1),
+            gp("HANDS", "Mystic gloves", 20, 0, 20),
+            gp("FEET", "Mystic boots", 20, 0, 20), gp("FEET", "Leather boots", 1, 0, 0),
+            gp("AMULET", "Amulet of magic", 1, 0, 1), gp("AMULET", "Amulet of power", 1, 0, 0)
+    };
+
+    private boolean canWearGear(GearPiece g) {
+        if (g == null) return false;
+        return safeDefenseLevel() >= g.defenseReq
+                && safeRangedLevel() >= g.rangedReq
+                && safeMagicLevel() >= g.magicReq;
+    }
+
+    private GearPiece[] armourTierForStyle(CombatBotConfig.ImpsCombatStyle style) {
+        switch (style) {
+            case MELEE:
+                return MELEE_ARMOUR_TIER;
+            case RANGED:
+                return RANGED_ARMOUR_TIER;
+            case MAGE:
+                return MAGE_ARMOUR_TIER;
+            default:
+                return new GearPiece[0];
+        }
+    }
+
+    private int gearTierIndex(GearPiece[] list, String name) {
+        if (name == null) return -1;
+        for (int i = 0; i < list.length; i++) {
+            if (list[i].name.equalsIgnoreCase(name)) return i;
+        }
+        return -1;
+    }
+
+    private GearPiece bestOwnedGearForSlot(GearPiece[] list, String slot) {
+        for (GearPiece g : list) {
+            if (!g.slot.equals(slot)) continue;
+            boolean owned = Inventory.contains(item -> item != null && item.getName() != null && g.name.equalsIgnoreCase(item.getName()))
+                    || Equipment.contains(item -> item != null && item.getName() != null && g.name.equalsIgnoreCase(item.getName()));
+            if (owned) return g;
+        }
+        return null;
+    }
+
+    private GearPiece bestBankGearForSlot(GearPiece[] list, String slot) {
+        for (GearPiece g : list) {
+            if (!g.slot.equals(slot)) continue;
+            if (!canWearGear(g)) continue;
+            if (Bank.contains(g.name)) return g;
+        }
+        return null;
+    }
+
+    private List<String> gearSlots(GearPiece[] list) {
+        List<String> out = new ArrayList<>();
+        for (GearPiece g : list) {
+            if (!out.contains(g.slot)) out.add(g.slot);
+        }
+        return out;
+    }
+
+    /** Pak per slot het beste draagbare armorstuk uit de bank. Ontbrekende armor blokkeert Giants niet. */
+    private void withdrawBestArmourForStyleInOneGo(CombatBotConfig.ImpsCombatStyle style) {
+        GearPiece[] list = armourTierForStyle(style);
+        for (String slot : gearSlots(list)) {
+            GearPiece owned = bestOwnedGearForSlot(list, slot);
+            GearPiece bankBest = bestBankGearForSlot(list, slot);
+            if (bankBest == null) {
+                continue;
+            }
+            int ownedIdx = owned != null ? gearTierIndex(list, owned.name) : Integer.MAX_VALUE;
+            int bankIdx = gearTierIndex(list, bankBest.name);
+            if (bankIdx >= ownedIdx) {
+                continue;
+            }
+            if (owned != null && Inventory.contains(owned.name)) {
+                Bank.depositAll(owned.name);
+                sleep(250, 500);
+            }
+            Bank.withdraw(bankBest.name, 1);
+            sleep(350, 650);
+            debug("[Bank] armor " + bankBest.name + " (" + style + ", slot=" + slot
+                    + ", def=" + safeDefenseLevel() + ", range=" + safeRangedLevel()
+                    + ", magic=" + safeMagicLevel() + ")");
+        }
+    }
+
+    /** Equip alle beste style-armor uit inventory. Als het dragen faalt, verdwijnt het volgende bankpass vanzelf terug naar bank. */
+    private void equipBestArmourFromInventory(CombatBotConfig.ImpsCombatStyle style) {
+        GearPiece[] list = armourTierForStyle(style);
+        for (String slot : gearSlots(list)) {
+            GearPiece best = null;
+            IInventoryItem item = null;
+            for (GearPiece g : list) {
+                if (!g.slot.equals(slot)) continue;
+                if (!canWearGear(g)) continue;
+                IInventoryItem hit = Inventory.getFirst(inv -> inv != null && inv.getName() != null
+                        && g.name.equalsIgnoreCase(inv.getName()));
+                if (hit != null) {
+                    best = g;
+                    item = hit;
+                    break;
+                }
+            }
+            if (item == null || best == null) {
+                continue;
+            }
+            String action = item.hasAction("Wear") ? "Wear" : (item.hasAction("Wield") ? "Wield" : null);
+            if (action == null) {
+                continue;
+            }
+            item.interact(action);
+            debug("[Bank] " + action + " " + best.name + " (auto-equip armor, " + style + ")");
+            sleep(350, 650);
+        }
+    }
+
     /** Haal alle gear voor deze style in één keer (één bank sessie, zoals Imps). */
     private void withdrawAllGearForStyleInOneGo(CombatBotConfig.ImpsCombatStyle style) {
         switch (style) {
             case MELEE: {
-                String[] meleeWeapons = {"Rune scimitar", "Adamant scimitar", "Mithril scimitar", "Steel scimitar", "Iron scimitar", "Bronze scimitar", "Scimitar"};
-                for (String w : meleeWeapons) {
-                    if (Bank.contains(w)) {
-                        Bank.withdraw(w, 1);
-                        sleep(500, 800);
-                        debug("[Bank] wapen " + w);
-                        return;
+                // Eerst eventuele "junk" wapens dumpen die in inv liggen maar te hoog tier zijn voor
+                // ons Attack-level. Zonder dit blijft de bot eindeloos proberen te wielden +
+                // re-withdrawen elke cycle.
+                for (String w : MELEE_TIER) {
+                    if (canWieldMelee(w)) continue;
+                    if (Inventory.contains(item -> item != null && item.getName() != null && w.equalsIgnoreCase(item.getName()))) {
+                        Bank.depositAll(w);
+                        sleep(300, 600);
+                        debug("[Bank] " + w + " gedeponeerd — Attack-level te laag (req="
+                                + MELEE_TIER_ATTACK_REQ.getOrDefault(w, 1)
+                                + ", lvl=" + safeAttackLevel() + ")");
                     }
                 }
-                break;
+
+                String owned = bestOwnedMeleeWeaponName();
+                String bankBest = bestBankMeleeWeaponName();
+                int ownedIdx = meleeTierIndexCi(owned);
+                int bankIdx = meleeTierIndexCi(bankBest);
+
+                if (bankBest == null) {
+                    if (owned == null) debug("[Bank] Geen wieldbaar melee-wapen gevonden (Attack lvl="
+                            + safeAttackLevel() + ")");
+                    return;
+                }
+
+                if (owned != null && bankIdx >= ownedIdx) {
+                    return;
+                }
+
+                if (owned != null && bankIdx < ownedIdx) {
+                    Bank.depositAll(owned);
+                    sleep(400, 700);
+                    debug("[Bank] upgrade gevonden: " + owned + " → " + bankBest + " (bank = beter)");
+                }
+
+                Bank.withdraw(bankBest, 1);
+                sleep(500, 800);
+                debug("[Bank] wapen " + bankBest + " (Attack lvl=" + safeAttackLevel()
+                        + ", req=" + MELEE_TIER_ATTACK_REQ.getOrDefault(bankBest, 1) + ")");
+                return;
             }
             case RANGED: {
                 if (Bank.contains("Shortbow")) {
@@ -1936,25 +2434,101 @@ public class GiantsHandler {
         return Math.max(1, config.foodAmount());
     }
 
+    /**
+     * Detecteert "we worden getarget maar kunnen niet vechten" deadlock en breekt eruit door
+     * actief de blokkerende giant aan te vallen. Retourneert delay in ms als er actie is gedaan,
+     * 0 als er niks aan de hand is.
+     */
+    private int maybeBreakOutOfStuckCombat(IPlayer player, long now) {
+        if (now - lastCombatStuckBreakoutMs < COMBAT_STUCK_BREAKOUT_COOLDOWN_MS) {
+            return 0;
+        }
+        // Animatie op -1 langer dan onze random 3-8s drempel?
+        if (lastPlayerCombatAnimMs == 0) {
+            // Eerste tick in combat: initialiseer baseline zodat we niet meteen forceren.
+            lastPlayerCombatAnimMs = now;
+            return 0;
+        }
+        long idleSinceAnim = now - lastPlayerCombatAnimMs;
+        if (idleSinceAnim < combatStuckThresholdMs) {
+            return 0;
+        }
+
+        // Kies de giant die ons als target heeft — bij meerdere: dichtste in path-distance.
+        WorldPoint myPos = player.getWorldLocation();
+        if (myPos == null) return 0;
+        String monsterName = config.giantsMonsterName();
+        List<INPC> attackers = NPCs.getAll(npc ->
+                npc != null
+                        && npc.getName() != null
+                        && npc.getName().equalsIgnoreCase(monsterName)
+                        && !npc.isDead()
+                        && npc.getInteracting() == player
+                        && npc.getWorldLocation() != null
+                        && npc.getWorldLocation().distanceTo(HILL_GIANTS_CENTER) <= HILL_GIANTS_RADIUS
+        );
+        if (attackers == null || attackers.isEmpty()) return 0;
+
+        INPC target = null;
+        int bestPathDist = Integer.MAX_VALUE;
+        int bestTileDist = Integer.MAX_VALUE;
+        for (INPC npc : attackers) {
+            if (npc == null || npc.getWorldLocation() == null) continue;
+            int tileDist = myPos.distanceTo(npc.getWorldLocation());
+            int pathDist;
+            try {
+                pathDist = Movement.calculateDistance(npc.getWorldLocation());
+            } catch (Exception e) {
+                pathDist = tileDist;
+            }
+            if (pathDist < 0) continue;
+            if (pathDist < bestPathDist
+                    || (pathDist == bestPathDist && tileDist < bestTileDist)) {
+                bestPathDist = pathDist;
+                bestTileDist = tileDist;
+                target = npc;
+            }
+        }
+        if (target == null) return 0;
+
+        target.interact("Attack");
+        lastAttackClickTime = now;
+        lastAttackedNpcIndex = target.getIndex();
+        lastCombatStuckBreakoutMs = now;
+        // Reset animatie-baseline + nieuwe random drempel zodat we niet binnen dezelfde dode periode
+        // direct opnieuw forceren als de bot op weg is naar de target.
+        lastPlayerCombatAnimMs = now;
+        combatStuckThresholdMs = 3000L + random.nextInt(5000);
+        debug("[Anti-stuck] " + idleSinceAnim + "ms geen anim terwijl giant ons targette → "
+                + "Attack geforceerd op " + target.getName() + " (pathDist=" + bestPathDist + ")");
+        return 600 + random.nextInt(500);
+    }
+
     private boolean isInCombat() {
         IPlayer player = Players.getLocal();
         if (player == null) return false;
         WorldPoint myPos = player.getWorldLocation();
         if (myPos == null) return false;
 
-        // 1) Eigen aanval-animatie is leidend: dan zijn we echt in actieve combat.
-        // Alleen "interacting" is te breed en kan leiden tot stilstaan/lusjes.
+        String monsterName = config.giantsMonsterName();
+
+        // Actieve animatie (slaan, casten, …) — duidelijk bezig met een actie.
         if (player.getAnimation() != -1) return true;
-        if (player.isInteracting()) {
-            // Interacting zonder animatie behandelen we NIET als vaste combat-lock.
-            // Zo kunnen we opnieuw klikken als giant vastzit of ons niet echt kan raken.
-            return false;
+
+        // Tussen twee hits is animatie vaak -1, maar de client houdt nog combat-lock op de NPC.
+        // Zonder deze check spamt de bot "Attack" terwijl we al op de giant zitten (zelfde patroon als ImpsHandler).
+        if (player.isInteracting() && player.getInteracting() instanceof INPC) {
+            INPC focus = (INPC) player.getInteracting();
+            if (focus.getName() != null
+                    && focus.getName().equalsIgnoreCase(monsterName)
+                    && !focus.isDead()
+                    && focus.getWorldLocation() != null
+                    && focus.getWorldLocation().distanceTo(HILL_GIANTS_CENTER) <= HILL_GIANTS_RADIUS) {
+                return true;
+            }
         }
 
-        // 2) Als we automatisch worden aangevallen: NPC interageert met ons EN kan ons praktisch bereiken.
-        //    We markeren dit alleen als "in combat" wanneer onze animatie ook loopt.
-        //    Anders mag de bot opnieuw "Attack" klikken (zoals door gebruiker gevraagd).
-        String monsterName = config.giantsMonsterName();
+        // Giant valt ons aan (ook tussen ticks / idle pose — niet afhankelijk van speler-animatie).
         List<INPC> attackers = NPCs.getAll(npc ->
                 npc != null
                         && npc.getName() != null
@@ -1971,8 +2545,7 @@ public class GiantsHandler {
         for (INPC attacker : attackers) {
             if (attacker == null || attacker.getWorldLocation() == null) continue;
             int pathDist = Movement.calculateDistance(myPos, attacker.getWorldLocation());
-            // -1/extreem groot = pad niet bruikbaar/geen route; dan niet als actieve combat behandelen.
-            if (pathDist >= 0 && pathDist <= 4 && player.getAnimation() != -1) {
+            if (pathDist >= 0 && pathDist <= 4) {
                 return true;
             }
         }
@@ -1997,7 +2570,9 @@ public class GiantsHandler {
                         break;
                     }
                 }
-                if (match && item.getWorldLocation().distanceTo(myPos) <= HILL_GIANTS_RADIUS + 3) return true;
+                if (match
+                        && canLootItemNow(item)
+                        && item.getWorldLocation().distanceTo(myPos) <= HILL_GIANTS_RADIUS + 3) return true;
             }
             return false;
         } else {
@@ -2007,6 +2582,7 @@ public class GiantsHandler {
                                 && i.getWorldLocation() != null
                                 && !isGroundLootTileExcluded(i.getWorldLocation())
                                 && i.getName().equalsIgnoreCase(name)
+                                && canLootItemNow(i)
                                 && i.getWorldLocation().distanceTo(myPos) <= HILL_GIANTS_RADIUS + 3);
                 if (item != null) return true;
             }
@@ -2026,6 +2602,7 @@ public class GiantsHandler {
                         && i.getWorldLocation() != null
                         && !isGroundLootTileExcluded(i.getWorldLocation())
                         && special.stream().anyMatch(n -> n.equalsIgnoreCase(i.getName()))
+                        && canLootItemNow(i)
                         && i.getWorldLocation().distanceTo(myPos) <= HILL_GIANTS_RADIUS + 3);
         return item != null;
     }
@@ -2085,8 +2662,9 @@ public class GiantsHandler {
 
     /**
      * Maak ruimte vrij voor loot:
-     * - Eet alleen als HP niet vol is (geen onnodig eten)
-     * - Begraaf bones/ashes waar mogelijk
+     * - Begraaf bones/ashes waar mogelijk (altijd, gratis slot)
+     * - Eet alleen als de globale toggle {@link CombatBotConfig#eatToMakeSpaceForLoot()} aan staat,
+     *   HP niet vol is én er ligt loot waar het de moeite waard voor is (geen bones/ashes).
      * Return >0 = actie gedaan (delay), 0 = geen ruimte kunnen maken.
      */
     private int tryMakeSpaceForLootWhenFull() {
@@ -2096,16 +2674,22 @@ public class GiantsHandler {
         int buryDelay = buryOneBoneIfReady();
         if (buryDelay > 0) return buryDelay;
 
-        // 2) Alleen eten als HP niet vol is
-        if (!isHpFull()) {
-            IInventoryItem food = Inventory.getFirst(item ->
-                    item != null && item.getName() != null
-                            && (item.hasAction("Eat") || item.hasAction("Drink")));
-            if (food != null) {
-                if (food.hasAction("Eat")) food.interact("Eat");
-                else food.interact("Drink");
-                return 900 + random.nextInt(500);
-            }
+        // 2) Eet om plek te maken voor non-bone/ash loot — gate'd op config toggle
+        List<String> wanted = new ArrayList<>();
+        String[] lootArr = getLootItems();
+        if (lootArr != null) {
+            for (String s : lootArr) if (s != null) wanted.add(s);
+        }
+        List<String> sp = getSpecialLootNames();
+        if (sp != null) wanted.addAll(sp);
+        int eatDelay = EatForLootSpaceHelper.tryEatForSpace(
+                config,
+                config.lootOnlyOwn(),
+                HILL_GIANTS_RADIUS + 3,
+                wanted.isEmpty() ? null : wanted,
+                this::debug);
+        if (eatDelay > 0) {
+            return eatDelay;
         }
 
         // Geen ruimte kunnen maken -> caller laat loot liggen en gaat verder.

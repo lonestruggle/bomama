@@ -51,7 +51,9 @@ public final class GeRestockHelper {
     public enum RestockResult {
         SUCCESS,
         FAILED,
-        GE_NOT_AVAILABLE
+        GE_NOT_AVAILABLE,
+        /** Per-account policy verbiedt aankoop van dit item (zie GeShopPolicy + Account-edit dialog). */
+        BLOCKED_BY_ACCOUNT_POLICY
     }
 
     private static void debug(String msg) {
@@ -122,6 +124,20 @@ public final class GeRestockHelper {
         if (quantity <= 0 || itemName == null || itemName.trim().isEmpty()) {
             debug("[GE] ongeldige input -> FAILED");
             return RestockResult.FAILED;
+        }
+
+        // Per-account policy: mag dit item überhaupt gekocht worden?
+        if (!GeShopPolicy.allowsBuy(itemName)) {
+            debug("[GE] BLOKKADE per-account policy: '" + itemName + "' (categorie="
+                    + GeShopPolicy.categoryFor(itemName) + ") staat UIT in account-tab. -> BLOCKED");
+            return RestockResult.BLOCKED_BY_ACCOUNT_POLICY;
+        }
+
+        // Per-account cap toepassen op de gevraagde hoeveelheid (bv. Law rune cap = 30).
+        int cappedQty = GeShopPolicy.effectiveQuantity(itemName, quantity);
+        if (cappedQty != quantity) {
+            debug("[GE] per-account cap actief: '" + itemName + "' " + quantity + " -> " + cappedQty);
+            quantity = cappedQty;
         }
 
         int invNow = Inventory.getCount(true, itemName);
@@ -207,6 +223,16 @@ public final class GeRestockHelper {
 
             int extraAffordable = Math.max(0, (coinsNow / Math.max(1, currentPrice)) - remainingBase);
             int extraToBuy = Math.min(desiredExtraUnits, extraAffordable);
+            // Per-account cap geldt ook voor bulk buffer: nooit méér totaal kopen dan de cap toelaat.
+            int totalIfAdded = invNow + remainingBase + extraToBuy;
+            int policyCap = GeShopPolicy.effectiveQuantity(itemName, totalIfAdded);
+            if (policyCap < totalIfAdded) {
+                int allowedExtra = Math.max(0, policyCap - invNow - remainingBase);
+                if (allowedExtra < extraToBuy) {
+                    debug("[GE] policy-cap reduceert bulk buffer: " + extraToBuy + " -> " + allowedExtra);
+                    extraToBuy = allowedExtra;
+                }
+            }
             int remaining = remainingBase + extraToBuy;
             if (extraToBuy > 0) {
                 debug("[GE] koopbuffer deze poging: base=" + remainingBase + " extra=" + extraToBuy
@@ -525,6 +551,24 @@ public final class GeRestockHelper {
         if (!(isRune || isBait || isArrow)) {
             return 0;
         }
+
+        // Dure / 'precieze' runes — kleine buffer (max +20) zodat we niet 160+ Law runes kopen
+        // terwijl de bot er per teleport maar 1 nodig heeft. Eerder gold de generieke 500..1000
+        // buffer voor élke "rune" en dan stopte de coin-affordability ergens halverwege.
+        boolean isExpensiveRune = isRune && (
+                n.contains("law")
+                        || n.contains("death")
+                        || n.contains("nature")
+                        || n.contains("cosmic")
+                        || n.contains("soul")
+                        || n.contains("blood")
+                        || n.contains("wrath")
+                        || n.contains("astral")
+        );
+        if (isExpensiveRune) {
+            return 5 + random.nextInt(16); // +5..+20
+        }
+
         return EXTRA_BUY_BUFFER_MIN + random.nextInt(EXTRA_BUY_BUFFER_MAX - EXTRA_BUY_BUFFER_MIN + 1);
     }
 

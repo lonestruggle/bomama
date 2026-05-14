@@ -31,12 +31,103 @@ public final class VarrockTeleportHelper {
     public enum TeleportReadiness {
         /** Alle benodigdheden in inventory, klaar om te teleporteren. */
         TELEPORT_READY,
+        /**
+         * Chronicle (in inv of equip) is bruikbaar — caller moet
+         * {@link ChronicleHelper#teleportToVarrock(String)} aanroepen i.p.v. spell te casten.
+         */
+        CHRONICLE_TELEPORT_READY,
         /** Niet mogelijk — loop naar bestemming. */
         WALK
     }
 
     private static void debug(String msg) {
         DebugLog.log("VarrockTP", msg);
+    }
+
+    /**
+     * Variant met chronicle-toggle (per-account). Probeert in volgorde:
+     * <ol>
+     *   <li>Chronicle in inv/equip met charges &gt; 0 → {@link TeleportReadiness#CHRONICLE_TELEPORT_READY}</li>
+     *   <li>Chronicle in inv + Teleport cards in inv → laad 1 card → {@link TeleportReadiness#CHRONICLE_TELEPORT_READY}</li>
+     *   <li>Bestaande spell-flow ({@link #prepareVarrockTeleport(boolean)}) — Magic 25, runes, staves</li>
+     * </ol>
+     * Bank hoeft alleen open te zijn voor de spell-flow; chronicle teleport werkt zonder bank.
+     *
+     * @param displayName ingelogde RSN — gebruikt voor JSON-state updates.
+     * @param useChronicle account-toggle (per-account vlag, zie ManagedJagexAccountRow#useChronicleForVarrock).
+     */
+    public static TeleportReadiness prepareVarrockTeleportSmart(String displayName, boolean useChronicle) {
+        if (useChronicle) {
+            TeleportReadiness viaBook = tryChroniclePath(displayName);
+            if (viaBook != null) return viaBook;
+        }
+        // Bestaande spell-flow vereist een open bank — hou dat gedrag intact.
+        return prepareVarrockTeleport();
+    }
+
+    /**
+     * Probeer een chronicle-teleport uit te voeren (per-account toggle uit JSON).
+     * Returns {@code true} als de teleport gestart is — caller skipt dan de spell-cast.
+     * Returns {@code false} als chronicle uit staat / niet beschikbaar — caller doet zijn
+     * bestaande spell-flow (Magic 25 Varrock teleport).
+     */
+    public static boolean tryExecuteChronicleTeleport(String displayName) {
+        if (displayName == null || displayName.trim().isEmpty()) return false;
+        boolean useChronicle = false;
+        try {
+            AccountStateJsonStore.AccountEntry e = AccountStateJsonStore.getEntry(displayName);
+            if (e != null) useChronicle = e.chronicleTeleportEnabled;
+        } catch (Throwable ignored) {
+            return false;
+        }
+        if (!useChronicle) return false;
+
+        TeleportReadiness r = tryChroniclePath(displayName);
+        if (r == TeleportReadiness.CHRONICLE_TELEPORT_READY) {
+            return ChronicleHelper.teleportToVarrock(displayName);
+        }
+        return false;
+    }
+
+    /**
+     * Probeer eerst chronicle te gebruiken; returns {@code null} als chronicle-pad niet beschikbaar is
+     * (caller mag dan terugvallen op de spell-flow).
+     */
+    private static TeleportReadiness tryChroniclePath(String displayName) {
+        // Refresh state-velden vanuit inv (voor zover dat zonder bank kan).
+        ChronicleHelper.syncCardsInInventory(displayName);
+
+        boolean inInv = ChronicleHelper.inInventory();
+        boolean equip = ChronicleHelper.isEquipped();
+        if (!inInv && !equip) {
+            debug("chronicle pad: geen chronicle in inv/equip → val terug op spell/walk");
+            return null;
+        }
+        if (!inInv && equip) {
+            debug("chronicle pad: chronicle is equipped — worn-widget teleport pas in volgende update,"
+                    + " val voor nu terug op spell/walk. Leg chronicle in inv voor direct gebruik.");
+            return null;
+        }
+
+        AccountStateJsonStore.AccountEntry entry = AccountStateJsonStore.getEntry(displayName);
+        int charges = entry == null ? 0 : Math.max(0, entry.chronicleCharges);
+
+        if (charges > 0) {
+            debug("chronicle pad: " + charges + " charges (state) → CHRONICLE_TELEPORT_READY");
+            return TeleportReadiness.CHRONICLE_TELEPORT_READY;
+        }
+
+        // Geen charges, maar evt cards in inv én chronicle in inv → laad 1 card en ga.
+        if (ChronicleHelper.cardsInInventory() > 0) {
+            int loaded = ChronicleHelper.chargeAvailableCardsBatch(displayName, 1);
+            if (loaded > 0) {
+                debug("chronicle pad: 1 card geladen → CHRONICLE_TELEPORT_READY");
+                return TeleportReadiness.CHRONICLE_TELEPORT_READY;
+            }
+        }
+
+        debug("chronicle pad: geen charges/cards bruikbaar → val terug op spell/walk");
+        return null;
     }
 
     /**
