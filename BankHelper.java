@@ -9,7 +9,9 @@ import net.storm.sdk.entities.NPCs;
 import net.storm.sdk.entities.Players;
 import net.storm.sdk.entities.TileObjects;
 import net.storm.sdk.items.Bank;
+import net.storm.sdk.items.GrandExchange;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
@@ -35,9 +37,57 @@ public class BankHelper {
 
     private static long nextBankOpenAttemptAllowedMs = 0;
 
+    /** Laatste {@link #walkToNearestFullBank(String...)}: false omdat snapshot bank leeg zegt (niet "geen bank"). */
+    private static volatile boolean lastWalkSkippedDueToSnapshot;
+
+    /**
+     * Karamja (Musa Point): volwaardige bank = eerst boot naar Port Sarim (zelfde als imps loot-dump).
+     * Geïnjecteerd vanuit {@link CombatBotPlugin} → {@link ImpsHandler#travelToPortSarimFromKaramja}.
+     */
+    @FunctionalInterface
+    public interface KaramjaBoatExitHandler {
+        /** @return true als speler op Karamja stond en boot-flow is gestart */
+        boolean travelToPortSarimIfOnKaramja();
+    }
+
+    private static KaramjaBoatExitHandler karamjaBoatExitHandler;
+
+    public static void setKaramjaBoatExitHandler(KaramjaBoatExitHandler handler) {
+        karamjaBoatExitHandler = handler;
+    }
+
+    /** Musa Point / Karamja eiland — zie {@link ImpsHandler#isOnKaramja(net.runelite.api.coords.WorldPoint)}. */
+    private static boolean isOnKaramja(WorldPoint pos) {
+        return ImpsHandler.isOnKaramja(pos);
+    }
+
+    /**
+     * Op Karamja geen bank-walk: Customs officer + Travel (loot-dump pad), nooit pathfinder naar mainland-bank.
+     */
+    private static boolean redirectKaramjaFullBankToBoat() {
+        IPlayer local = Players.getLocal();
+        WorldPoint myPos = local != null ? local.getWorldLocation() : null;
+        if (!isOnKaramja(myPos)) {
+            return false;
+        }
+        if (karamjaBoatExitHandler == null) {
+            debug("redirectKaramjaFullBankToBoat: geen handler — kan niet van Karamja naar mainland");
+            return false;
+        }
+        debug("redirectKaramjaFullBankToBoat: Karamja → Port Sarim boot (zelfde als loot-dump)");
+        return karamjaBoatExitHandler.travelToPortSarimIfOnKaramja();
+    }
+
     /** Reset static bank-open cooldown bij login/account-switch/fresh start. */
     public static void resetOpenCooldown() {
         nextBankOpenAttemptAllowedMs = 0;
+        lastAlKharidBankApproachTile = null;
+        lastAlKharidBankInteractTile = null;
+        lastWalkSkippedDueToSnapshot = false;
+    }
+
+    public static boolean wasLastWalkSkippedDueToSnapshot() {
+        return lastWalkSkippedDueToSnapshot;
     }
 
     /** Gebieden die we niet als bank gebruiken: Cooking Guild (F2P maar user wil niet), Crafting Guild (P2P). */
@@ -49,6 +99,11 @@ public class BankHelper {
     /** Lumbridge Castle center — voor detectie of nearest bank Lumbridge is. */
     private static final WorldPoint LUMBRIDGE_CASTLE_CENTER = new WorldPoint(3208, 3220, 0);
     private static final int LUMBRIDGE_DETECT_RADIUS = 40;
+
+    /** Bankbooth bij GE (niet de "Bankier" naast de clerk — die opent vaak geen bank-UI). */
+    private static final WorldPoint GRAND_EXCHANGE_BANK_BOOTH = new WorldPoint(3164, 3488, 0);
+    private static final WorldPoint GRAND_EXCHANGE_CENTER = new WorldPoint(3164, 3486, 0);
+    private static final int GRAND_EXCHANGE_BANK_RADIUS = 24;
 
     /** F2P banklocaties (geen Cooking Guild, geen Crafting Guild) — fallback als geen booth/banker in wereld. */
     private static final List<WorldPoint> F2P_BANK_POINTS = Arrays.asList(
@@ -62,6 +117,21 @@ public class BankHelper {
             new WorldPoint(2946, 3368, 0),   // Falador West
             new WorldPoint(3269, 3167, 0)    // Al Kharid
     );
+
+    /** Al Kharid bank: meerdere booths/bankiers — niet altijd dezelfde (anti-pattern). */
+    private static final WorldPoint AL_KHARID_BANK_AREA_CENTER = new WorldPoint(3269, 3167, 0);
+    private static final int AL_KHARID_BANK_AREA_RADIUS = 10;
+    private static final List<WorldPoint> AL_KHARID_BANK_APPROACH_TILES = Arrays.asList(
+            new WorldPoint(3269, 3163, 0),
+            new WorldPoint(3269, 3165, 0),
+            new WorldPoint(3269, 3167, 0),
+            new WorldPoint(3269, 3168, 0),
+            new WorldPoint(3270, 3165, 0),
+            new WorldPoint(3267, 3166, 0),
+            new WorldPoint(3267, 3169, 0)
+    );
+    private static WorldPoint lastAlKharidBankApproachTile;
+    private static WorldPoint lastAlKharidBankInteractTile;
 
     /**
      * Lumbridge kasteel trappen:
@@ -166,6 +236,88 @@ public class BankHelper {
      * Check of een punt dicht bij een bekende bank is.
      * Gebruikt BankLocation.getNearest() voor dynamische check.
      */
+    public static boolean isNearGrandExchange(WorldPoint point) {
+        return point != null && point.distanceTo(GRAND_EXCHANGE_CENTER) <= GRAND_EXCHANGE_BANK_RADIUS;
+    }
+
+    /** Sluit GE-UI zodat bankbooth/bankier niet geblokkeerd wordt. */
+    public static void closeGrandExchangeIfOpen() {
+        try {
+            if (GrandExchange.isOpen()) {
+                net.storm.sdk.input.Keyboard.type(
+                        String.valueOf((char) java.awt.event.KeyEvent.VK_ESCAPE), false);
+                debug("closeGrandExchangeIfOpen: Escape");
+            }
+        } catch (Throwable t) {
+            debug("closeGrandExchangeIfOpen: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Nabij GE: loop naar echte bankbooth (niet clerk-bankier op 2 tiles) en open bank.
+     *
+     * @return {@code true} als {@link Bank#isOpen()}; {@code false} als nog bezig of mislukt
+     */
+    public static boolean tryOpenBankAtGrandExchange() {
+        if (Bank.isOpen()) {
+            return true;
+        }
+        closeGrandExchangeIfOpen();
+        IPlayer local = Players.getLocal();
+        WorldPoint myPos = local != null ? local.getWorldLocation() : null;
+        if (myPos == null || !isNearGrandExchange(myPos)) {
+            return false;
+        }
+
+        ITileObject booth = TileObjects.getNearest(obj ->
+                obj != null
+                        && isFullBankTileObject(obj)
+                        && obj.getWorldLocation() != null
+                        && obj.getWorldLocation().distanceTo(GRAND_EXCHANGE_CENTER) <= GRAND_EXCHANGE_BANK_RADIUS);
+        if (booth == null && myPos.distanceTo(GRAND_EXCHANGE_BANK_BOOTH) <= BANK_OPEN_RANGE + 2) {
+            booth = TileObjects.getNearest(obj ->
+                    obj != null
+                            && isFullBankTileObject(obj)
+                            && obj.getWorldLocation() != null
+                            && myPos.distanceTo(obj.getWorldLocation()) <= BANK_OPEN_RANGE + 2);
+        }
+        WorldPoint boothTile = booth != null ? booth.getWorldLocation() : GRAND_EXCHANGE_BANK_BOOTH;
+        int dist = myPos.distanceTo(boothTile);
+        debug("tryOpenBankAtGrandExchange: boothTile=" + boothTile.getX() + "," + boothTile.getY()
+                + " dist=" + dist);
+
+        if (dist > BANK_OPEN_RANGE) {
+            if (walkTowardBankGoal(boothTile)) {
+                return false;
+            }
+            MovementHelper.walkToExact(boothTile);
+            return false;
+        }
+
+        if (booth != null) {
+            long now = System.currentTimeMillis();
+            if (now >= nextBankOpenAttemptAllowedMs) {
+                HumanBanking.pauseBeforeBankOpenClick();
+                nextBankOpenAttemptAllowedMs = now + 5500 + ThreadLocalRandom.current().nextInt(2501);
+                String action = booth.hasAction("Bank") ? "Bank" : "Use";
+                debug("tryOpenBankAtGrandExchange: klik booth " + action);
+                booth.interact(action);
+            }
+        } else {
+            long now = System.currentTimeMillis();
+            if (now >= nextBankOpenAttemptAllowedMs) {
+                HumanBanking.pauseBeforeBankOpenClick();
+                nextBankOpenAttemptAllowedMs = now + 5500 + ThreadLocalRandom.current().nextInt(2501);
+                debug("tryOpenBankAtGrandExchange: Bank.open() fallback");
+                try {
+                    Bank.open();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return waitUntilBankOpenVerified(8000, "tryOpenBankAtGrandExchange");
+    }
+
     public static boolean isNearAnyBank(WorldPoint point) {
         if (point == null) return false;
         // Check tegen bekende F2P bank punten
@@ -183,32 +335,158 @@ public class BankHelper {
         }
     }
 
+    private static boolean isFullBankTileObject(ITileObject obj) {
+        if (obj == null || obj.getName() == null) {
+            return false;
+        }
+        if (isInExcludedBankArea(obj.getWorldLocation())) {
+            return false;
+        }
+        String name = obj.getName().toLowerCase();
+        if (name.contains("deposit")) {
+            return false;
+        }
+        return (name.contains("bank booth") || name.contains("bank chest")
+                || name.contains("bank counter") || name.equals("bank"))
+                && (obj.hasAction("Bank") || obj.hasAction("Use"));
+    }
+
+    private static boolean isBankerNpc(INPC npc) {
+        if (npc == null || npc.getName() == null) {
+            return false;
+        }
+        if (isInExcludedBankArea(npc.getWorldLocation())) {
+            return false;
+        }
+        return npc.getName().toLowerCase().contains("banker") && npc.hasAction("Bank");
+    }
+
+    private static boolean isNearAlKharidBank(WorldPoint point) {
+        return point != null && point.getPlane() == AL_KHARID_BANK_AREA_CENTER.getPlane()
+                && point.distanceTo(AL_KHARID_BANK_AREA_CENTER) <= AL_KHARID_BANK_AREA_RADIUS;
+    }
+
+    private static boolean isAlKharidBankAnchor(WorldPoint anchor) {
+        return anchor != null && anchor.distanceTo(AL_KHARID_BANK_AREA_CENTER) <= 4;
+    }
+
+    /** Wisselt aanlooptile bij Al Kharid (niet steeds 3269,3167). */
+    private static WorldPoint pickAlKharidBankApproachTile() {
+        List<WorldPoint> pool = new ArrayList<>(AL_KHARID_BANK_APPROACH_TILES);
+        if (pool.size() > 1 && lastAlKharidBankApproachTile != null) {
+            pool.removeIf(lastAlKharidBankApproachTile::equals);
+            if (pool.isEmpty()) {
+                pool = new ArrayList<>(AL_KHARID_BANK_APPROACH_TILES);
+            }
+        }
+        WorldPoint pick = pool.get(ThreadLocalRandom.current().nextInt(pool.size()));
+        lastAlKharidBankApproachTile = pick;
+        debug("pickAlKharidBankApproachTile: " + pick.getX() + "," + pick.getY());
+        return pick;
+    }
+
     /**
      * Zoek het dichtstbijzijnde volwaardige bank object (booth/chest/counter).
      * Negeert deposit boxes. Sluit Cooking Guild en Crafting Guild uit (F2P-veilig).
      */
     public static ITileObject findNearestFullBankObject() {
-        return TileObjects.getNearest(obj -> {
-            if (obj == null || obj.getName() == null) return false;
-            if (isInExcludedBankArea(obj.getWorldLocation())) return false;
-            String name = obj.getName().toLowerCase();
-            if (name.contains("deposit")) return false;
-            return (name.contains("bank booth") || name.contains("bank chest")
-                    || name.contains("bank counter") || name.equals("bank"))
-                    && (obj.hasAction("Bank") || obj.hasAction("Use"));
-        });
+        return TileObjects.getNearest(BankHelper::isFullBankTileObject);
+    }
+
+    private static ITileObject pickVariedFullBankObject(WorldPoint myPos) {
+        if (!isNearAlKharidBank(myPos)) {
+            return findNearestFullBankObject();
+        }
+        List<ITileObject> inArea = new ArrayList<>();
+        try {
+            for (ITileObject obj : TileObjects.getAll(BankHelper::isFullBankTileObject)) {
+                WorldPoint w = obj.getWorldLocation();
+                if (w != null && isNearAlKharidBank(w)) {
+                    inArea.add(obj);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (inArea.isEmpty()) {
+            return findNearestFullBankObject();
+        }
+        List<ITileObject> pool = inArea;
+        if (lastAlKharidBankInteractTile != null && inArea.size() > 1) {
+            List<ITileObject> alt = new ArrayList<>();
+            for (ITileObject obj : inArea) {
+                WorldPoint w = obj.getWorldLocation();
+                if (w != null && !w.equals(lastAlKharidBankInteractTile)) {
+                    alt.add(obj);
+                }
+            }
+            if (!alt.isEmpty()) {
+                pool = alt;
+            }
+        }
+        ITileObject pick = pool.get(ThreadLocalRandom.current().nextInt(pool.size()));
+        WorldPoint pt = pick.getWorldLocation();
+        if (pt != null) {
+            lastAlKharidBankInteractTile = pt;
+            debug("pickVariedFullBankObject AK: " + pt.getX() + "," + pt.getY());
+        }
+        return pick;
     }
 
     /**
      * Zoek de dichtstbijzijnde banker NPC (F2P-veilig: geen Cooking/Crafting Guild).
      */
     public static INPC findNearestBankerNpc() {
-        return NPCs.getNearest(npc -> {
-            if (npc == null || npc.getName() == null) return false;
-            if (isInExcludedBankArea(npc.getWorldLocation())) return false;
-            return npc.getName().toLowerCase().contains("banker")
-                    && npc.hasAction("Bank");
-        });
+        return NPCs.getNearest(BankHelper::isBankerNpc);
+    }
+
+    private static INPC pickVariedBankerNpc(WorldPoint myPos) {
+        if (!isNearAlKharidBank(myPos)) {
+            return findNearestBankerNpc();
+        }
+        List<INPC> inArea = new ArrayList<>();
+        try {
+            List<INPC> all = NPCs.getAll(BankHelper::isBankerNpc);
+            if (all != null) {
+                for (INPC npc : all) {
+                    WorldPoint w = npc.getWorldLocation();
+                    if (w != null && isNearAlKharidBank(w)) {
+                        inArea.add(npc);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (inArea.isEmpty()) {
+            return findNearestBankerNpc();
+        }
+        List<INPC> pool = inArea;
+        if (lastAlKharidBankInteractTile != null && inArea.size() > 1) {
+            List<INPC> alt = new ArrayList<>();
+            for (INPC npc : inArea) {
+                WorldPoint w = npc.getWorldLocation();
+                if (w != null && !w.equals(lastAlKharidBankInteractTile)) {
+                    alt.add(npc);
+                }
+            }
+            if (!alt.isEmpty()) {
+                pool = alt;
+            }
+        }
+        INPC pick = pool.get(ThreadLocalRandom.current().nextInt(pool.size()));
+        WorldPoint pt = pick.getWorldLocation();
+        if (pt != null) {
+            lastAlKharidBankInteractTile = pt;
+            debug("pickVariedBankerNpc AK: " + pt.getX() + "," + pt.getY());
+        }
+        return pick;
+    }
+
+    private static ITileObject resolveFullBankObject(WorldPoint myPos) {
+        return pickVariedFullBankObject(myPos);
+    }
+
+    private static INPC resolveBankerNpc(WorldPoint myPos) {
+        return pickVariedBankerNpc(myPos);
     }
 
     private static final int BANK_OPEN_RANGE = 5;
@@ -238,13 +516,16 @@ public class BankHelper {
         if (Bank.isOpen()) {
             return true;
         }
+        if (redirectKaramjaFullBankToBoat()) {
+            return false;
+        }
 
         IPlayer local = Players.getLocal();
         WorldPoint myPos = local != null ? local.getWorldLocation() : null;
         long now = System.currentTimeMillis();
 
-        ITileObject booth = findNearestFullBankObject();
-        INPC banker = findNearestBankerNpc();
+        ITileObject booth = resolveFullBankObject(myPos);
+        INPC banker = resolveBankerNpc(myPos);
         boolean nearBooth = myPos != null && booth != null
                 && myPos.distanceTo(booth.getWorldLocation()) <= BANK_OPEN_RANGE;
         boolean nearBanker = myPos != null && banker != null
@@ -301,6 +582,11 @@ public class BankHelper {
     /** Zie {@link #openSdkBankAndWait(int)} met {@value #DEFAULT_BANK_INTERFACE_WAIT_MS} ms. */
     public static boolean openSdkBankAndWait() {
         return openSdkBankAndWait(DEFAULT_BANK_INTERFACE_WAIT_MS);
+    }
+
+    /** Poll tot bank open of timeout (na booth-klik). */
+    public static boolean waitForBankOpen(int timeoutMs) {
+        return waitUntilBankOpenVerified(timeoutMs, "waitForBankOpen");
     }
 
     /**
@@ -387,8 +673,32 @@ public class BankHelper {
      * @return true als walkTo succesvol is gestart, false als geen bank gevonden
      */
     public static boolean walkToNearestFullBank() {
+        return walkToNearestFullBank((String[]) null);
+    }
+
+    /**
+     * Loop naar bank tenzij snapshot bevestigt dat geen van de hoped items in de bank ligt.
+     *
+     * @param hopedWithdrawItems itemnamen die je wilt withdrawen; {@code null}/leeg = altijd lopen
+     * @return {@code false} als geen pad, of snapshot-skip ({@link #wasLastWalkSkippedDueToSnapshot()})
+     */
+    public static boolean walkToNearestFullBank(String... hopedWithdrawItems) {
+        lastWalkSkippedDueToSnapshot = false;
+        if (hopedWithdrawItems != null && hopedWithdrawItems.length > 0) {
+            String rsn = BankSnapshotPlanner.currentDisplayName();
+            if (!BankSnapshotPlanner.shouldWalkToBankForWithdraw(rsn, hopedWithdrawItems)) {
+                lastWalkSkippedDueToSnapshot = true;
+                debug("walkToNearestFullBank: overgeslagen (snapshot leeg voor "
+                        + Arrays.toString(hopedWithdrawItems) + ")");
+                return false;
+            }
+        }
         IPlayer local = Players.getLocal();
         WorldPoint myPos = local != null ? local.getWorldLocation() : null;
+
+        if (redirectKaramjaFullBankToBoat()) {
+            return true;
+        }
 
         // ============================================================
         // LUMBRIDGE SPECIALE CASE — ALTIJD EERST TRAP OP!
@@ -416,60 +726,61 @@ public class BankHelper {
         }
 
         // 1. Bank object in wereld (excl. Cooking/Crafting Guild)
-        ITileObject booth = findNearestFullBankObject();
+        ITileObject booth = resolveFullBankObject(myPos);
         if (booth != null) {
             if (myPos != null && myPos.distanceTo(booth.getWorldLocation()) <= BANK_OPEN_RANGE) {
                 if (tryOpenFullBank()) {
                     return true;
                 }
             }
-            try {
-                if (MovementHelper.walkTo(booth.getWorldLocation())) return true;
-            } catch (Throwable ignored) { }
-            int dBooth = myPos != null ? myPos.distanceTo(booth.getWorldLocation()) : 0;
+            WorldPoint boothTile = booth.getWorldLocation();
+            if (walkTowardBankGoal(boothTile)) {
+                return true;
+            }
+            int dBooth = myPos != null ? myPos.distanceTo(boothTile) : 0;
             if (myPos != null && dBooth > BANK_OPEN_RANGE && dBooth <= BANK_APPROACH_MAX) {
                 int step = Math.min(18, Math.max(6, dBooth - 4));
-                try {
-                    if (MovementHelper.walkTowardTarget(booth.getWorldLocation(), step)) {
-                        debug("walkToNearestFullBank: walkTowardTarget booth step=" + step);
-                        return true;
-                    }
-                } catch (Throwable ignored) { }
+                if (MovementHelper.walkTowardBankSteps(boothTile, step)) {
+                    debug("walkToNearestFullBank: walkTowardBankSteps booth step=" + step);
+                    return true;
+                }
             }
         }
 
         // 2. Banker NPC (excl. Cooking/Crafting Guild)
-        INPC banker = findNearestBankerNpc();
+        INPC banker = resolveBankerNpc(myPos);
         if (banker != null) {
             if (myPos != null && myPos.distanceTo(banker.getWorldLocation()) <= BANK_OPEN_RANGE) {
                 if (tryOpenFullBank()) {
                     return true;
                 }
             }
-            try {
-                if (MovementHelper.walkTo(banker.getWorldLocation())) return true;
-            } catch (Throwable ignored) { }
-            int dBanker = myPos != null ? myPos.distanceTo(banker.getWorldLocation()) : 0;
+            WorldPoint bankerTile = banker.getWorldLocation();
+            if (walkTowardBankGoal(bankerTile)) {
+                return true;
+            }
+            int dBanker = myPos != null ? myPos.distanceTo(bankerTile) : 0;
             if (myPos != null && dBanker > BANK_OPEN_RANGE && dBanker <= BANK_APPROACH_MAX) {
                 int step = Math.min(18, Math.max(6, dBanker - 4));
-                try {
-                    if (MovementHelper.walkTowardTarget(banker.getWorldLocation(), step)) {
-                        debug("walkToNearestFullBank: walkTowardTarget banker step=" + step);
-                        return true;
-                    }
-                } catch (Throwable ignored) { }
+                if (MovementHelper.walkTowardBankSteps(bankerTile, step)) {
+                    debug("walkToNearestFullBank: walkTowardBankSteps banker step=" + step);
+                    return true;
+                }
+            }
+        }
+
+        if (myPos != null && isNearAlKharidBank(myPos)) {
+            WorldPoint approach = pickAlKharidBankApproachTile();
+            if (walkTowardBankGoal(approach)) {
+                debug("walkToNearestFullBank: AK varied approach");
+                return true;
             }
         }
 
         // 3. Fallback: dichtstbijzijnde F2P bank uit vaste lijst (geen Cooking/Crafting Guild)
         WorldPoint f2p = getNearestF2pBankPoint(myPos);
-        if (f2p != null) {
-            try {
-                if (MovementHelper.walkTo(f2p)) return true;
-            } catch (Throwable ignored) { }
-            try {
-                if (MovementHelper.walkToExact(f2p)) return true;
-            } catch (Throwable ignored) { }
+        if (f2p != null && walkTowardBankGoal(f2p)) {
+            return true;
         }
 
         // 4. Laatste fallback: SDK BankLocation — alleen als het géén Cooking/Crafting Guild is
@@ -527,12 +838,20 @@ public class BankHelper {
         if (Bank.isOpen()) {
             return true;
         }
+        if (redirectKaramjaFullBankToBoat()) {
+            return false;
+        }
         NearbyBankStep step = attemptNearbyBankInteract();
         if (step == NearbyBankStep.NONE) {
             return false;
         }
         if (step == NearbyBankStep.WALKING) {
-            return true;
+            if (maxWaitForOpenMs <= 0) {
+                IPlayer local = Players.getLocal();
+                return local != null && local.isMoving();
+            }
+            // Cooldown na klik of aanloop: poll UI i.p.v. true zonder open bank (WC/Imps-loop).
+            return waitUntilBankOpenVerified(maxWaitForOpenMs, "interactIfNearby bank UI (walk/cooldown)");
         }
         if (maxWaitForOpenMs <= 0) {
             return true;
@@ -545,12 +864,59 @@ public class BankHelper {
      * Moet alleen {@code true} teruggeven als er daadwerkelijk een walk is gestart — anders denkt
      * {@link #interactIfNearby()} dat er voortgang is (Imps blijft wachten terwijl {@code moving=false}).
      */
+    /**
+     * Loop naar bankdoel zonder approach-personalisatie (mining AK → bank).
+     */
+    private static boolean walkTowardBankGoal(WorldPoint goal) {
+        if (goal == null) {
+            return false;
+        }
+        IPlayer local = Players.getLocal();
+        WorldPoint myPos = local != null ? local.getWorldLocation() : null;
+        if (myPos == null) {
+            return false;
+        }
+        int dist = myPos.distanceTo(goal);
+        if (dist <= BANK_OPEN_RANGE) {
+            return tryOpenFullBank();
+        }
+        int maxStep = Math.min(18, Math.max(6, dist - 3));
+        if (MovementHelper.walkTowardBankSteps(goal, maxStep)) {
+            return true;
+        }
+        return MovementHelper.walkToExact(goal);
+    }
+
     private static boolean tryWalkTowardVisibleBank(WorldPoint myPos) {
         if (myPos == null) {
             return false;
         }
-        ITileObject booth = findNearestFullBankObject();
-        INPC banker = findNearestBankerNpc();
+        if (isNearGrandExchange(myPos)) {
+            WorldPoint boothGoal = GRAND_EXCHANGE_BANK_BOOTH;
+            ITileObject geBooth = TileObjects.getNearest(obj ->
+                    obj != null
+                            && isFullBankTileObject(obj)
+                            && obj.getWorldLocation() != null
+                            && obj.getWorldLocation().distanceTo(GRAND_EXCHANGE_CENTER) <= GRAND_EXCHANGE_BANK_RADIUS);
+            if (geBooth != null) {
+                boothGoal = geBooth.getWorldLocation();
+            }
+            int dGe = myPos.distanceTo(boothGoal);
+            if (dGe > BANK_OPEN_RANGE && walkTowardBankGoal(boothGoal)) {
+                debug("tryWalkTowardVisibleBank: loop naar GE booth (dist=" + dGe + ")");
+                return true;
+            }
+        }
+        if (isNearAlKharidBank(myPos)) {
+            WorldPoint approach = pickAlKharidBankApproachTile();
+            if (walkTowardBankGoal(approach)) {
+                debug("tryWalkTowardVisibleBank: AK varied approach " + approach.getX() + "," + approach.getY());
+                return true;
+            }
+        }
+
+        ITileObject booth = resolveFullBankObject(myPos);
+        INPC banker = resolveBankerNpc(myPos);
         int dB = booth != null ? myPos.distanceTo(booth.getWorldLocation()) : Integer.MAX_VALUE;
         int dN = banker != null ? myPos.distanceTo(banker.getWorldLocation()) : Integer.MAX_VALUE;
         boolean bWalk = dB > BANK_OPEN_RANGE && dB <= BANK_APPROACH_MAX;
@@ -559,35 +925,34 @@ public class BankHelper {
             return false;
         }
 
-        boolean preferBanker = nWalk && (!bWalk || dN < dB);
+        boolean nearGe = isNearGrandExchange(myPos);
+        boolean preferBanker = nWalk && (!bWalk || dN < dB) && !nearGe;
         WorldPoint primary = preferBanker ? banker.getWorldLocation() : booth.getWorldLocation();
         String which = preferBanker ? "banker" : "booth";
         int dPrimary = preferBanker ? dN : dB;
 
-        if (MovementHelper.walkTo(primary)) {
+        if (walkTowardBankGoal(primary)) {
             debug("tryWalkTowardVisibleBank: loop naar " + which + " (dist=" + dPrimary + ")");
             return true;
         }
-        debug("tryWalkTowardVisibleBank: walkTo " + which + " mislukt (dist=" + dPrimary + ") — fallbacks");
-
-        WorldPoint f2p = getNearestF2pBankPoint(myPos);
-        if (f2p != null && myPos.distanceTo(f2p) > BANK_OPEN_RANGE) {
-            if (MovementHelper.walkTo(f2p)) {
-                debug("tryWalkTowardVisibleBank: fallback walk naar F2P anker "
-                        + f2p.getX() + "," + f2p.getY());
-                return true;
-            }
-            if (MovementHelper.walkToExact(f2p)) {
-                debug("tryWalkTowardVisibleBank: fallback walkToExact F2P anker");
-                return true;
-            }
-        }
+        debug("tryWalkTowardVisibleBank: walkTowardBankGoal " + which + " mislukt (dist=" + dPrimary + ")");
 
         int maxStep = Math.min(18, Math.max(6, dPrimary - 4));
-        if (MovementHelper.walkTowardTarget(primary, maxStep)) {
-            debug("tryWalkTowardVisibleBank: walkTowardTarget maxStep=" + maxStep);
+        if (MovementHelper.walkTowardBankSteps(primary, maxStep)) {
+            debug("tryWalkTowardVisibleBank: walkTowardBankSteps maxStep=" + maxStep);
             return true;
         }
+
+        WorldPoint f2p = getNearestF2pBankPoint(myPos);
+        int dF2p = f2p != null ? myPos.distanceTo(f2p) : Integer.MAX_VALUE;
+        // Booth al dichterbij dan vast anker: niet naar anker schakelen (voelt als achteruit)
+        if (f2p != null && dF2p > BANK_OPEN_RANGE && dPrimary + 4 < dF2p) {
+            if (walkTowardBankGoal(f2p)) {
+                debug("tryWalkTowardVisibleBank: fallback F2P anker " + f2p.getX() + "," + f2p.getY());
+                return true;
+            }
+        }
+
         debug("tryWalkTowardVisibleBank: alle aanloop-pogingen mislukt");
         return false;
     }
@@ -605,8 +970,8 @@ public class BankHelper {
             debug("interactIfNearby: myPos=" + myPos.getX() + "," + myPos.getY() + "," + myPos.getPlane());
         }
 
-        ITileObject booth = findNearestFullBankObject();
-        INPC banker = findNearestBankerNpc();
+        ITileObject booth = resolveFullBankObject(myPos);
+        INPC banker = resolveBankerNpc(myPos);
         int dB = booth != null && myPos != null ? myPos.distanceTo(booth.getWorldLocation()) : Integer.MAX_VALUE;
         int dN = banker != null && myPos != null ? myPos.distanceTo(banker.getWorldLocation()) : Integer.MAX_VALUE;
 
@@ -635,15 +1000,27 @@ public class BankHelper {
         }
 
         if (banker != null && dN <= BANK_OPEN_RANGE) {
-            if (!cooldown) {
+            // GE-clerk "Bankier" opent vaak geen bank; loop/klik echte booth via GE-pad.
+            if (myPos != null && isNearGrandExchange(myPos)
+                    && (booth == null || dB > BANK_OPEN_RANGE)) {
+                debug("interactIfNearby: GE-gebied — GE booth-pad (geen clerk-bankier)");
+                if (Bank.isOpen()) {
+                    return NearbyBankStep.CLICKED;
+                }
+                if (tryOpenBankAtGrandExchange()) {
+                    return NearbyBankStep.CLICKED;
+                }
+                return NearbyBankStep.WALKING;
+            } else if (!cooldown) {
                 HumanBanking.pauseBeforeBankOpenClick();
                 nextBankOpenAttemptAllowedMs = now + 5500 + ThreadLocalRandom.current().nextInt(2501);
                 debug("interactIfNearby: klik banker");
                 banker.interact("Bank");
                 return NearbyBankStep.CLICKED;
+            } else {
+                debug("interactIfNearby: banker in range, cooldown na vorige open-klik — wacht (geen dubbele klik)");
+                return NearbyBankStep.WALKING;
             }
-            debug("interactIfNearby: banker in range, cooldown na vorige open-klik — wacht (geen dubbele klik)");
-            return NearbyBankStep.WALKING;
         }
 
         if (tryWalkTowardVisibleBank(myPos)) {
@@ -676,5 +1053,38 @@ public class BankHelper {
         debug("interactIfNearby: geen bank binnen klik-/aanloopbereik (open=" + BANK_OPEN_RANGE
                 + " aanloop≤" + BANK_APPROACH_MAX + " F2P≤" + F2P_BANK_OPEN_ANCHOR_RANGE + ")");
         return NearbyBankStep.NONE;
+    }
+
+    /**
+     * Loop naar een vaste F2P-banktegel (bv. Draynor of Al Kharid) voor mining-routes;
+     * valt terug op {@link #walkToNearestFullBank()} als lopen faalt.
+     */
+    public static boolean walkToMiningBankAnchor(WorldPoint anchor) {
+        if (anchor == null) {
+            return walkToNearestFullBank();
+        }
+        IPlayer local = Players.getLocal();
+        WorldPoint myPos = local != null ? local.getWorldLocation() : null;
+        WorldPoint walkGoal = isAlKharidBankAnchor(anchor) ? pickAlKharidBankApproachTile() : anchor;
+        if (myPos != null && myPos.distanceTo(walkGoal) <= BANK_OPEN_RANGE) {
+            return tryOpenFullBank();
+        }
+        ITileObject booth = resolveFullBankObject(myPos);
+        if (booth != null && myPos != null) {
+            int dB = myPos.distanceTo(booth.getWorldLocation());
+            if (dB <= BANK_APPROACH_MAX && walkTowardBankGoal(booth.getWorldLocation())) {
+                debug("walkToMiningBankAnchor: zichtbare booth dist=" + dB);
+                return true;
+            }
+        }
+        if (walkTowardBankGoal(walkGoal)) {
+            debug("walkToMiningBankAnchor: naar " + walkGoal.getX() + "," + walkGoal.getY()
+                    + (isAlKharidBankAnchor(anchor) ? " (AK varied)" : ""));
+            return true;
+        }
+        if (MovementHelper.walkTowardBankSteps(walkGoal, 18)) {
+            return true;
+        }
+        return walkToNearestFullBank();
     }
 }

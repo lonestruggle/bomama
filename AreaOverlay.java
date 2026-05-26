@@ -39,6 +39,8 @@ public class AreaOverlay extends Overlay {
     private WorldPoint activeCombatCenter;
     private WorldPoint activeWcCenter;
     private WorldPoint activeMiningCenter;
+    /** Tile van de rots die MiningHandler target (highlight). */
+    private WorldPoint miningTargetRockTile;
     private WorldPoint activeFishingCenter;
     private WorldPoint activeImpsCenter;
     private WorldPoint activeLootCenter;
@@ -120,6 +122,10 @@ public class AreaOverlay extends Overlay {
     }
 
     /** Stel het actieve center in (het center dat de handler momenteel gebruikt). */
+    public void setMiningTargetRockTile(WorldPoint tile) {
+        this.miningTargetRockTile = tile;
+    }
+
     public void setActiveCenterForSkill(CombatBotPlugin.ActiveSkill skill, WorldPoint center) {
         switch (skill) {
             case COMBAT:      activeCombatCenter = center; break;
@@ -299,12 +305,38 @@ public class AreaOverlay extends Overlay {
             renderCenterTile(graphics, starterTrain, true, null);
         }
 
+        // Doelrots mining (actieve tile)
+        if (activeSkill == CombatBotPlugin.ActiveSkill.MINING
+                && config.showMiningRockTarget()
+                && miningTargetRockTile != null) {
+            renderMiningTargetRock(graphics, miningTargetRockTile);
+        }
+
         // Render gemarkeerde tiles (altijd)
         if (tileMarkerManager != null) {
             renderMarkedTiles(graphics);
         }
 
         return null;
+    }
+
+    private void renderMiningTargetRock(Graphics2D graphics, WorldPoint tile) {
+        if (client == null || tile == null) {
+            return;
+        }
+        LocalPoint lp = LocalPoint.fromWorld(client, tile);
+        if (lp == null) {
+            return;
+        }
+        Polygon poly = Perspective.getCanvasTilePoly(client, lp);
+        if (poly == null) {
+            return;
+        }
+        graphics.setColor(new Color(255, 220, 60, 95));
+        graphics.fill(poly);
+        graphics.setColor(new Color(255, 200, 40, 220));
+        graphics.setStroke(new BasicStroke(2f));
+        graphics.draw(poly);
     }
 
     private void renderGiantsHuntArea(Graphics2D graphics) {

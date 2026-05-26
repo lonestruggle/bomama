@@ -121,12 +121,12 @@ public final class ChronicleHelper {
      * widget-interacties die in de Resupply-fase (volgende ronde) worden toegevoegd. Voor nu wordt bij
      * een equipped-only state een log-tip uitgegeven en valt de caller terug op de spell/walk-flow.
      */
-    public static boolean teleportToVarrock(String displayName) {
+    public static boolean teleportToVarrock(CombatBotConfig config, String displayName) {
         if (inInventory()) {
             try {
                 IInventoryItem item = Inventory.getFirst(CHRONICLE);
                 if (item != null && itemHasAction(item, "Teleport")) {
-                    item.interact("Teleport");
+                    InventoryActionHelper.interact(config, item, "Teleport");
                     debug("teleportToVarrock: inv chronicle → Teleport");
                     AccountStateJsonStore.decrementChronicleCharges(displayName);
                     return true;

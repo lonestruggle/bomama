@@ -30,9 +30,12 @@ import java.nio.file.Files;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.lang.ref.WeakReference;
 import java.util.Arrays;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -69,6 +72,8 @@ public class CombatBotPanel extends PluginPanel {
     private final JLabel lblLogs = new JLabel("0");
     private final JLabel lblOres = new JLabel("0");
     private final JLabel lblFish = new JLabel("0");
+    /** Live beginner-clue kit checklist (Debug-tab). */
+    private JTextPane beginnerClueKitPane;
 
     // Colors
     private static final Color GOLD = new Color(255, 215, 0);
@@ -93,7 +98,18 @@ public class CombatBotPanel extends PluginPanel {
     private static final DateTimeFormatter DATE_TIME_FMT = DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm");
     private static final String DEFAULT_COMBAT_CENTERS = "3212:3424:0:18:Varrock guards:1";
     private static final String DEFAULT_WC_CENTERS = "3086:3232:0:14:Draynor willows:1";
-    private static final String DEFAULT_MINING_CENTERS = "3285:3368:0:14:Varrock east mine:1";
+    /** Standaard mining-centers (pipe); namen moeten {@link MiningSiteRules#classify} matchen voor site-regels. */
+    private static final String DEFAULT_MINING_CENTERS =
+            "3285:3368:0:14:Varrock east mine:1|"
+                    + "3226:3146:0:10:lumb zuid:1|"
+                    + "3232:3148:0:10:draynor zuid:1|"
+                    + "3297:3291:0:15:alkarid 2:1|"
+                    + "3295:3310:0:4:alkarid 3:1";
+
+    /** Zelfde als standaard mining-lijst in dit panel; plugin gebruikt dit voor eenmalige merge zonder restore van andere skills. */
+    public static String builtinDefaultMiningCenters() {
+        return DEFAULT_MINING_CENTERS;
+    }
     private static final String DEFAULT_FISHING_CENTERS = "3104:3433:0:14:Barbarian village:1|3090:3230:0:14:Draynor village:1";
     private static final String DEFAULT_IMPS_CENTERS = "2826:3181:0:12:Karamja imps:1";
 
@@ -104,6 +120,18 @@ public class CombatBotPanel extends PluginPanel {
     private JFrame detachedFrame = null;
     private JTabbedPane tabs;
     private JPanel mainContent;
+
+    /** Panels onder 📍 Centers → skill-rijen; verversen bij tab-open (config kan in-game wijzigen). */
+    private static final class CentersSectionRefs {
+        JPanel combat;
+        JPanel wc;
+        JPanel mining;
+        JPanel fishing;
+        JPanel imps;
+    }
+
+    private CentersSectionRefs embeddedCentersRefs;
+    private CentersSectionRefs detachedCentersRefs;
 
     private final Runnable onSwitchNowRequested;
     private final Runnable onNextAccountRequested;
@@ -136,15 +164,30 @@ public class CombatBotPanel extends PluginPanel {
      * terwijl de tabel in het andere nog een oude {@code ArrayList} gebruikt (dan lijkt er "niets" te gebeuren).
      */
     private List<ManagedJagexAccountsStore.ManagedJagexAccountRow> sharedManagedAccountRows;
-    /** Elke geopende Accounts-tab registreert hier zijn {@code refillTable}; na import/persist alles verversen. */
-    private final CopyOnWriteArrayList<WeakReference<Runnable>> accountTableRefillCallbacks = new CopyOnWriteArrayList<>();
+    /**
+     * Elke geopende Accounts-tab registreert een refill-{@link Runnable}. Die runnable moet <b>niet</b> alleen
+     * in een {@link WeakReference} zitten (dan kan GC 'm weggooien terwijl de tabel nog bestaat → geen refresh
+     * na bewerken/opslaan). We houden de runnable sterk vast en koppelen een zwakke ref aan de {@link JTable}
+     * om handles op te ruimen als het venster/tab weg is.
+     */
+    private final CopyOnWriteArrayList<AccountTableRefillHandle> accountTableRefillHandles = new CopyOnWriteArrayList<>();
+
+    private static final class AccountTableRefillHandle {
+        final WeakReference<JTable> tableRef;
+        final Runnable refill;
+
+        AccountTableRefillHandle(JTable table, Runnable refill) {
+            this.tableRef = new WeakReference<>(table);
+            this.refill = refill;
+        }
+    }
     /** Houd toggles met dezelfde config-key live synchroon (o.a. overlays in meerdere tabs). */
     private final Map<String, List<JCheckBox>> mirroredTogglesByConfigKey = new HashMap<>();
     private boolean syncingMirroredToggles = false;
     private static final String[] DEFAULT_DEBUG_SOURCES = {
             "COMBATBOT", "STARTSKILL", "STARTERSKILL", "MELEESTYLE", "COMBAT", "IMPS", "GIANTS",
             "WOODCUTTING", "MINING", "FISHING", "BARBLOOT", "QUEST", "LAMP", "DISCORD",
-            "ACCOUNTS", "RELOG", "MOVEMENTHELPER", "BANKHELPER", "UBM", "GERESTOCK",
+            "ACCOUNTS", "RELOG", "LOGIN", "MOVEMENTHELPER", "BANKHELPER", "UBM", "GERESTOCK",
             "ACCOUNTSTATEJSON", "INVCHECK", "SAFESPOT", "VARROCKTP", "DEBUG", "WIDGET", "STORMIMPORT"
     };
 
@@ -245,9 +288,24 @@ public class CombatBotPanel extends PluginPanel {
         tabs.addTab("⚙ Settings", createSettingsTab());
         tabs.addTab("🎯 Skills", createSkillTabsTab());
         tabs.addTab("📊 Stats", createStatsTab());
-        tabs.addTab("📍 Centers", createCentersTab());
+        tabs.addTab("📍 Centers", createCentersTab(r -> embeddedCentersRefs = r));
         tabs.addTab("🔍 Debug", createDebugTab());
         tabs.setSelectedIndex(0);
+
+        tabs.addChangeListener(e -> {
+            if (!(e.getSource() instanceof JTabbedPane)) {
+                return;
+            }
+            JTabbedPane tp = (JTabbedPane) e.getSource();
+            int i = tp.getSelectedIndex();
+            if (i < 0) {
+                return;
+            }
+            String tabTitle = tp.getTitleAt(i);
+            if (tabTitle != null && tabTitle.contains("Centers")) {
+                refreshCentersTabRowsFromConfig();
+            }
+        });
 
         add(tabs, BorderLayout.CENTER);
 
@@ -280,9 +338,17 @@ public class CombatBotPanel extends PluginPanel {
 
         // ▶ Bot Control
         JPanel control = createSection("▶ Bot Control", true);
-        addToggle(control, "Bot inschakelen", config.botEnabled(), v -> setConfig("botEnabled", v));
+        addToggle(control, "Bot inschakelen", config.botEnabled(), v -> {
+            setConfig("botEnabled", v);
+            if (v) {
+                notifyBotStartRequested();
+            }
+        });
         addToggle(control, "Grote loopstappen 15-20 (globaal)", config.impsForceLargeSteps(), v -> setConfig("impsForceLargeSteps", v));
         addToggle(control, "Reset per-account timers bij stop", config.resetAccountTimersOnStop(), v -> setConfig("resetAccountTimersOnStop", v));
+        addToggle(control, "LoopWatch: herstel bij loop", config.loopWatchRecoveryEnabled(), v -> setConfig("loopWatchRecoveryEnabled", v));
+        addSlider(control, "LoopWatch: herstel na (sec)", config.loopWatchTriggerSec(), 45, 600, v -> setConfig("loopWatchTriggerSec", v));
+        addSlider(control, "LoopWatch: logout na (sec)", config.loopWatchLogoutSec(), 60, 900, v -> setConfig("loopWatchLogoutSec", v));
         addTriggerToggle(control, "🚪 Uitloggen (wacht op combat, loot, client thread)", "panelLogoutTrigger", onPanelLogoutRequested);
         addTextField(control, "Web GUI URL", config.webGuiUrl(), v -> setConfig("webGuiUrl", v));
         panel.add(control);
@@ -396,7 +462,6 @@ public class CombatBotPanel extends PluginPanel {
                 v -> setConfig("combatGeFoodType", v.name()));
         addSlider(bank, "GE food basisprijs (gp)", config.combatGeFoodBasePrice(), 1, 50000, v -> setConfig("combatGeFoodBasePrice", v));
         addToggle(bank, "GE ranged ammo (Combat)", config.combatGeRangedAmmoEnabled(), v -> setConfig("combatGeRangedAmmoEnabled", v));
-        addTextField(bank, "GE ranged ammo itemnaam", config.combatGeRangedAmmoItem(), v -> setConfig("combatGeRangedAmmoItem", v));
         addSlider(bank, "GE ranged ammo basisprijs (gp/stuk)", config.combatGeRangedAmmoBasePrice(), 1, 1000, v -> setConfig("combatGeRangedAmmoBasePrice", v));
         panel.add(bank);
         panel.add(Box.createVerticalStrut(6));
@@ -419,12 +484,14 @@ public class CombatBotPanel extends PluginPanel {
         // ⛏ Mining
         JPanel mining = createSection("⛏ Mining", false);
         addToggle(mining, "Mining inschakelen", config.miningEnabled(), v -> setConfig("miningEnabled", v));
+        addToggle(mining, "Doric's Quest automatisch", config.miningDoricsQuestAuto(), v -> setConfig("miningDoricsQuestAuto", v));
         addToggle(mining, "Specifiek erts", config.miningUseSpecificOre(), v -> setConfig("miningUseSpecificOre", v));
         addTextField(mining, "Erts naam", config.miningOreName(), v -> setConfig("miningOreName", v));
-        addToggle(mining, "Erts droppen", config.miningDropOre(), v -> setConfig("miningDropOre", v));
+        addToggle(mining, "Erts droppen (standaard)", config.miningDropOre(), v -> setConfig("miningDropOre", v));
         addSlider(mining, "Mining delay min (ms)", config.miningInteractDelayMin(), 0, 5000, v -> setConfig("miningInteractDelayMin", v));
         addSlider(mining, "Mining delay max (ms)", config.miningInteractDelayMax(), 0, 10000, v -> setConfig("miningInteractDelayMax", v));
         addOverlayToggle(mining, "Mining overlay", config.showMiningOverlay(), "showMiningOverlay");
+        addOverlayToggle(mining, "Markeer doelrots", config.showMiningRockTarget(), "showMiningRockTarget");
         panel.add(mining);
         panel.add(Box.createVerticalStrut(6));
 
@@ -551,6 +618,8 @@ public class CombatBotPanel extends PluginPanel {
         addSlider(antiban, "Fidget duur max (ms)", config.mouseFidgetDurMaxMs(), 50, 2000,
                 v -> setConfig("mouseFidgetDurMaxMs", v));
         addToggle(antiban, "Tab-wissel (inventory)", config.tabGlanceEnabled(), v -> setConfig("tabGlanceEnabled", v));
+        addToggle(antiban, "Use mouse to inv", config.openInventoryViaMouseClick(),
+                v -> setConfig("openInventoryViaMouseClick", v));
         addToggle(antiban, "Misclicks", config.misClickEnabled(), v -> setConfig("misClickEnabled", v));
         addSlider(antiban, "Misclick kans %", config.misClickPercent(), 1, 30, v -> setConfig("misClickPercent", v));
         addToggle(antiban, "Speler lookup (rechtsklik)", config.playerLookupAntibanEnabled(),
@@ -592,6 +661,12 @@ public class CombatBotPanel extends PluginPanel {
         addSlider(imps, "Idle roam (sec)", config.impsIdleRoamSeconds(), 0, 60, v -> setConfig("impsIdleRoamSeconds", v));
         addToggle(imps, "Val scorpions aan", config.impsAttackScorpions(), v -> setConfig("impsAttackScorpions", v));
         addSlider(imps, "Scorpion zone radius", config.impsScorpionZoneRadius(), 1, 20, v -> setConfig("impsScorpionZoneRadius", v));
+        JCheckBox cbImpsHop = new JCheckBox("Wereld-hop bij andere imp-jager", config.impsCompetitorWorldHop());
+        cbImpsHop.setToolTipText("Bevestigingspopup in-game uitzetten: World Switcher → Configure (tandwiel). "
+                + "Anders klikt de bot automatisch op Switch world.");
+        cbImpsHop.addActionListener(e -> setConfig("impsCompetitorWorldHop", cbImpsHop.isSelected()));
+        cbImpsHop.setAlignmentX(Component.LEFT_ALIGNMENT);
+        imps.add(cbImpsHop);
         addToggle(imps, "🛒 GE verkoop", config.impsGeSellEnabled(), v -> setConfig("impsGeSellEnabled", v));
         addSlider(imps, "GE na X bank trips", config.impsGeSellAfterBanks(), 1, 20, v -> setConfig("impsGeSellAfterBanks", v));
         addSlider(imps, "GE verkoopprijs (gp)", config.impsGeSellPrice(), 1, 10000, v -> setConfig("impsGeSellPrice", v));
@@ -827,15 +902,26 @@ public class CombatBotPanel extends PluginPanel {
         panel.setBorder(new EmptyBorder(8, 8, 8, 8));
         panel.add(createCollapsibleSection("⛏ Mining (basis)", false, true, c -> {
             addToggle(c, "Mining inschakelen", config.miningEnabled(), v -> setConfig("miningEnabled", v));
+            addToggle(c, "Doric's Quest automatisch", config.miningDoricsQuestAuto(), v -> setConfig("miningDoricsQuestAuto", v));
             addToggle(c, "Specifiek erts", config.miningUseSpecificOre(), v -> setConfig("miningUseSpecificOre", v));
             addTextField(c, "Erts naam", config.miningOreName(), v -> setConfig("miningOreName", v));
-            addToggle(c, "Erts droppen", config.miningDropOre(), v -> setConfig("miningDropOre", v));
+            addToggle(c, "Erts droppen (standaard)", config.miningDropOre(), v -> setConfig("miningDropOre", v));
+            JLabel dropHint = new JLabel("<html><div style='color:#a0a0b0;font-size:10px;width:280px'>"
+                    + "Geldt voor onbekende locaties. <b>Al Kharid 2</b> bankt ijzer altijd; "
+                    + "<b>Al Kharid 3</b> dropt ijzer altijd — ook als deze toggle aan staat. "
+                    + "Center-naam moet \"alkarid 2\" of \"alkarid 3\" bevatten (of standaard-coördinaten).</div></html>");
+            dropHint.setFont(FONT_LABEL);
+            dropHint.setForeground(TEXT_DIM);
+            dropHint.setAlignmentX(Component.LEFT_ALIGNMENT);
+            dropHint.setBorder(new EmptyBorder(0, 18, 4, 4));
+            c.add(dropHint);
         }));
         panel.add(Box.createVerticalStrut(6));
         panel.add(createCollapsibleSection("⏱ Mining delays & overlay", false, false, c -> {
             addSlider(c, "Mining delay min (ms)", config.miningInteractDelayMin(), 0, 5000, v -> setConfig("miningInteractDelayMin", v));
             addSlider(c, "Mining delay max (ms)", config.miningInteractDelayMax(), 0, 10000, v -> setConfig("miningInteractDelayMax", v));
             addOverlayToggle(c, "Mining overlay", config.showMiningOverlay(), "showMiningOverlay");
+            addOverlayToggle(c, "Markeer doelrots", config.showMiningRockTarget(), "showMiningRockTarget");
         }));
         panel.add(Box.createVerticalGlue());
         return wrapScroll(panel);
@@ -1080,7 +1166,7 @@ public class CombatBotPanel extends PluginPanel {
 
     // ===================== CENTERS TAB =====================
 
-    private JScrollPane createCentersTab() {
+    private JScrollPane createCentersTab(java.util.function.Consumer<CentersSectionRefs> refSink) {
         JPanel panel = new JPanel();
         panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
         panel.setBackground(BG_DARK);
@@ -1111,7 +1197,7 @@ public class CombatBotPanel extends PluginPanel {
             setConfig("impsCenters", DEFAULT_IMPS_CENTERS);
             JOptionPane.showMessageDialog(
                     CombatBotPanel.this,
-                    "Default centers zijn teruggezet.\nOpen de Centers-tab opnieuw om direct de nieuwe lijst te zien.",
+                    "Default centers zijn teruggezet.\nSchakel naar de tab 📍 Centers om de lijst te zien (of open die tab opnieuw).",
                     "Centers hersteld",
                     JOptionPane.INFORMATION_MESSAGE
             );
@@ -1120,21 +1206,31 @@ public class CombatBotPanel extends PluginPanel {
         panel.add(defaultCentersRow);
         panel.add(Box.createVerticalStrut(6));
 
-        addCentersSection(panel, "⚔ Combat", config.combatCenters(), "combatCenters");
+        JPanel combatSec = addCentersSection(panel, "⚔ Combat", config.combatCenters(), "combatCenters");
         panel.add(Box.createVerticalStrut(6));
-        addCentersSection(panel, "🪓 Woodcutting", config.wcCenters(), "wcCenters");
+        JPanel wcSec = addCentersSection(panel, "🪓 Woodcutting", config.wcCenters(), "wcCenters");
         panel.add(Box.createVerticalStrut(6));
-        addCentersSection(panel, "⛏ Mining", config.miningCenters(), "miningCenters");
+        JPanel mineSec = addCentersSection(panel, "⛏ Mining", config.miningCenters(), "miningCenters");
         panel.add(Box.createVerticalStrut(6));
-        addCentersSection(panel, "🐟 Fishing", config.fishingCenters(), "fishingCenters");
+        JPanel fishSec = addCentersSection(panel, "🐟 Fishing", config.fishingCenters(), "fishingCenters");
         panel.add(Box.createVerticalStrut(6));
-        addImpsCentersBlock(panel);
+        JPanel impsSec = addImpsCentersBlock(panel);
         panel.add(Box.createVerticalStrut(6));
         addGiantsSection(panel);
         panel.add(Box.createVerticalStrut(6));
         addBarbarianSection(panel);
 
         panel.add(Box.createVerticalGlue());
+
+        if (refSink != null) {
+            CentersSectionRefs r = new CentersSectionRefs();
+            r.combat = combatSec;
+            r.wc = wcSec;
+            r.mining = mineSec;
+            r.fishing = fishSec;
+            r.imps = impsSec;
+            refSink.accept(r);
+        }
 
         JScrollPane scroll = new JScrollPane(panel);
         scroll.setBackground(BG_DARK);
@@ -1144,8 +1240,8 @@ public class CombatBotPanel extends PluginPanel {
         return scroll;
     }
 
-    /** Imps: rotatie-toggle + lijst hunting centers (zelfde als andere skills). */
-    private void addImpsCentersBlock(JPanel parent) {
+    /** Imps: rotatie-toggle + lijst hunting centers (zelfde als andere skills). @return panel met Imps center-rijen */
+    private JPanel addImpsCentersBlock(JPanel parent) {
         JPanel head = createSection("🎯 Imps (Karamja)", false);
         addToggle(head, "Imps als skill kiezen (in rotatie / start skill)", config.impsMode(), v -> setConfig("impsMode", v));
         JLabel info = new JLabel("<html><i>Rechtermuisklik in-game → Imps center. ≥1 actief: jachtzone = center+radius. Anders: Hunting X/Y in Settings.</i></html>");
@@ -1156,7 +1252,8 @@ public class CombatBotPanel extends PluginPanel {
         head.add(info);
         parent.add(head);
         parent.add(Box.createVerticalStrut(4));
-        addCentersSection(parent, "Imps hunting centers", config.impsCenters(), "impsCenters");
+        JPanel impsRows = addCentersSection(parent, "Imps hunting centers", config.impsCenters(), "impsCenters");
+        return impsRows;
     }
 
     /** Sectie voor Giants mode: geen centers (vaste locatie Edgeville Dungeon), wel toggle. */
@@ -1196,10 +1293,19 @@ public class CombatBotPanel extends PluginPanel {
         }
     }
 
-    private void addCentersSection(JPanel parent, String title, String centersData, String configKey) {
+    /** Bij mining altijd ontdubbelen vóór opslaan (zelfde regels als {@link CenterManager#dedupeMiningCentersBlob}). */
+    private static String serializeCentersForPersistence(String configKey, List<CenterManager.Center> updated) {
+        if ("miningCenters".equals(configKey)) {
+            return CenterManager.serializeMiningCentersDeduped(updated);
+        }
+        return CenterManager.serialize(updated);
+    }
+
+    private JPanel addCentersSection(JPanel parent, String title, String centersData, String configKey) {
         JPanel section = createSection(title, false);
         populateCentersSectionRows(section, centersData, configKey);
         parent.add(section);
+        return section;
     }
 
     /**
@@ -1270,7 +1376,7 @@ public class CombatBotPanel extends PluginPanel {
                     List<CenterManager.Center> updated = CenterManager.parse(current);
                     if (idx < updated.size()) {
                         updated.get(idx).name = newName.trim();
-                        String serialized = CenterManager.serialize(updated);
+                        String serialized = serializeCentersForPersistence(configKey, updated);
                         configManager.setConfiguration("combatbot", configKey, serialized);
                         String dispName = newName.trim().isEmpty()
                                 ? "(" + updated.get(idx).point.getX() + "," + updated.get(idx).point.getY() + ")"
@@ -1293,7 +1399,7 @@ public class CombatBotPanel extends PluginPanel {
                 List<CenterManager.Center> updated = CenterManager.parse(current);
                 if (idx < updated.size()) {
                     updated.remove(idx);
-                    String serialized = CenterManager.serialize(updated);
+                    String serialized = serializeCentersForPersistence(configKey, updated);
                     configManager.setConfiguration("combatbot", configKey, serialized);
                     SwingUtilities.invokeLater(() -> {
                         populateCentersSectionRows(section, serialized, configKey);
@@ -1310,7 +1416,7 @@ public class CombatBotPanel extends PluginPanel {
                 if (idx < updated.size()) {
                     updated.get(idx).active = cb.isSelected();
                     configManager.setConfiguration("combatbot", configKey,
-                            CenterManager.serialize(updated));
+                            serializeCentersForPersistence(configKey, updated));
                 }
             });
 
@@ -1323,6 +1429,47 @@ public class CombatBotPanel extends PluginPanel {
             row.add(nameLbl, BorderLayout.CENTER);
             row.add(btnPanel, BorderLayout.EAST);
             section.add(row);
+        }
+    }
+
+    /** Herlaadt skill-secties vanuit actuele config (in-game centers, account-wissel zonder tab te sluiten). */
+    private void refreshCentersTabRowsFromConfig() {
+        refreshCentersSections(embeddedCentersRefs);
+        refreshCentersSections(detachedCentersRefs);
+    }
+
+    private void refreshCentersSections(CentersSectionRefs r) {
+        if (r == null) {
+            return;
+        }
+        try {
+            if (r.combat != null && r.combat.isDisplayable()) {
+                populateCentersSectionRows(r.combat, config.combatCenters(), "combatCenters");
+                r.combat.revalidate();
+                r.combat.repaint();
+            }
+            if (r.wc != null && r.wc.isDisplayable()) {
+                populateCentersSectionRows(r.wc, config.wcCenters(), "wcCenters");
+                r.wc.revalidate();
+                r.wc.repaint();
+            }
+            if (r.mining != null && r.mining.isDisplayable()) {
+                populateCentersSectionRows(r.mining, config.miningCenters(), "miningCenters");
+                r.mining.revalidate();
+                r.mining.repaint();
+            }
+            if (r.fishing != null && r.fishing.isDisplayable()) {
+                populateCentersSectionRows(r.fishing, config.fishingCenters(), "fishingCenters");
+                r.fishing.revalidate();
+                r.fishing.repaint();
+            }
+            if (r.imps != null && r.imps.isDisplayable()) {
+                populateCentersSectionRows(r.imps, config.impsCenters(), "impsCenters");
+                r.imps.revalidate();
+                r.imps.repaint();
+            }
+        } catch (Throwable ignored) {
+            // verdwenen panel (detach gesloten) of config race
         }
     }
 
@@ -2059,6 +2206,7 @@ public class CombatBotPanel extends PluginPanel {
 
         btnStart.addActionListener(e -> {
             setConfig("botEnabled", true);
+            notifyBotStartRequested();
             refresh.run();
         });
         btnPause.addActionListener(e -> {
@@ -2207,24 +2355,46 @@ public class CombatBotPanel extends PluginPanel {
         return sharedManagedAccountRows;
     }
 
-    private void registerAccountTableRefill(Runnable refillTable) {
-        accountTableRefillCallbacks.removeIf(wr -> wr.get() == null);
-        accountTableRefillCallbacks.add(new WeakReference<>(refillTable));
+    private void registerAccountTableRefill(JTable table, Runnable refillTable) {
+        if (table == null || refillTable == null) {
+            return;
+        }
+        pruneDeadAccountTableRefillHandles();
+        accountTableRefillHandles.add(new AccountTableRefillHandle(table, refillTable));
+    }
+
+    private void pruneDeadAccountTableRefillHandles() {
+        accountTableRefillHandles.removeIf(h -> h.tableRef.get() == null);
     }
 
     /** Alle open Accounts-tabellen (zijpaneel + los venster) opnieuw vullen vanuit de gedeelde accountlijst. */
     private void refreshAllAccountTables() {
-        accountTableRefillCallbacks.removeIf(wr -> wr.get() == null);
-        for (WeakReference<Runnable> wr : accountTableRefillCallbacks) {
-            Runnable r = wr.get();
-            if (r != null) {
+        pruneDeadAccountTableRefillHandles();
+        for (AccountTableRefillHandle h : accountTableRefillHandles) {
+            JTable t = h.tableRef.get();
+            if (t != null) {
                 try {
-                    r.run();
-                } catch (Throwable t) {
-                    DebugLog.log("StormImport", "Account-tabel verversen: " + t.getMessage());
+                    h.refill.run();
+                } catch (Throwable ex) {
+                    DebugLog.log("ACCOUNTS", "Account-tabel verversen: " + ex.getMessage());
                 }
             }
         }
+    }
+
+    /** Herken OK uit handmatige {@link JOptionPane#createDialog} (Integer/Long/String afhankelijk van LAF). */
+    private static boolean isJOptionPaneOkValue(Object selVal) {
+        if (selVal instanceof Integer) {
+            return ((Integer) selVal).intValue() == JOptionPane.OK_OPTION;
+        }
+        if (selVal instanceof Long) {
+            return ((Long) selVal).longValue() == JOptionPane.OK_OPTION;
+        }
+        if (selVal instanceof String) {
+            String s = ((String) selVal).trim();
+            return "OK".equalsIgnoreCase(s);
+        }
+        return false;
     }
 
     private JPanel createAccountsManagerTab() {
@@ -2369,8 +2539,6 @@ public class CombatBotPanel extends PluginPanel {
                 }
             }
         };
-
-        registerAccountTableRefill(refillTable);
 
         final Timer[] accountPersistDebounce = new Timer[1];
         Runnable runPersistManagedAccounts = () -> {
@@ -2619,6 +2787,7 @@ public class CombatBotPanel extends PluginPanel {
             }
         });
 
+        registerAccountTableRefill(table, refillTable);
         refreshAllAccountTables();
         JScrollPane scroll = new JScrollPane(table);
         scroll.setBorder(null);
@@ -2730,63 +2899,81 @@ public class CombatBotPanel extends PluginPanel {
             JFileChooser fc = new JFileChooser();
             fc.setDialogTitle("Storm accounts JSON (storm-accounts.json)");
             fc.setFileFilter(new FileNameExtensionFilter("JSON (*.json)", "json"));
-            if (fc.showOpenDialog(w) != JFileChooser.APPROVE_OPTION) {
+            int rc = fc.showOpenDialog(w);
+            if (rc != JFileChooser.APPROVE_OPTION) {
+                lblStormImportStatus.setText("<html><body width='440'><font color='#bbbbbb'>Import geannuleerd.</font></body></html>");
+                DebugLog.log("StormImport", "geannuleerd door gebruiker");
                 return;
             }
             File f = fc.getSelectedFile();
             if (f == null || !f.isFile()) {
+                String msg = "Geen geldig bestand gekozen: " + (f == null ? "(null)" : f.getAbsolutePath());
+                lblStormImportStatus.setText("<html><body width='440'><font color='#ff8888'>" + escapeForHtmlLabel(msg) + "</font></body></html>");
+                JOptionPane.showMessageDialog(resolveSwingOwner(root), msg, "Storm JSON import", JOptionPane.ERROR_MESSAGE);
+                DebugLog.log("StormImport", msg);
                 return;
             }
+
+            String json;
             try {
-                String json = Files.readString(f.toPath(), StandardCharsets.UTF_8);
-                StormAccountsBulkImport.Result res = StormAccountsBulkImport.importInto(accountRows, json);
-
-                Runnable showDlg = () -> {
-                    try {
-                        Window owner = resolveSwingOwner(root);
-                        if (res.fatalError != null) {
-                            JOptionPane.showMessageDialog(owner,
-                                    res.fatalError,
-                                    "Storm JSON import",
-                                    JOptionPane.ERROR_MESSAGE);
-                        } else {
-                            JOptionPane.showMessageDialog(owner,
-                                    res.summary() + "\n\nBestand:\n" + f.getAbsolutePath(),
-                                    "Storm JSON import",
-                                    JOptionPane.INFORMATION_MESSAGE);
-                        }
-                    } catch (Throwable t) {
-                        DebugLog.log("StormImport", "Dialoog mislukt: " + t.getMessage());
-                    }
-                };
-
-                if (res.fatalError != null) {
-                    String t = res.fatalError + "\n\n" + f.getAbsolutePath();
-                    lblStormImportStatus.setText("<html><body width='440'><font color='#ff8888'>"
-                            + escapeForHtmlLabel(t) + "</font></body></html>");
-                    refreshAllAccountTables();
-                    DebugLog.log("StormImport", "fatal: " + res.fatalError);
-                    SwingUtilities.invokeLater(showDlg);
-                    return;
-                }
-
-                refreshAllAccountTables();
-                if (res.added > 0) {
-                    schedulePersistManagedAccounts.run();
-                }
-                String summaryLine = res.summary() + "\n\n" + f.getAbsolutePath();
-                lblStormImportStatus.setText("<html><body width='440'>" + escapeForHtmlLabel(summaryLine) + "</body></html>");
-                DebugLog.log("StormImport", res.summary().replace('\n', ' '));
-                SwingUtilities.invokeLater(showDlg);
-            } catch (Exception ex) {
-                lblStormImportStatus.setText("<html><body width='440'><font color='#ff8888'>"
-                        + escapeForHtmlLabel("Fout: " + ex.getMessage()) + "</font></body></html>");
-                DebugLog.log("StormImport", "exception: " + ex.getMessage());
-                SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(resolveSwingOwner(root),
-                        "Kon niet importeren: " + ex.getMessage(),
-                        "Import mislukt",
-                        JOptionPane.ERROR_MESSAGE));
+                json = new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8);
+            } catch (Exception readEx) {
+                String msg = "Kon bestand niet lezen: " + readEx.getMessage() + "\n" + f.getAbsolutePath();
+                lblStormImportStatus.setText("<html><body width='440'><font color='#ff8888'>" + escapeForHtmlLabel(msg) + "</font></body></html>");
+                JOptionPane.showMessageDialog(resolveSwingOwner(root), msg, "Storm JSON import", JOptionPane.ERROR_MESSAGE);
+                DebugLog.log("StormImport", "read-fail: " + readEx.getMessage());
+                return;
             }
+
+            int rowsBefore = accountRows.size();
+            StormAccountsBulkImport.Result res;
+            try {
+                res = StormAccountsBulkImport.importInto(accountRows, json);
+            } catch (Throwable importEx) {
+                String msg = "Import-exception: " + importEx.getClass().getSimpleName() + ": " + importEx.getMessage();
+                lblStormImportStatus.setText("<html><body width='440'><font color='#ff8888'>" + escapeForHtmlLabel(msg) + "</font></body></html>");
+                JOptionPane.showMessageDialog(resolveSwingOwner(root), msg, "Storm JSON import", JOptionPane.ERROR_MESSAGE);
+                DebugLog.log("StormImport", msg);
+                return;
+            }
+            int rowsAfter = accountRows.size();
+
+            // Schrijf diagnose-bestand naast ~/.runelite/ zodat de gebruiker exact ziet wat er gebeurde.
+            try {
+                java.nio.file.Path diag = java.nio.file.Paths.get(System.getProperty("user.home"),
+                        ".runelite", "combatbot-storm-import.log");
+                java.nio.file.Files.createDirectories(diag.getParent());
+                String line = "[" + java.time.Instant.now() + "] file=" + f.getAbsolutePath()
+                        + " bytes=" + json.length()
+                        + " rowsBefore=" + rowsBefore + " rowsAfter=" + rowsAfter
+                        + " result=" + res.summary()
+                        + (res.fatalError != null ? " fatal=" + res.fatalError : "")
+                        + System.lineSeparator();
+                java.nio.file.Files.write(diag, line.getBytes(StandardCharsets.UTF_8),
+                        java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+            } catch (Throwable ignore) { }
+
+            refreshAllAccountTables();
+            if (res.added > 0) {
+                schedulePersistManagedAccounts.run();
+            }
+
+            String summaryLine = (res.fatalError != null ? res.fatalError : res.summary())
+                    + "\n\nRijen voor: " + rowsBefore + " → na: " + rowsAfter
+                    + "\nBestand: " + f.getAbsolutePath()
+                    + "\nDiagnose-log: ~/.runelite/combatbot-storm-import.log";
+            lblStormImportStatus.setText("<html><body width='440'>"
+                    + (res.fatalError != null ? "<font color='#ff8888'>" : "")
+                    + escapeForHtmlLabel(summaryLine)
+                    + (res.fatalError != null ? "</font>" : "")
+                    + "</body></html>");
+            DebugLog.log("StormImport", summaryLine.replace('\n', ' '));
+
+            // Toon ALTIJD een modale popup zodat de gebruiker de uitkomst ziet.
+            JOptionPane.showMessageDialog(resolveSwingOwner(root),
+                    summaryLine,
+                    "Storm JSON import",
+                    res.fatalError != null ? JOptionPane.ERROR_MESSAGE : JOptionPane.INFORMATION_MESSAGE);
         });
 
         editBtn.addActionListener(e -> runEditSelectedAccount.run());
@@ -3139,6 +3326,8 @@ public class CombatBotPanel extends PluginPanel {
         String skillsHelpHtml = "<p>Alleen zichtbaar als <b>Centers: alleen globale lijsten</b> <b>uit</b> staat.</p>"
                 + "<p><b>Gebruik globale lijst</b> per skill: aan = alle locaties van de tab Centers; uit = vink hieronder "
                 + "welke locaties dit account gebruikt (minstens één = skill aan).</p>"
+                + "<p><b>Drop / FM / Cook</b> per locatie: overschrijft de globale skill-vinken voor dit account op die tile. "
+                + "Leeg gelaten = zelfde als de hoofdtab (WC / Mining / Fishing).</p>"
                 + "<p><b>Imps (Karamja)</b>: de globale lijst is <i>exact</i> wat je op de tab <b>Centers</b> onder "
                 + "<b>🎯 Imps (Karamja)</b> → <b>Imps hunting centers</b> hebt staan (zelfde data als in de plugin-instellingen).</p>"
                 + "<p><b>Imps combat</b> en <b>Giants combat</b>: zelfde idee als op de skill-tabs (Globaal of vast MELEE/RANGED/MAGE).</p>"
@@ -3240,6 +3429,37 @@ public class CombatBotPanel extends PluginPanel {
         cg.weightx = 1.0;
         cg.fill = GridBagConstraints.HORIZONTAL;
         comboGrid.add(giantsCombatCombo, cg);
+
+        String[] rangedAmmoUiChoices = new String[ManagedJagexAccountsStore.RANGED_AMMO_TYPE_CHOICES.length + 1];
+        System.arraycopy(ManagedJagexAccountsStore.RANGED_AMMO_TYPE_CHOICES, 0, rangedAmmoUiChoices, 0,
+                ManagedJagexAccountsStore.RANGED_AMMO_TYPE_CHOICES.length);
+        rangedAmmoUiChoices[rangedAmmoUiChoices.length - 1] = ManagedJagexAccountsStore.RANGED_AMMO_BEST_LABEL;
+        JComboBox<String> rangedAmmoCombo = new JComboBox<>(rangedAmmoUiChoices);
+        rangedAmmoCombo.setToolTipText(
+                "Pijl-type voor RANGED: geldt voor Combat, Imps, Giants, … op dit account. "
+                        + "Vast type negeert betere pijlen in bank; Beste = Rune → Bronze.");
+        String ammoUiSel = ManagedJagexAccountsStore.rangedAmmoUiLabel(r.rangedAmmoType);
+        for (int i = 0; i < rangedAmmoCombo.getItemCount(); i++) {
+            if (ammoUiSel.equalsIgnoreCase(rangedAmmoCombo.getItemAt(i))) {
+                rangedAmmoCombo.setSelectedIndex(i);
+                break;
+            }
+        }
+        rangedAmmoCombo.setPreferredSize(comboPref);
+        cg.gridx = 0;
+        cg.gridy = 2;
+        cg.weightx = 0;
+        cg.fill = GridBagConstraints.NONE;
+        JLabel lAmmo = new JLabel("Ranged pijl-type (per account)");
+        lAmmo.setFont(FONT_LABEL);
+        lAmmo.setForeground(TEXT);
+        lAmmo.setPreferredSize(new Dimension(200, 26));
+        comboGrid.add(lAmmo, cg);
+        cg.gridx = 1;
+        cg.weightx = 1.0;
+        cg.fill = GridBagConstraints.HORIZONTAL;
+        comboGrid.add(rangedAmmoCombo, cg);
+
         perAccountSkillBlock.add(comboGrid);
 
         perAccountSkillBlock.add(Box.createVerticalStrut(6));
@@ -3251,29 +3471,45 @@ public class CombatBotPanel extends PluginPanel {
 
         AccountCenterUiState stCombat = accountCenterStateFromRow(config.combatCenters(), r.combatCenters, r.useGlobalCombatCenters);
         AccountCenterUiState stWc = accountCenterStateFromRow(config.wcCenters(), r.wcCenters, r.useGlobalWcCenters);
+        stWc.behaviorsBlob = r.wcCenterBehaviorsBlob != null ? r.wcCenterBehaviorsBlob : "";
         AccountCenterUiState stMine = accountCenterStateFromRow(config.miningCenters(), r.miningCenters, r.useGlobalMiningCenters);
+        stMine.behaviorsBlob = r.miningCenterBehaviorsBlob != null ? r.miningCenterBehaviorsBlob : "";
         AccountCenterUiState stFish = accountCenterStateFromRow(config.fishingCenters(), r.fishingCenters, r.useGlobalFishingCenters);
+        stFish.behaviorsBlob = r.fishingCenterBehaviorsBlob != null ? r.fishingCenterBehaviorsBlob : "";
         AccountCenterUiState stImps = accountCenterStateFromRow(
                 impsMasterCentersForAccountEditor(config.impsCenters(), r.impsCenters),
                 r.impsCenters,
                 r.useGlobalImpsCenters);
 
-        AccountSkillBlock blkCombat = buildAccountSkillCenterBlock("Combat", stCombat);
+        AccountSkillBlock blkCombat = buildAccountSkillCenterBlock("Combat", stCombat, null);
         perAccountSkillBlock.add(blkCombat.root);
         perAccountSkillBlock.add(Box.createVerticalStrut(4));
-        AccountSkillBlock blkWc = buildAccountSkillCenterBlock("Woodcutting", stWc);
+        AccountSkillBlock blkWc = buildAccountSkillCenterBlock("Woodcutting", stWc,
+                AccountCenterBehaviorStore.SkillKind.WOODCUTTING);
         perAccountSkillBlock.add(blkWc.root);
         perAccountSkillBlock.add(Box.createVerticalStrut(4));
-        AccountSkillBlock blkMine = buildAccountSkillCenterBlock("Mining", stMine);
+        AccountSkillBlock blkMine = buildAccountSkillCenterBlock("Mining", stMine,
+                AccountCenterBehaviorStore.SkillKind.MINING);
         perAccountSkillBlock.add(blkMine.root);
         perAccountSkillBlock.add(Box.createVerticalStrut(4));
-        AccountSkillBlock blkFish = buildAccountSkillCenterBlock("Fishing", stFish);
+        AccountSkillBlock blkFish = buildAccountSkillCenterBlock("Fishing", stFish,
+                AccountCenterBehaviorStore.SkillKind.FISHING);
         perAccountSkillBlock.add(blkFish.root);
         perAccountSkillBlock.add(Box.createVerticalStrut(4));
         cbImpsModeForceOn.setAlignmentX(Component.LEFT_ALIGNMENT);
         cbImpsModeForceOn.setBorder(new EmptyBorder(2, 2, 4, 2));
         perAccountSkillBlock.add(cbImpsModeForceOn);
-        AccountSkillBlock blkImps = buildAccountSkillCenterBlock("Imps (Karamja)", stImps);
+        JCheckBox cbImpsCompetitorHop = new JCheckBox("Imps: wereld-hop bij andere imp-jager");
+        cbImpsCompetitorHop.setFont(FONT_LABEL);
+        cbImpsCompetitorHop.setBackground(BG_SECTION);
+        cbImpsCompetitorHop.setForeground(TEXT);
+        cbImpsCompetitorHop.setSelected(r.impsCompetitorWorldHopEnabled);
+        cbImpsCompetitorHop.setToolTipText(
+                "Alleen op Karamja. Vereist ook de globale vink \"Wereld-hop bij andere imp-jager\" in Imps Mode.");
+        cbImpsCompetitorHop.setAlignmentX(Component.LEFT_ALIGNMENT);
+        cbImpsCompetitorHop.setBorder(new EmptyBorder(0, 2, 4, 2));
+        perAccountSkillBlock.add(cbImpsCompetitorHop);
+        AccountSkillBlock blkImps = buildAccountSkillCenterBlock("Imps (Karamja)", stImps, null);
         perAccountSkillBlock.add(blkImps.root);
 
         centers.add(perAccountSkillBlock);
@@ -3286,7 +3522,7 @@ public class CombatBotPanel extends PluginPanel {
         cbGiantsInRotation.setFont(FONT_LABEL);
         cbGiantsInRotation.setBackground(BG_DARK);
         cbGiantsInRotation.setForeground(TEXT);
-        cbGiantsInRotation.setToolTipText("Uit = dit account doet nooit Giants. Aan = volgens Giants-tab (of vast 'aan' als je dat eerder zo had).");
+        cbGiantsInRotation.setToolTipText("Uit = Giants nooit in rotatie voor dit account. Aan = Giants wisselt mee (onafhankelijk van de globale Giants-tab).");
         {
             String gOv = prevGiantsOvSnapshot;
             boolean giantsOff = "0".equals(gOv) || "false".equalsIgnoreCase(gOv) || "off".equalsIgnoreCase(gOv);
@@ -3396,8 +3632,7 @@ public class CombatBotPanel extends PluginPanel {
         editDialog.setVisible(true);
         editDialog.dispose();
         Object selVal = optionPane.getValue();
-        int ok = (selVal instanceof Integer) ? ((Integer) selVal).intValue() : JOptionPane.CLOSED_OPTION;
-        if (ok != JOptionPane.OK_OPTION) {
+        if (selVal == null || selVal == JOptionPane.UNINITIALIZED_VALUE || !isJOptionPaneOkValue(selVal)) {
             return false;
         }
         r.displayName = fName.getText().trim();
@@ -3436,6 +3671,9 @@ public class CombatBotPanel extends PluginPanel {
         } else {
             r.giantsCombatStyleOverride = Objects.requireNonNull(giantsCombatCombo.getSelectedItem()).toString();
         }
+        Object ammoSel = rangedAmmoCombo.getSelectedItem();
+        r.rangedAmmoType = ManagedJagexAccountsStore.rangedAmmoFromUiLabel(
+                ammoSel != null ? ammoSel.toString() : "");
         if (!cbGiantsInRotation.isSelected()) {
             r.giantsModeOverride = "0";
         } else if ("1".equals(prevGiantsOvSnapshot) || "true".equalsIgnoreCase(prevGiantsOvSnapshot)
@@ -3447,20 +3685,24 @@ public class CombatBotPanel extends PluginPanel {
         // Aan/uit checkbox semantiek: aangevinkt = forceer Imps Mode aan voor dit account ("1");
         // uitgevinkt = geen override ("") zodat het Imps-centers blok / globale instellingen weer leiden.
         r.impsModeOverride = cbImpsModeForceOn.isSelected() ? "1" : "";
+        r.impsCompetitorWorldHopEnabled = cbImpsCompetitorHop.isSelected();
         if (r.useGlobalCenterListsOnly) {
             r.rotationUseCustomProfile = false;
         } else {
             r.rotationUseCustomProfile = true;
         }
-        blkCombat.syncUiToState();
-        blkWc.syncUiToState();
-        blkMine.syncUiToState();
-        blkFish.syncUiToState();
-        blkImps.syncUiToState();
+        blkCombat.syncUiToState(config);
+        blkWc.syncUiToState(config);
+        blkMine.syncUiToState(config);
+        blkFish.syncUiToState(config);
+        blkImps.syncUiToState(config);
         applyAccountCenterUiState(stCombat, r, (row, s) -> row.combatCenters = s, (row, u) -> row.useGlobalCombatCenters = u);
         applyAccountCenterUiState(stWc, r, (row, s) -> row.wcCenters = s, (row, u) -> row.useGlobalWcCenters = u);
+        r.wcCenterBehaviorsBlob = stWc.behaviorsBlob != null ? stWc.behaviorsBlob : "";
         applyAccountCenterUiState(stMine, r, (row, s) -> row.miningCenters = s, (row, u) -> row.useGlobalMiningCenters = u);
+        r.miningCenterBehaviorsBlob = stMine.behaviorsBlob != null ? stMine.behaviorsBlob : "";
         applyAccountCenterUiState(stFish, r, (row, s) -> row.fishingCenters = s, (row, u) -> row.useGlobalFishingCenters = u);
+        r.fishingCenterBehaviorsBlob = stFish.behaviorsBlob != null ? stFish.behaviorsBlob : "";
         applyAccountCenterUiState(stImps, r, (row, s) -> row.impsCenters = s, (row, u) -> row.useGlobalImpsCenters = u);
         if (r.rotationUseCustomProfile) {
             r.rotationPickCombat = r.useGlobalCombatCenters;
@@ -3520,10 +3762,17 @@ public class CombatBotPanel extends PluginPanel {
         }
         int trackedItems = AccountStateJsonStore.knownBankQtyMap(e).size();
         long totalCoins = AccountStateJsonStore.knownCoinsApprox(e);
+        String rsn = e.displayName != null ? e.displayName : "";
+        int equipped = EquipmentSnapshotPlanner.equippedSlotCount(rsn);
+        if (equipped <= 0) {
+            equipped = AccountStateJsonStore.knownEquippedQtyMap(e).size();
+        }
+        String wornBrief = EquipmentSnapshotPlanner.formatEquippedSlotsBrief(rsn);
         return "bank=" + Math.max(0L, e.knownBankCoins)
                 + " gp, inv=" + Math.max(0L, e.knownInventoryCoins)
                 + " gp, items=" + trackedItems
-                + ", totaal≈" + totalCoins + " gp";
+                + ", totaal≈" + totalCoins + " gp"
+                + " | worn=" + equipped + " (" + wornBrief + ")";
     }
 
     /** Tijdelijke UI-state voor subset per skill in account-dialoog. */
@@ -3534,6 +3783,8 @@ public class CombatBotPanel extends PluginPanel {
         boolean mainOn;
         /** Checkbox: volledige globale lijst i.p.v. eigen locaties. */
         boolean useGlobalFullList;
+        /** Per-tile drop/bank (+ FM/cook) overrides — {@link AccountCenterBehaviorStore}. */
+        String behaviorsBlob = "";
     }
 
     private static AccountCenterUiState accountCenterStateFromRow(String master, String centersBlob,
@@ -3584,19 +3835,36 @@ public class CombatBotPanel extends PluginPanel {
         return DEFAULT_IMPS_CENTERS;
     }
 
+    private static final class AccountLocationRowUi {
+        final CenterManager.Center center;
+        final JCheckBox locCb;
+        final JCheckBox dropCb;
+        final JCheckBox extraCb;
+
+        AccountLocationRowUi(CenterManager.Center center, JCheckBox locCb, JCheckBox dropCb, JCheckBox extraCb) {
+            this.center = center;
+            this.locCb = locCb;
+            this.dropCb = dropCb;
+            this.extraCb = extraCb;
+        }
+    }
+
     private static final class AccountSkillBlock {
         final AccountCenterUiState st;
+        final AccountCenterBehaviorStore.SkillKind behaviorKind;
         final JCheckBox useGlobalListCb;
-        final JCheckBox[] locationCbs;
+        final AccountLocationRowUi[] locationRows;
         final JLabel statusLbl;
         final JPanel locPanel;
         final JPanel root;
 
-        AccountSkillBlock(AccountCenterUiState st, JCheckBox useGlobalListCb, JCheckBox[] locationCbs,
+        AccountSkillBlock(AccountCenterUiState st, AccountCenterBehaviorStore.SkillKind behaviorKind,
+                JCheckBox useGlobalListCb, AccountLocationRowUi[] locationRows,
                 JLabel statusLbl, JPanel locPanel, JPanel root) {
             this.st = st;
+            this.behaviorKind = behaviorKind;
             this.useGlobalListCb = useGlobalListCb;
-            this.locationCbs = locationCbs;
+            this.locationRows = locationRows;
             this.statusLbl = statusLbl;
             this.locPanel = locPanel;
             this.root = root;
@@ -3613,8 +3881,8 @@ public class CombatBotPanel extends PluginPanel {
                 return;
             }
             int n = 0;
-            for (JCheckBox cb : locationCbs) {
-                if (cb.isSelected()) {
+            for (AccountLocationRowUi row : locationRows) {
+                if (row.locCb.isSelected()) {
                     n++;
                 }
             }
@@ -3627,37 +3895,67 @@ public class CombatBotPanel extends PluginPanel {
             }
         }
 
-        void syncUiToState() {
+        void syncUiToState(CombatBotConfig cfg) {
             List<CenterManager.Center> master = CenterManager.parse(st.masterBlob);
             boolean global = useGlobalListCb.isSelected();
             st.useGlobalFullList = global;
             if (master.isEmpty()) {
-                // Zonder master-centers: alleen de globale-list checkbox kan een "aan"-betekenis hebben.
                 st.mainOn = global;
                 st.accountSubsetBlob = "";
+                syncBehaviorsBlob(cfg, master, global);
                 return;
             }
             if (global) {
-                // User koos expliciet "gebruik globale lijst" → subset leeg betekent "auto-grow met master".
                 st.accountSubsetBlob = "";
                 st.mainOn = true;
+                syncBehaviorsBlob(cfg, master, true);
                 return;
             }
-            boolean[] sel = new boolean[locationCbs.length];
-            for (int i = 0; i < locationCbs.length; i++) {
-                sel[i] = locationCbs[i].isSelected();
+            boolean[] sel = new boolean[locationRows.length];
+            for (int i = 0; i < locationRows.length; i++) {
+                sel[i] = locationRows[i].locCb.isSelected();
             }
             String built = CenterManager.buildSubsetFromSelection(st.masterBlob, sel);
             int picked = CenterManager.parse(built).size();
             st.mainOn = picked > 0;
-            // Bewust GEEN subsetCoversAllGlobal-collapse: als de user zelf elke location apart
-            // aanvinkt (bv. omdat er maar 1 is), respecteren we die expliciete keuze. Anders
-            // veranderen toggles bij OK + heropenen "vanzelf" van uiterlijk.
             st.accountSubsetBlob = st.mainOn ? built : "";
+            syncBehaviorsBlob(cfg, master, false);
+        }
+
+        private void syncBehaviorsBlob(CombatBotConfig cfg, List<CenterManager.Center> master, boolean globalList) {
+            if (behaviorKind == null || cfg == null || master == null || master.isEmpty()) {
+                st.behaviorsBlob = "";
+                return;
+            }
+            AccountCenterBehaviorStore.CenterBehavior global =
+                    AccountCenterBehaviorStore.globalDefaults(behaviorKind, cfg);
+            Map<String, AccountCenterBehaviorStore.CenterBehavior> map =
+                    new LinkedHashMap<>(AccountCenterBehaviorStore.parse(st.behaviorsBlob));
+            for (int i = 0; i < master.size() && i < locationRows.length; i++) {
+                AccountLocationRowUi row = locationRows[i];
+                CenterManager.Center c = master.get(i);
+                if (c == null || c.point == null) {
+                    continue;
+                }
+                boolean active = globalList || row.locCb.isSelected();
+                if (!active) {
+                    continue;
+                }
+                boolean drop = row.dropCb.isSelected();
+                boolean extra = row.extraCb != null && row.extraCb.isSelected();
+                String key = AccountCenterBehaviorStore.tileKey(c.point);
+                if (drop == global.drop && extra == global.extra) {
+                    map.remove(key);
+                } else {
+                    map.put(key, new AccountCenterBehaviorStore.CenterBehavior(drop, extra, true));
+                }
+            }
+            st.behaviorsBlob = AccountCenterBehaviorStore.serialize(map);
         }
     }
 
-    private AccountSkillBlock buildAccountSkillCenterBlock(String skillLabel, AccountCenterUiState st) {
+    private AccountSkillBlock buildAccountSkillCenterBlock(String skillLabel, AccountCenterUiState st,
+            AccountCenterBehaviorStore.SkillKind behaviorKind) {
         JPanel root = new JPanel();
         root.setLayout(new BoxLayout(root, BoxLayout.Y_AXIS));
         root.setBackground(BG_DARK);
@@ -3719,7 +4017,41 @@ public class CombatBotPanel extends PluginPanel {
                 new EmptyBorder(6, 18, 4, 4)));
         locPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
 
-        JCheckBox[] locationCbs = new JCheckBox[master.size()];
+        boolean showBehaviorCols = behaviorKind != null;
+        if (showBehaviorCols && !master.isEmpty()) {
+            JPanel hdr = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+            hdr.setOpaque(false);
+            hdr.setAlignmentX(Component.LEFT_ALIGNMENT);
+            hdr.add(Box.createHorizontalStrut(4));
+            JLabel hLoc = new JLabel("Locatie");
+            hLoc.setFont(FONT_LABEL);
+            hLoc.setForeground(TEXT_DIM);
+            hdr.add(hLoc);
+            hdr.add(Box.createHorizontalStrut(72));
+            JLabel hDrop = new JLabel("Drop");
+            hDrop.setFont(FONT_LABEL);
+            hDrop.setForeground(TEXT_DIM);
+            hDrop.setToolTipText("Aan = droppen; uit = banken (overschrijft globale skill-vink voor dit account op deze tile).");
+            hdr.add(hDrop);
+            if (behaviorKind != AccountCenterBehaviorStore.SkillKind.MINING) {
+                String extraLab = behaviorKind == AccountCenterBehaviorStore.SkillKind.FISHING ? "Cook" : "FM";
+                JLabel hExtra = new JLabel(extraLab);
+                hExtra.setFont(FONT_LABEL);
+                hExtra.setForeground(TEXT_DIM);
+                hdr.add(hExtra);
+            }
+            locPanel.add(hdr);
+        }
+
+        Map<String, AccountCenterBehaviorStore.CenterBehavior> parsedBehaviors =
+                behaviorKind != null
+                        ? AccountCenterBehaviorStore.parse(st.behaviorsBlob)
+                        : Collections.emptyMap();
+        AccountCenterBehaviorStore.CenterBehavior globalBeh = behaviorKind != null
+                ? AccountCenterBehaviorStore.globalDefaults(behaviorKind, config)
+                : AccountCenterBehaviorStore.CenterBehavior.inherit();
+
+        AccountLocationRowUi[] locationRows = new AccountLocationRowUi[master.size()];
         boolean[] mask;
         if (!st.mainOn) {
             mask = new boolean[master.size()];
@@ -3734,33 +4066,72 @@ public class CombatBotPanel extends PluginPanel {
             CenterManager.Center c = master.get(i);
             String lab = (c.name != null && !c.name.isEmpty()) ? c.name
                     : ("(" + c.point.getX() + "," + c.point.getY() + ")");
-            JCheckBox cb = new JCheckBox(lab + "  r=" + c.radius);
-            cb.setSelected(mask[i]);
-            cb.setFont(FONT_LABEL);
-            cb.setBackground(new Color(34, 36, 46));
-            cb.setForeground(TEXT);
-            locationCbs[i] = cb;
-            locPanel.add(cb);
+            JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+            row.setOpaque(false);
+            row.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+            JCheckBox locCb = new JCheckBox(lab + "  r=" + c.radius);
+            locCb.setSelected(mask[i]);
+            locCb.setFont(FONT_LABEL);
+            locCb.setBackground(new Color(34, 36, 46));
+            locCb.setForeground(TEXT);
+
+            JCheckBox dropCb = null;
+            JCheckBox extraCb = null;
+            if (showBehaviorCols && c.point != null) {
+                String key = AccountCenterBehaviorStore.tileKey(c.point);
+                AccountCenterBehaviorStore.CenterBehavior b = parsedBehaviors.get(key);
+                boolean dropVal = b != null && b.explicit ? b.drop : globalBeh.drop;
+                boolean extraVal = b != null && b.explicit ? b.extra : globalBeh.extra;
+                dropCb = new JCheckBox("Drop");
+                dropCb.setSelected(dropVal);
+                dropCb.setFont(FONT_LABEL);
+                dropCb.setBackground(new Color(34, 36, 46));
+                dropCb.setForeground(TEXT);
+                dropCb.setToolTipText("Aan = droppen; uit = banken op dit center voor dit account.");
+                if (behaviorKind != AccountCenterBehaviorStore.SkillKind.MINING) {
+                    String extraLab = behaviorKind == AccountCenterBehaviorStore.SkillKind.FISHING
+                            ? "Cook" : "FM";
+                    extraCb = new JCheckBox(extraLab);
+                    extraCb.setSelected(extraVal);
+                    extraCb.setFont(FONT_LABEL);
+                    extraCb.setBackground(new Color(34, 36, 46));
+                    extraCb.setForeground(TEXT);
+                    extraCb.setToolTipText(behaviorKind == AccountCenterBehaviorStore.SkillKind.FISHING
+                            ? "Vis koken op vuur voor dit account op dit center."
+                            : "Firemaking / bonfire op dit center voor dit account.");
+                }
+            }
+
+            row.add(locCb);
+            if (dropCb != null) {
+                row.add(dropCb);
+            }
+            if (extraCb != null) {
+                row.add(extraCb);
+            }
+            locationRows[i] = new AccountLocationRowUi(c, locCb, dropCb, extraCb);
+            locPanel.add(row);
         }
 
-        AccountSkillBlock block = new AccountSkillBlock(st, useGlobalListCb, locationCbs, statusLbl, locPanel, root);
+        AccountSkillBlock block = new AccountSkillBlock(st, behaviorKind, useGlobalListCb, locationRows,
+                statusLbl, locPanel, root);
 
         Runnable refreshAll = () -> {
-            boolean hideLocs = useGlobalListCb.isSelected();
-            locPanel.setVisible(!hideLocs);
+            boolean hideLocChecks = useGlobalListCb.isSelected();
+            for (AccountLocationRowUi row : locationRows) {
+                row.locCb.setVisible(!hideLocChecks);
+                if (hideLocChecks) {
+                    row.locCb.setSelected(true);
+                }
+            }
+            locPanel.setVisible(!master.isEmpty());
             block.refreshStatus();
         };
 
-        useGlobalListCb.addActionListener(e -> {
-            if (useGlobalListCb.isSelected()) {
-                for (JCheckBox cb : locationCbs) {
-                    cb.setSelected(true);
-                }
-            }
-            refreshAll.run();
-        });
-        for (JCheckBox cb : locationCbs) {
-            cb.addActionListener(e -> refreshAll.run());
+        useGlobalListCb.addActionListener(e -> refreshAll.run());
+        for (AccountLocationRowUi row : locationRows) {
+            row.locCb.addActionListener(e -> refreshAll.run());
         }
 
         root.add(locPanel);
@@ -4125,6 +4496,16 @@ public class CombatBotPanel extends PluginPanel {
         walkHotspotCb.addActionListener(e -> setConfig("debugWalkStuckHotspotEnabled", walkHotspotCb.isSelected()));
         checkToggles.add(walkHotspotCb);
 
+        JCheckBox loopWatchCb = new JCheckBox("LoopWatch: herstel + logout bij loop");
+        loopWatchCb.setSelected(config.loopWatchRecoveryEnabled());
+        loopWatchCb.setFont(FONT_LABEL);
+        loopWatchCb.setForeground(TEXT);
+        loopWatchCb.setBackground(BG_DARK);
+        loopWatchCb.setToolTipText("<html>Bij [LoopWatch] in debug (zelfde status te lang):<br>"
+                + "±90s zacht herstel, ±180s bot uit + logout. Drempels: Settings → Bot Control.</html>");
+        loopWatchCb.addActionListener(e -> setConfig("loopWatchRecoveryEnabled", loopWatchCb.isSelected()));
+        checkToggles.add(loopWatchCb);
+
         JCheckBox mouseDbgCb = new JCheckBox("Toon muispositie (overlay)");
         mouseDbgCb.setSelected(config.debugMouseOverlay());
         mouseDbgCb.setFont(FONT_LABEL);
@@ -4133,6 +4514,83 @@ public class CombatBotPanel extends PluginPanel {
         mouseDbgCb.setToolTipText("Tekent cursor-kruis + X/Y in-game.");
         mouseDbgCb.addActionListener(e -> setConfig("debugMouseOverlay", mouseDbgCb.isSelected()));
         checkToggles.add(mouseDbgCb);
+
+        JCheckBox invIdOverlayCb = new JCheckBox("Inventory item-ID overlay");
+        invIdOverlayCb.setSelected(config.debugInventoryItemIdOverlay());
+        invIdOverlayCb.setFont(FONT_LABEL);
+        invIdOverlayCb.setForeground(TEXT);
+        invIdOverlayCb.setBackground(BG_DARK);
+        invIdOverlayCb.setToolTipText("<html>Tekent item-ID op inventory-vakjes alleen met Inventory-tab open.<br>"
+                + "Niet op Worn Equipment / andere tabs. Clue scrolls: ook tier.</html>");
+        invIdOverlayCb.addActionListener(e ->
+                setConfig("debugInventoryItemIdOverlay", invIdOverlayCb.isSelected()));
+        checkToggles.add(invIdOverlayCb);
+
+        JCheckBox beginnerClueCb = new JCheckBox("Beginner clue solver", config.beginnerClueSolverEnabled());
+        beginnerClueCb.setFont(FONT_LABEL);
+        beginnerClueCb.setForeground(TEXT);
+        beginnerClueCb.setBackground(BG_DARK);
+        beginnerClueCb.setToolTipText("<html>Bank → GE (ontbrekende items) → Reldo (Strange device).<br>"
+                + "Daarna talk/emote/map dig/hot-cold/Charlie.</html>");
+        beginnerClueCb.addActionListener(e ->
+                configManager.setConfiguration("combatbot", "beginnerClueSolverEnabled", beginnerClueCb.isSelected()));
+        checkToggles.add(beginnerClueCb);
+
+        JCheckBox beginnerClueGeCb = new JCheckBox("Beginner clues: GE koop ontbrekend", config.beginnerClueGeBuyMissing());
+        beginnerClueGeCb.setFont(FONT_LABEL);
+        beginnerClueGeCb.setForeground(TEXT);
+        beginnerClueGeCb.setBackground(BG_DARK);
+        beginnerClueGeCb.setToolTipText("Ontbrekende kit op GE (niet Strange device — die komt van Reldo).");
+        beginnerClueGeCb.addActionListener(e ->
+                configManager.setConfiguration("combatbot", "beginnerClueGeBuyMissing", beginnerClueGeCb.isSelected()));
+        checkToggles.add(beginnerClueGeCb);
+
+        beginnerClueKitPane = new JTextPane();
+        beginnerClueKitPane.setContentType("text/html");
+        beginnerClueKitPane.setEditable(false);
+        beginnerClueKitPane.setBackground(new Color(35, 38, 48));
+        beginnerClueKitPane.setForeground(TEXT);
+        beginnerClueKitPane.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
+        beginnerClueKitPane.setPreferredSize(new Dimension(300, 140));
+        beginnerClueKitPane.setMaximumSize(new Dimension(Integer.MAX_VALUE, 200));
+        beginnerClueKitPane.setText("<html><body style='color:#888;font-family:SansSerif;font-size:10px'>"
+                + "Kit-lijst verschijnt tijdens beginner-clue bank/GE prep.</body></html>");
+
+        JPanel clueKitBlock = new JPanel(new BorderLayout(0, 4));
+        clueKitBlock.setBackground(BG_DARK);
+        clueKitBlock.setAlignmentX(Component.LEFT_ALIGNMENT);
+        clueKitBlock.setMaximumSize(new Dimension(Integer.MAX_VALUE, 220));
+        JLabel clueKitTitle = new JLabel("Beginner clue kit");
+        clueKitTitle.setFont(FONT_SECTION);
+        clueKitTitle.setForeground(GOLD);
+        clueKitTitle.setBorder(new EmptyBorder(8, 0, 0, 0));
+        JLabel clueKitLegend = new JLabel("<html><span style='color:#64FF82'>■</span> inv/equip &nbsp;"
+                + "<span style='color:#64DCFF'>■</span> bank &nbsp;"
+                + "<span style='color:#AAAAAA'>■</span> nog nodig (GE) &nbsp;"
+                + "<span style='color:#C898FF'>■</span> Reldo</html>");
+        clueKitLegend.setFont(new Font("SansSerif", Font.PLAIN, 10));
+        clueKitLegend.setForeground(TEXT_DIM);
+        JPanel clueKitNorth = new JPanel();
+        clueKitNorth.setLayout(new BoxLayout(clueKitNorth, BoxLayout.Y_AXIS));
+        clueKitNorth.setBackground(BG_DARK);
+        clueKitNorth.add(clueKitTitle);
+        clueKitNorth.add(clueKitLegend);
+        clueKitBlock.add(clueKitNorth, BorderLayout.NORTH);
+        JScrollPane clueKitScroll = new JScrollPane(beginnerClueKitPane);
+        clueKitScroll.setBorder(new LineBorder(new Color(55, 60, 75)));
+        clueKitScroll.setPreferredSize(new Dimension(300, 130));
+        clueKitBlock.add(clueKitScroll, BorderLayout.CENTER);
+
+        JCheckBox areaMenuCb = new JCheckBox("Rechtermenu: centers & tiles");
+        areaMenuCb.setSelected(config.debugAreaContextMenu());
+        areaMenuCb.setFont(FONT_LABEL);
+        areaMenuCb.setForeground(TEXT);
+        areaMenuCb.setBackground(BG_DARK);
+        areaMenuCb.setToolTipText("<html>Toont bij rechtsklik op een tile de bot-opties<br>"
+                + "(voeg center, radius ±, tile markers). Uit = normaal OSRS-menu.</html>");
+        areaMenuCb.addActionListener(e ->
+                configManager.setConfiguration("combatbot", "debugAreaContextMenu", areaMenuCb.isSelected()));
+        checkToggles.add(areaMenuCb);
 
         JButton resetWalkTilesBtn = new JButton("↺ Reset walk-tiles");
         resetWalkTilesBtn.setFont(new Font("Arial", Font.PLAIN, 10));
@@ -4204,6 +4662,46 @@ public class CombatBotPanel extends PluginPanel {
         lookupTestBtn.addActionListener(e -> onTestPlayerLookupRequested.run());
         controlButtons.add(lookupTestBtn);
 
+        JButton playTestBtn = new JButton("▶ Test Play");
+        playTestBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        playTestBtn.setPreferredSize(new Dimension(96, 24));
+        playTestBtn.setBackground(new Color(60, 100, 70));
+        playTestBtn.setForeground(Color.WHITE);
+        playTestBtn.setFocusPainted(false);
+        playTestBtn.setToolTipText("<html>Welkomstscherm: log getState + klik 378,77 CLICK HERE TO PLAY.<br>Zet <b>Debug Log Aan</b> aan — bron <b>Login</b>.</html>");
+        playTestBtn.addActionListener(e -> {
+            WelcomeScreenPlayHelper.debugTestClickPlay();
+            SwingUtilities.invokeLater(this::refreshDebugLogViews);
+        });
+        controlButtons.add(playTestBtn);
+
+        JButton clueDbgBtn = new JButton("📜 Clue info");
+        clueDbgBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        clueDbgBtn.setPreferredSize(new Dimension(96, 24));
+        clueDbgBtn.setBackground(new Color(90, 75, 50));
+        clueDbgBtn.setForeground(Color.WHITE);
+        clueDbgBtn.setFocusPainted(false);
+        clueDbgBtn.setToolTipText(ClueScrollHelper.solverFeasibilitySummary());
+        clueDbgBtn.addActionListener(e -> {
+            ClueScrollHelper.logInventoryCluesToDebug();
+            SwingUtilities.invokeLater(this::refreshDebugLogViews);
+        });
+        controlButtons.add(clueDbgBtn);
+
+        JButton beginnerDbBtn = new JButton("📜 Beginner DB");
+        beginnerDbBtn.setFont(new Font("Arial", Font.PLAIN, 10));
+        beginnerDbBtn.setPreferredSize(new Dimension(108, 24));
+        beginnerDbBtn.setBackground(new Color(75, 90, 55));
+        beginnerDbBtn.setForeground(Color.WHITE);
+        beginnerDbBtn.setFocusPainted(false);
+        beginnerDbBtn.setToolTipText("<html>Log alle bekende beginner-stappen naar Debug-tab.<br>"
+                + "Gebaseerd op OSRS Wiki + RuneLite clue-database.</html>");
+        beginnerDbBtn.addActionListener(e -> {
+            ClueScrollHelper.logBeginnerReferenceToDebug();
+            SwingUtilities.invokeLater(this::refreshDebugLogViews);
+        });
+        controlButtons.add(beginnerDbBtn);
+
         JButton lampHoverTestBtn = new JButton("🧞 Test lamp hover");
         lampHoverTestBtn.setFont(new Font("Arial", Font.PLAIN, 10));
         lampHoverTestBtn.setPreferredSize(new Dimension(126, 24));
@@ -4273,6 +4771,7 @@ public class CombatBotPanel extends PluginPanel {
         controlButtons.add(openFolderBtn);
         controls.add(controlButtons);
         controls.add(checkToggles);
+        controls.add(clueKitBlock);
 
         JLabel debugHint = new JLabel("<html><div style='color:#a0a0b0;font-size:10px'>"
                 + "Staat <b>Debug Log Aan</b> uit, dan zie je hier geen nieuwe regels. "
@@ -4376,6 +4875,12 @@ public class CombatBotPanel extends PluginPanel {
                 v -> setConfig("widgetInspectorSkipAlreadyPrinted", v));
         addToggle(wiFields, "Toon widget-info onder muis (overlay)", config.widgetHoverInspectorEnabled(),
                 v -> setConfig("widgetHoverInspectorEnabled", v));
+        addToggle(wiFields, "Inventory item-ID op vakjes (overlay)", config.debugInventoryItemIdOverlay(),
+                v -> setConfig("debugInventoryItemIdOverlay", v));
+        addToggle(wiFields, "Beginner clue solver", config.beginnerClueSolverEnabled(),
+                v -> setConfig("beginnerClueSolverEnabled", v));
+        addToggle(wiFields, "Beginner clues: GE koop ontbrekend", config.beginnerClueGeBuyMissing(),
+                v -> setConfig("beginnerClueGeBuyMissing", v));
         addToggle(wiFields, "Log menu-klikken (ML) — jsonl + ML_CLICK", config.gameplayMlClickLog(),
                 v -> setConfig("gameplayMlClickLog", v));
         addToggle(wiFields, "ML alleen handmatige klikken (geen bot)", config.gameplayMlClickLogOnlyAuthentic(),
@@ -4634,6 +5139,7 @@ public class CombatBotPanel extends PluginPanel {
 
     private void updateLabels() {
         refreshDebugLogViews();
+        updateBeginnerClueKitPane();
         if (paint == null) return;
         lblRuntime.setText(paint.formatRuntime());
         lblActiveSkill.setText(paint.getActiveSkillName());
@@ -4674,6 +5180,59 @@ public class CombatBotPanel extends PluginPanel {
             h.refresh.run();
         }
         repaint();
+    }
+
+    private void notifyBotStartRequested() {
+        CombatBotPlugin plugin = CombatBotRuntime.getActivePlugin();
+        if (plugin != null) {
+            plugin.onBotStartRequested();
+        }
+    }
+
+    private void updateBeginnerClueKitPane() {
+        if (beginnerClueKitPane == null || paint == null) {
+            return;
+        }
+        if (!paint.isBeginnerClueKitOverlayVisible()) {
+            if (!beginnerClueKitPane.getText().contains("Kit-lijst verschijnt")) {
+                beginnerClueKitPane.setText("<html><body style='color:#888;font-family:SansSerif;font-size:10px'>"
+                        + "Kit-lijst verschijnt tijdens beginner-clue bank/GE prep.</body></html>");
+            }
+            return;
+        }
+        List<CombatBotPaint.BeginnerKitLine> lines = paint.getBeginnerClueKitLines();
+        StringBuilder html = new StringBuilder("<html><body style='font-family:SansSerif;font-size:10px;line-height:14px'>");
+        html.append("<b style='color:#FFD878'>").append(paint.getBeginnerClueKitHaveCount())
+                .append("/").append(paint.getBeginnerClueKitTotalCount()).append("</b><br/>");
+        for (CombatBotPaint.BeginnerKitLine line : lines) {
+            String color = "#AAAAAA";
+            switch (line.availability) {
+                case IN_INVENTORY:
+                    color = "#64FF82";
+                    break;
+                case IN_BANK:
+                    color = "#64DCFF";
+                    break;
+                case RELDO_ONLY:
+                    color = "#C898FF";
+                    break;
+                case MISSING:
+                default:
+                    color = "#B0B0B8";
+                    break;
+            }
+            html.append("<span style='color:").append(color).append("'>")
+                    .append(escapeHtml(line.itemName)).append("</span><br/>");
+        }
+        html.append("</body></html>");
+        beginnerClueKitPane.setText(html.toString());
+    }
+
+    private static String escapeHtml(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
     }
 
     /** Vult alle geregistreerde Debug-tab tekstvakken (hoofd + los venster). */
@@ -4742,9 +5301,24 @@ public class CombatBotPanel extends PluginPanel {
         detachedTabs.addTab("⚙ Settings", createSettingsTab());
         detachedTabs.addTab("🎯 Skills", createSkillTabsTab());
         detachedTabs.addTab("📊 Stats", createStatsTab());
-        detachedTabs.addTab("📍 Centers", createCentersTab());
+        detachedTabs.addTab("📍 Centers", createCentersTab(dr -> detachedCentersRefs = dr));
         detachedTabs.addTab("🔍 Debug", createDebugTab());
         detachedTabs.setSelectedIndex(0);
+
+        detachedTabs.addChangeListener(e -> {
+            if (!(e.getSource() instanceof JTabbedPane)) {
+                return;
+            }
+            JTabbedPane tp = (JTabbedPane) e.getSource();
+            int i = tp.getSelectedIndex();
+            if (i < 0) {
+                return;
+            }
+            String tabTitle = tp.getTitleAt(i);
+            if (tabTitle != null && tabTitle.contains("Centers")) {
+                refreshCentersTabRowsFromConfig();
+            }
+        });
 
         detachedFrame.add(detachedTabs, BorderLayout.CENTER);
         detachedFrame.setLocationRelativeTo(null);
@@ -4755,6 +5329,7 @@ public class CombatBotPanel extends PluginPanel {
             @Override
             public void windowClosed(java.awt.event.WindowEvent e) {
                 detachedFrame = null;
+                detachedCentersRefs = null;
             }
         });
     }

@@ -684,7 +684,7 @@ public final class TutorialModeHandler {
         try {
             var it = Inventory.getFirst(itemName);
             if (it == null) return false;
-            it.interact(action);
+            InventoryActionHelper.interact(config, it, action);
             return true;
         } catch (Throwable ignored) {
             return false;
@@ -1191,7 +1191,7 @@ public final class TutorialModeHandler {
             if ((h.contains("open your inventory") || h.contains("open the inventory")
                     || (h.contains("inventory") && (h.contains("you'll need to open") || h.contains("need to open"))))
                     && random.nextInt(100) < 88) {
-                Tabs.open(Tab.INVENTORY);
+                InventoryTabHelper.openInventoryTab(config);
                 return true;
             }
             // Geen losse "flashing yellow": eerste tut-stap zegt "flashing yellow arrow" bij Gielinor Guide —

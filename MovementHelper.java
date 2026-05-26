@@ -1479,6 +1479,53 @@ public final class MovementHelper {
     }
 
     /**
+     * Bank / mining → bank: exacte tegels, geen {@link #walkTo(WorldPoint)}-personalisatie
+     * (voorkomt schijnbaar achteruit klikken richting de mijn).
+     */
+    public static boolean walkTowardBankSteps(WorldPoint target, int maxStep) {
+        if (target == null) {
+            return false;
+        }
+        IPlayer local = Players.getLocal();
+        if (local == null) {
+            return false;
+        }
+        WorldPoint myPos = local.getWorldLocation();
+        if (myPos == null) {
+            return false;
+        }
+        if (myPos.distanceTo(target) <= 1) {
+            return true;
+        }
+        if (walkToExact(target)) {
+            return true;
+        }
+        int dx = target.getX() - myPos.getX();
+        int dy = target.getY() - myPos.getY();
+        int dist = Math.max(Math.abs(dx), Math.abs(dy));
+        if (dist <= 0) {
+            return true;
+        }
+        int[] steps = {maxStep, 15, 10, 5};
+        for (int stepSize : steps) {
+            int step = Math.min(stepSize, dist);
+            int stepX = myPos.getX() + (dx * step / dist);
+            int stepY = myPos.getY() + (dy * step / dist);
+            WorldPoint stepPoint = new WorldPoint(stepX, stepY, myPos.getPlane());
+            if (isInsideLumbridgeCastle(stepPoint) || isInsideLumbridgeDiningRoom(stepPoint)) {
+                continue;
+            }
+            try {
+                if (walkToInternal(stepPoint)) {
+                    return true;
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return false;
+    }
+
+    /**
      * Vereenvoudigde versie zonder center/radius — loop naar een enkel punt met fallbacks.
      */
     public static boolean walkTowardTarget(WorldPoint target, int maxStep) {

@@ -159,6 +159,42 @@ public interface CombatBotConfig extends Config {
     default int debugWalkStuckHotspotWindowSec() { return 120; }
 
     @ConfigItem(
+            keyName = "loopWatchRecoveryEnabled",
+            name = "LoopWatch: herstel bij vaste loop",
+            description = "Als skill+status+tile te lang hetzelfde blijven (zie [LoopWatch] in debug): eerst zacht herstel, daarna bot uit + logout.",
+            section = controlSection,
+            position = 11
+    )
+    default boolean loopWatchRecoveryEnabled() { return true; }
+
+    @ConfigItem(
+            keyName = "loopWatchTriggerSec",
+            name = "LoopWatch: herstel na (sec)",
+            description = "Zelfde loop-signature langer dan dit → zacht herstel (handler reset / account-wissel).",
+            section = controlSection,
+            position = 12
+    )
+    default int loopWatchTriggerSec() { return 90; }
+
+    @ConfigItem(
+            keyName = "loopWatchLogoutSec",
+            name = "LoopWatch: logout na (sec)",
+            description = "Zelfde loop-signature langer dan dit → bot uit + uitloggen (ook met bank open).",
+            section = controlSection,
+            position = 13
+    )
+    default int loopWatchLogoutSec() { return 180; }
+
+    @ConfigItem(
+            keyName = "debugAreaContextMenu",
+            name = "Debug: rechtermenu centers & tiles",
+            description = "Toont in-game bij rechtsklik op een tile de Combat Bot-opties (voeg/verwijder center, radius, tile markers). Uit = alleen het normale OSRS-menu. Schakel ook via tab Debug.",
+            section = controlSection,
+            position = 14
+    )
+    default boolean debugAreaContextMenu() { return true; }
+
+    @ConfigItem(
             keyName = "debugMouseOverlay",
             name = "Debug: toon muispositie overlay",
             description = "Toont een cursor-markering + X/Y in-game zodat je precies ziet waar de muis staat.",
@@ -166,6 +202,33 @@ public interface CombatBotConfig extends Config {
             position = 5
     )
     default boolean debugMouseOverlay() { return false; }
+
+    @ConfigItem(
+            keyName = "debugInventoryItemIdOverlay",
+            name = "Debug: inventory item-ID overlay",
+            description = "Tekent item-ID's op elk inventory-vakje (iface 149) alleen als de Inventory-tab open is — niet op Worn Equipment of andere tabs. Clue scrolls tonen ook tier.",
+            section = controlSection,
+            position = 15
+    )
+    default boolean debugInventoryItemIdOverlay() { return false; }
+
+    @ConfigItem(
+            keyName = "beginnerClueSolverEnabled",
+            name = "Beginner clue solver",
+            description = "Met beginner clue scroll (23182): bank (inv leeg, kit), GE voor ontbrekende items, Reldo voor Strange device; daarna stappen.",
+            section = controlSection,
+            position = 16
+    )
+    default boolean beginnerClueSolverEnabled() { return false; }
+
+    @ConfigItem(
+            keyName = "beginnerClueGeBuyMissing",
+            name = "Beginner clues: GE koop ontbrekend",
+            description = "Na bank: elk ontbrekend kit-item (behalve Strange device) op GE kopen. Device alleen via Reldo.",
+            section = controlSection,
+            position = 17
+    )
+    default boolean beginnerClueGeBuyMissing() { return true; }
 
     // ===================== COMBAT =====================
 
@@ -393,6 +456,16 @@ public interface CombatBotConfig extends Config {
 
     @ConfigItem(keyName = "impsScorpionZoneRadius", name = "Scorpion zone radius", description = "Radius van de scorpion danger zones in tiles", section = impsSection, position = 15)
     default int impsScorpionZoneRadius() { return 8; }
+
+    @ConfigItem(
+            keyName = "impsCompetitorWorldHop",
+            name = "Wereld-hop bij andere imp-jager",
+            description = "Op Karamja: wissel wereld als een andere speler imps in het jachtgebied aanvalt (per account ook uit te zetten). "
+                    + "OSRS vraagt soms om bevestiging: bot klikt Switch world; permanent uitzetten via World Switcher → tandwiel (Configure).",
+            section = impsSection,
+            position = 35
+    )
+    default boolean impsCompetitorWorldHop() { return true; }
 
     @ConfigItem(keyName = "impsGeSellEnabled", name = "🛒 GE verkoop", description = "Verkoop loot via Grand Exchange na X bank trips", section = impsSection, position = 16)
     default boolean impsGeSellEnabled() { return false; }
@@ -674,26 +747,60 @@ public interface CombatBotConfig extends Config {
     @ConfigItem(keyName = "miningEnabled", name = "Mining inschakelen", description = "Schakel mining in als skill rotatie", section = miningSection, position = 0)
     default boolean miningEnabled() { return false; }
 
-    @ConfigItem(keyName = "miningUseSpecificOre", name = "Specifiek erts", description = "Gebruik een specifiek erts i.p.v. beste voor je level", section = miningSection, position = 1)
+    @ConfigItem(
+            keyName = "miningDoricsQuestAuto",
+            name = "Doric's Quest automatisch",
+            description = "Bij mining onder level 10: eerst 6 clay, 4 copper ore en 2 iron ore (unnoted) uit bank/GE, "
+                    + "daarna één trip naar Doric om te starten én af te ronden.",
+            section = miningSection,
+            position = 1
+    )
+    default boolean miningDoricsQuestAuto() { return true; }
+
+    @ConfigItem(keyName = "miningUseSpecificOre", name = "Specifiek erts", description = "Gebruik een specifiek erts i.p.v. beste voor je level", section = miningSection, position = 2)
     default boolean miningUseSpecificOre() { return false; }
 
-    @ConfigItem(keyName = "miningOreName", name = "Erts naam", description = "Naam van het specifieke erts (bijv. Iron rocks, Coal rocks)", section = miningSection, position = 2)
+    @ConfigItem(keyName = "miningOreName", name = "Erts naam", description = "Naam van het specifieke erts (bijv. Iron rocks, Coal rocks)", section = miningSection, position = 3)
     default String miningOreName() { return "Iron rocks"; }
 
-    @ConfigItem(keyName = "miningDropOre", name = "Erts droppen", description = "Drop erts i.p.v. banken (powermining)", section = miningSection, position = 3)
+    @ConfigItem(
+            keyName = "miningDropOre",
+            name = "Erts droppen (standaard)",
+            description = "Standaard bij volle inventaris: erts droppen i.p.v. banken. "
+                    + "Overschreven per locatie: Al Kharid 2 = altijd banken (ijzer), "
+                    + "Al Kharid 3 = altijd droppen (ijzer). Zie paint: spot · bank/drop.",
+            section = miningSection,
+            position = 4
+    )
     default boolean miningDropOre() { return true; }
 
-    @ConfigItem(keyName = "miningCenters", name = "Mining centers", description = "Center-locaties voor mining (X:Y:Z:R:Naam). Beheer via rechtermuisklik in-game.", section = miningSection, position = 4)
-    default String miningCenters() { return "3285:3368:0:14:Varrock east mine:1"; }
+    @ConfigItem(keyName = "miningCenters", name = "Mining centers", description = "Center-locaties voor mining (X:Y:Z:R:Naam). Beheer via rechtermuisklik in-game.", section = miningSection, position = 5)
+    default String miningCenters() {
+        return "3285:3368:0:14:Varrock east mine:1|"
+                + "3226:3146:0:10:lumb zuid:1|"
+                + "3232:3148:0:10:draynor zuid:1|"
+                + "3297:3291:0:15:alkarid 2:1|"
+                + "3295:3310:0:4:alkarid 3:1";
+    }
 
-    @ConfigItem(keyName = "showMiningOverlay", name = "Toon Mining overlay", description = "Toon het mining-gebied als overlay in-game", section = miningSection, position = 5)
+    @ConfigItem(keyName = "showMiningOverlay", name = "Toon Mining overlay", description = "Toon het mining-gebied als overlay in-game", section = miningSection, position = 6)
     default boolean showMiningOverlay() { return true; }
 
-    @ConfigItem(keyName = "miningInteractDelayMin", name = "Mining delay min (ms)", description = "Minimale vertraging voordat de volgende rots wordt gemijnd (0 = standaard)", section = miningSection, position = 6)
+    @ConfigItem(keyName = "showMiningRockTarget", name = "Markeer doelrots", description = "Highlight de rots die de bot gaat minen (tile in-game)", section = miningSection, position = 7)
+    default boolean showMiningRockTarget() { return true; }
+
+    @ConfigItem(keyName = "miningInteractDelayMin", name = "Mining delay min (ms)", description = "Minimale vertraging voordat de volgende rots wordt gemijnd (0 = standaard)", section = miningSection, position = 8)
     default int miningInteractDelayMin() { return 0; }
 
-    @ConfigItem(keyName = "miningInteractDelayMax", name = "Mining delay max (ms)", description = "Maximale vertraging voordat de volgende rots wordt gemijnd (0 = standaard)", section = miningSection, position = 7)
+    @ConfigItem(keyName = "miningInteractDelayMax", name = "Mining delay max (ms)", description = "Maximale vertraging voordat de volgende rots wordt gemijnd (0 = standaard)", section = miningSection, position = 9)
     default int miningInteractDelayMax() { return 0; }
+
+    /**
+     * Intern: welke ingebouwde mining-standaardset al is samengevoegd met jouw bestaande miningCenters.
+     * Bij verhoging in de plugin worden ontbrekende standaard-tiles toegevoegd (geen restore van combat/wc/fish/imps).
+     */
+    @ConfigItem(keyName = "miningBuiltinPackVersion", name = "[intern] Mining-standaardset", description = "0 = nog niet samengevoegd. Niet handmatig wijzigen tenzij je opnieuw wilt laten aanvullen.", section = miningSection, position = 50)
+    default int miningBuiltinPackVersion() { return 0; }
 
     // ===================== FISHING =====================
 
@@ -1101,7 +1208,7 @@ public interface CombatBotConfig extends Config {
     @ConfigItem(
             keyName = "combatGeRangedAmmoEnabled",
             name = "GE ranged ammo (Combat)",
-            description = "Als bank geen pijlen/bolten heeft voor normale Combat (RANGED): koop op de GE. Itemnaam = hieronder (standaard Bronze arrow).",
+            description = "Als bank geen ammo heeft voor RANGED: koop op GE (type = per account, Accounts → Bewerken).",
             section = bankSection,
             position = 8
     )
@@ -1109,10 +1216,11 @@ public interface CombatBotConfig extends Config {
 
     @ConfigItem(
             keyName = "combatGeRangedAmmoItem",
-            name = "GE ranged ammo itemnaam",
-            description = "Welk ammo-type te kopen (bijv. Bronze arrow, Iron arrow). Wordt gebruikt als de bank leeg is voor je gekozen stack.",
+            name = "GE ranged ammo itemnaam (legacy)",
+            description = "Niet meer gebruikt — zie Ranged pijl-type per account (Accounts → Bewerken).",
             section = bankSection,
-            position = 9
+            position = 9,
+            hidden = true
     )
     default String combatGeRangedAmmoItem() { return "Bronze arrow"; }
 
@@ -1121,7 +1229,7 @@ public interface CombatBotConfig extends Config {
             name = "GE ranged ammo basisprijs (gp/stuk)",
             description = "Startbod per pijl/bolt; daarna +20% zoals food.",
             section = bankSection,
-            position = 10
+            position = 11
     )
     default int combatGeRangedAmmoBasePrice() { return 8; }
 
@@ -1471,6 +1579,15 @@ public interface CombatBotConfig extends Config {
     @ConfigItem(keyName = "tabGlanceEnabled", name = "Tab-wissel (inventory)", description = "Anti-ban: willekeurige F-toets (F1,F2,F4–F8), 2–4 s wachten, dan ESC voor inventory. Op Tutorial Island: Storm Tabs.open (tab-widgets), geen F-toetsen. Frequentie volgt anti-ban seconden (random ½–1½×).", section = antiBanSection, position = 10)
     default boolean tabGlanceEnabled() { return true; }
 
+    @ConfigItem(
+            keyName = "openInventoryViaMouseClick",
+            name = "Use mouse to inv",
+            description = "Vóór elke inventory-actie (eten, drinken, wield, drop, bury, use, …): controleer of de Inventory-tab open is; zo niet, klik op tab-widget iface 161,62. Uit = geen extra tab-open (huidig gedrag). Anti-ban tab-glance: aan = inv-klik i.p.v. ESC.",
+            section = antiBanSection,
+            position = 100
+    )
+    default boolean openInventoryViaMouseClick() { return false; }
+
     @ConfigItem(keyName = "accountBehaviorProfileEnabled", name = "Per-RSN gedragsprofiel", description = "Elk account: eigen anti-ban-timing/gewichten + licht verschoven bank-nadertegels (zelfde seed als profiel; Lumbridge-traproute ongemoeid). Intern opgeslagen — geen ML.", section = antiBanSection, position = 11)
     default boolean accountBehaviorProfileEnabled() { return true; }
 
@@ -1556,7 +1673,7 @@ public interface CombatBotConfig extends Config {
     @ConfigSection(name = "Web GUI", description = "Instellingen voor de web-interface", position = 12)
     String webGuiSection = "webGuiSection";
 
-    @ConfigItem(keyName = "webGuiUrl", name = "Web GUI URL", description = "URL naar de web-based GUI. Knop in het zijpaneel opent deze URL.", section = webGuiSection, position = 0)
+    @ConfigItem(keyName = "webGuiUrl", name = "Web GUI URL", description = "URL naar de web-based GUI (extern). Knop 🌐 Web opent deze URL; /config.json blijft op localhost voor sync.", section = webGuiSection, position = 0)
     default String webGuiUrl() { return "https://id-preview--189c9144-0c91-40c6-81e5-f3542a0829c4.lovable.app"; }
 
     // ===================== WIDGET INSPECTOR =====================

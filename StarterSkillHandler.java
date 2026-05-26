@@ -637,7 +637,7 @@ public final class StarterSkillHandler {
             if (w >= 0) {
                 return w;
             }
-            eat.interact("Eat");
+            InventoryActionHelper.interact(config, eat, "Eat");
             markStarterInteract();
             paint.setCurrentStatus("Starter: eten (nood <7 HP)");
             DebugLog.log("StarterSkill", "HP<" + CRITICAL_HP_THRESHOLD + ": Eat " + eat.getName());
@@ -957,7 +957,7 @@ public final class StarterSkillHandler {
         if (w >= 0) {
             return w;
         }
-        food.interact("Eat");
+        InventoryActionHelper.interact(config, food, "Eat");
         markStarterInteract();
         paint.setCurrentStatus("Starter: eten (lage HP)");
         return afterStarterInteractDelay();
@@ -985,7 +985,7 @@ public final class StarterSkillHandler {
         if (w >= 0) {
             return w;
         }
-        food.interact("Eat");
+        InventoryActionHelper.interact(config, food, "Eat");
         markStarterInteract();
         paint.setCurrentStatus("Starter: eten voor koken (lage HP)");
         return afterStarterInteractDelay();
@@ -1248,7 +1248,7 @@ public final class StarterSkillHandler {
         }
         IInventoryItem w = Inventory.getFirst(wName);
         if (w != null && w.hasAction("Wield")) {
-            w.interact("Wield");
+            InventoryActionHelper.interact(config, w, "Wield");
             HumanBanking.pauseWearOrWield();
         }
     }
@@ -1373,10 +1373,10 @@ public final class StarterSkillHandler {
                     continue;
                 }
                 if (it.hasAction("Wear")) {
-                    it.interact("Wear");
+                    InventoryActionHelper.interact(config, it, "Wear");
                     HumanBanking.pauseWearOrWield();
                 } else if (it.hasAction("Wield")) {
-                    it.interact("Wield");
+                    InventoryActionHelper.interact(config, it, "Wield");
                     HumanBanking.pauseWearOrWield();
                 }
                 break;
@@ -1392,13 +1392,13 @@ public final class StarterSkillHandler {
                     continue;
                 }
                 if (it.hasAction("Wear")) {
-                    it.interact("Wear");
+                    InventoryActionHelper.interact(config, it, "Wear");
                     HumanBanking.pauseWearOrWield();
                     t = STARTER_HELM_BY_TIER.length;
                     break;
                 }
                 if (it.hasAction("Wield")) {
-                    it.interact("Wield");
+                    InventoryActionHelper.interact(config, it, "Wield");
                     HumanBanking.pauseWearOrWield();
                     t = STARTER_HELM_BY_TIER.length;
                     break;
@@ -1412,7 +1412,7 @@ public final class StarterSkillHandler {
             String body = STARTER_LEATHER_BODY_PREF[i];
             IInventoryItem it = Inventory.getFirst(body);
             if (it != null && it.hasAction("Wear")) {
-                it.interact("Wear");
+                InventoryActionHelper.interact(config, it, "Wear");
                 HumanBanking.pauseWearOrWield();
                 break;
             }
@@ -1420,7 +1420,7 @@ public final class StarterSkillHandler {
         for (String piece : STARTER_LEATHER_REST) {
             IInventoryItem it = Inventory.getFirst(piece);
             if (it != null && it.hasAction("Wear")) {
-                it.interact("Wear");
+                InventoryActionHelper.interact(config, it, "Wear");
                 HumanBanking.pauseWearOrWield();
             }
         }
@@ -1456,12 +1456,12 @@ public final class StarterSkillHandler {
                 continue;
             }
             if (it.hasAction("Wear")) {
-                it.interact("Wear");
+                InventoryActionHelper.interact(config, it, "Wear");
                 HumanBanking.pauseWearOrWield();
                 return;
             }
             if (it.hasAction("Wield")) {
-                it.interact("Wield");
+                InventoryActionHelper.interact(config, it, "Wield");
                 HumanBanking.pauseWearOrWield();
                 return;
             }
@@ -1532,25 +1532,12 @@ public final class StarterSkillHandler {
      * Leegt inventory naar de bank behalve coins (starter: gp niet banken).
      */
     private void depositEntireInventory() {
-        List<IInventoryItem> items = Inventory.getAll();
-        if (items == null || items.isEmpty()) {
+        if (!Bank.isOpen()) {
             return;
         }
-        List<IInventoryItem> order = new ArrayList<>(items);
-        Collections.shuffle(order, random);
-        for (IInventoryItem it : order) {
-            if (it == null || it.getName() == null) {
-                continue;
-            }
-            if (it.getId() == GENIE_LAMP_ITEM_ID) {
-                continue;
-            }
-            if (isStarterCoinStackName(it.getName())) {
-                continue;
-            }
-            Bank.depositAll(it.getName());
-            HumanBanking.pauseBetweenActions();
-        }
+        String[] keep = BankDepositHelper.mergeKeepWithGenieLamp("Coins");
+        Bank.depositAllExcept(keep);
+        HumanBanking.pauseBetweenActions();
     }
 
     /** Eerst alle coins uit de bank — nergens gp achterlaten voor een trip. */
@@ -1653,7 +1640,7 @@ public final class StarterSkillHandler {
         if (w >= 0) {
             return w;
         }
-        bone.interact("Bury");
+        InventoryActionHelper.interact(config, bone, "Bury");
         markStarterInteract();
         return afterStarterInteractDelay();
     }
@@ -1669,7 +1656,7 @@ public final class StarterSkillHandler {
         if (w >= 0) {
             return w;
         }
-        burnt.interact("Drop");
+        InventoryActionHelper.interact(config, burnt, "Drop");
         markStarterInteract();
         return afterStarterInteractDelay();
     }

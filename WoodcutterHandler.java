@@ -153,11 +153,21 @@ public class WoodcutterHandler {
     private int cantLightHereCount = 0;
     /** Forestry: spel vraagt om Forester's Campfire te tenden i.p.v. eigen vuur binnen 5 tiles. */
     private boolean foresterCampfireTendPreferred = false;
+    /** Opeenvolgende ticks zonder Forester's Campfire-object → ver weg lopen voor eigen vuur. */
+    private int foresterTendMissStreak = 0;
+
+    private static final int FORESTRY_DETECT_RADIUS = 12;
+    private static final int FORESTRY_TEND_SEARCH_RADIUS = 20;
+    private static final int FORESTRY_MOVE_AWAY_TILES = 8;
+    private static final int FORESTRY_TEND_MISS_BEFORE_RELOCATE = 4;
     private long lastFireAttemptTime = 0;
     private long lastFiremakingTime = 0;
     // (removed postBonfireFirstChopDone — no longer needed)
     private int pendingLogCheckCount = -1;
     private long lastCenterRetargetMs = 0L;
+    private int bankOpenFailStreak = 0;
+
+    private static final WorldPoint DRAYNOR_BANK_BOOTH = new WorldPoint(3092, 3243, 0);
 
     private final UniversalBankingManager bankingManager = new UniversalBankingManager();
 
@@ -191,6 +201,7 @@ public class WoodcutterHandler {
         lastBonfireLogChangeTime = 0;
         cantLightHereCount = 0;
         foresterCampfireTendPreferred = false;
+        foresterTendMissStreak = 0;
         lastFireAttemptTime = 0;
         lastFiremakingTime = 0;
         lastTravelClickTime = 0;
@@ -198,6 +209,7 @@ public class WoodcutterHandler {
         lastImpsCashFarmRequestMs = 0L;
         lastAxeUpgradeTripCheckMs = 0L;
         lastCenterRetargetMs = 0L;
+        bankOpenFailStreak = 0;
     }
 
     public ImpsCashFarmRequest pollImpsCashFarmRequest() {
@@ -208,6 +220,39 @@ public class WoodcutterHandler {
 
     public void setTileMarkerManager(TileMarkerManager manager) {
         this.tileMarkerManager = manager;
+    }
+
+    public WorldPoint getTreeArea() {
+        return treeArea;
+    }
+
+    private AccountCenterBehaviorStore.CenterBehavior wcCenterBehavior() {
+        return AccountCenterBehaviorStore.forCenter(
+                AccountCenterBehaviorStore.SkillKind.WOODCUTTING, treeArea, config);
+    }
+
+    private boolean effectiveWcDropLogs() {
+        return wcCenterBehavior().drop;
+    }
+
+    private boolean effectiveWcFiremaking() {
+        return wcCenterBehavior().extra;
+    }
+
+    /** Volle inv + bank-modus: logs storten (niet na elke enkele log). */
+    private boolean shouldDepositWcLogsNow() {
+        if (effectiveWcDropLogs() || !Inventory.isFull()) {
+            return false;
+        }
+        String logName = WoodcutterConfig.getLogName(getTargetTreeName());
+        if (logName == null || logName.isEmpty()) {
+            return true;
+        }
+        try {
+            return Inventory.getCount(true, logName) > 0;
+        } catch (Exception e) {
+            return Inventory.contains(logName);
+        }
     }
 
     public void setActiveCenter(WorldPoint center, int radius) {
@@ -226,23 +271,27 @@ public class WoodcutterHandler {
      * andermans vuur meer gebruiken en of we opnieuw moeten aansteken (logs) of naar WC.
      */
     public void onGameMessage(String message) {
-        if (message == null || !config.wcFiremaking()) return;
+        if (message == null || !effectiveWcFiremaking()) return;
         String m = message.trim();
         String lower = m.toLowerCase(Locale.ROOT).replace('\u2019', '\'');
         boolean forestryNear = lower.contains("forester's campfire")
-                || lower.contains("help tend to that one or move further away");
+                || lower.contains("foresters campfire")
+                || lower.contains("help tend to that one or move further away")
+                || (lower.contains("forester") && lower.contains("campfire") && lower.contains("nearby"));
         boolean vanillaCantLight = lower.contains("can't light a fire") || lower.contains("cannot light a fire")
                 || lower.contains("you can't light") || lower.contains("unable to light a fire");
         if (forestryNear || vanillaCantLight) {
             ownFireLocation = null;
             bonfireInProgress = false;
             resetBonfireStall();
-            firemakingMoveTile = true;
+            firemakingMoveTile = false;
+            foresterTendMissStreak = 0;
             if (forestryNear) {
                 foresterCampfireTendPreferred = true;
             }
-            if (vanillaCantLight) {
+            if (vanillaCantLight && !forestryNear) {
                 cantLightHereCount = 1;
+                firemakingMoveTile = true;
             }
             debug("game message: vuur geweigerd — " + m);
             paint.setLastAntiBanAction(forestryNear
@@ -380,7 +429,7 @@ public class WoodcutterHandler {
                 case IDLE:
                 default:
                     paint.setCurrentStatus("⏳ Wachten op boom...");
-                    if (config.wcFiremaking()) {
+                    if (effectiveWcFiremaking()) {
                         IPlayer pIdle = Players.getLocal();
                         int bonfireBreak = tryForceChopToClearBonfireTail(pIdle);
                         if (bonfireBreak > 0) return bonfireBreak;
@@ -428,14 +477,20 @@ public class WoodcutterHandler {
         }
 
         if (Inventory.isFull()) {
-            if (config.wcFiremaking() && !firemakingFailed && getBestBurnableLog() != null) {
+            if (effectiveWcFiremaking() && !firemakingFailed && getBestBurnableLog() != null) {
                 isBurningLogs = true;
                 // Delay van chopping → firemaking wordt afgehandeld door firemakingTransitionDelay
                 firemakingTransitionDelay = randomDelay(3, 8) * 600; // 3-8 game ticks
                 return WcState.FIREMAKING;
             }
-            if (config.wcDropLogs()) return WcState.DROPPING;
+            if (effectiveWcDropLogs()) {
+                return WcState.DROPPING;
+            }
             saveBankPosition();
+            // Bank al open + volle inv — direct storten (anders blijft WALKING_TO_BANK hangen).
+            if (Bank.isOpen() && shouldDepositWcLogsNow()) {
+                return WcState.BANKING;
+            }
             return WcState.WALKING_TO_BANK;
         }
 
@@ -563,7 +618,7 @@ public class WoodcutterHandler {
 
     private boolean needsGearPrep() {
         boolean needsAxe = !hasAxe();
-        boolean needsTinderbox = config.wcFiremaking() && !firemakingFailed && !Inventory.contains("Tinderbox");
+        boolean needsTinderbox = effectiveWcFiremaking() && !firemakingFailed && !Inventory.contains("Tinderbox");
         return needsAxe || needsTinderbox;
     }
 
@@ -694,21 +749,139 @@ public class WoodcutterHandler {
         java.util.List<UniversalBankingManager.Requirement> reqs = new java.util.ArrayList<>();
         String bestAxe = findBestAvailableAxe();
         reqs.add(new UniversalBankingManager.Requirement(bestAxe, 1, 1));
-        if (config.wcFiremaking() && !firemakingFailed) {
+        if (effectiveWcFiremaking() && !firemakingFailed) {
             reqs.add(new UniversalBankingManager.Requirement("Tinderbox", 1, 1));
         }
         return reqs;
     }
 
+    /**
+     * Bank openen en verifiëren. Willow logs worden pas gestort in {@link #handleBanking()} via UBM
+     * zodra {@link Bank#isOpen()} echt true is.
+     *
+     * @return delay &gt; 0; 0 als open mislukt deze tick
+     */
+    private int tryOpenBankVerified(String context) {
+        if (Bank.isOpen()) {
+            bankOpenFailStreak = 0;
+            if (shouldDepositWcLogsNow()) {
+                currentState = WcState.BANKING;
+                return handleBanking();
+            }
+            return 600;
+        }
+        if (BankHelper.tryOpenFullBank() && Bank.isOpen()) {
+            bankOpenFailStreak = 0;
+            debug(context + ": bank open (tryOpenFullBank)");
+            return afterBankOpened(context);
+        }
+        if (tryOpenDraynorBankBooth()) {
+            if (BankHelper.waitForBankOpen(4000)) {
+                bankOpenFailStreak = 0;
+                debug(context + ": bank open (Draynor booth)");
+                return afterBankOpened(context);
+            }
+        }
+        if (isNearDraynorBankArea() && BankHelper.openSdkBankAndWait() && Bank.isOpen()) {
+            bankOpenFailStreak = 0;
+            debug(context + ": bank open (SDK @ Draynor)");
+            return afterBankOpened(context);
+        }
+        bankOpenFailStreak++;
+        paint.setLastAntiBanAction("WC: bank open mislukt (" + bankOpenFailStreak + ")");
+        debug(context + ": bank niet open na poging #" + bankOpenFailStreak);
+        if (bankOpenFailStreak >= 4) {
+            bankOpenFailStreak = 0;
+            IPlayer local = Players.getLocal();
+            if (local != null && local.getWorldLocation() != null
+                    && local.getWorldLocation().distanceTo(DRAYNOR_BANK_BOOTH) > 2) {
+                MovementHelper.walkToExact(DRAYNOR_BANK_BOOTH);
+                paint.setLastAntiBanAction("WC: → bankbooth-tegel");
+            }
+        }
+        return 0;
+    }
+
+    /** Direct banken zodra UI open is (willow logs via UBM deposit). */
+    private int afterBankOpened(String context) {
+        if (shouldDepositWcLogsNow()) {
+            currentState = WcState.BANKING;
+            debug(context + ": → handleBanking (volle inv, logs storten)");
+            return handleBanking();
+        }
+        return antiBan.varyDelay(randomDelay(1200, 2000));
+    }
+
+    private boolean isNearDraynorBankArea() {
+        IPlayer local = Players.getLocal();
+        WorldPoint p = local != null ? local.getWorldLocation() : null;
+        if (p == null) {
+            return false;
+        }
+        if (p.distanceTo(DRAYNOR_BANK_BOOTH) <= 14) {
+            return true;
+        }
+        return treeArea != null && treeArea.distanceTo(DRAYNOR_BANK_BOOTH) <= 18;
+    }
+
+    private boolean tryOpenDraynorBankBooth() {
+        if (!isNearDraynorBankArea()) {
+            return false;
+        }
+        IPlayer local = Players.getLocal();
+        WorldPoint myPos = local != null ? local.getWorldLocation() : null;
+        if (myPos == null) {
+            return false;
+        }
+        ITileObject booth = TileObjects.getNearest(obj ->
+                obj != null
+                        && obj.getWorldLocation() != null
+                        && obj.getName() != null
+                        && obj.getName().toLowerCase().contains("bank")
+                        && (obj.hasAction("Bank") || obj.hasAction("Use"))
+                        && myPos.distanceTo(obj.getWorldLocation()) <= 8);
+        if (booth == null) {
+            return false;
+        }
+        if (myPos.distanceTo(booth.getWorldLocation()) > 4) {
+            MovementHelper.walkToExact(booth.getWorldLocation());
+            return false;
+        }
+        String action = booth.hasAction("Bank") ? "Bank" : "Use";
+        booth.interact(action);
+        paint.setLastAntiBanAction("WC: Draynor bankbooth klik");
+        return true;
+    }
+
     /** Helper: loop naar bank en open. Wordt gebruikt door GEAR_PREP en WALKING_TO_BANK. */
     private int handleWalkToBank() {
-        if (Bank.isOpen()) return 600;
-        // Probeer dichtbij bank te openen, anders walk
-        if (BankHelper.interactIfNearby()) {
-            return antiBan.varyDelay(randomDelay(1500, 2500));
+        if (Bank.isOpen()) {
+            if (shouldDepositWcLogsNow()) {
+                currentState = WcState.BANKING;
+                return handleBanking();
+            }
+            return 600;
         }
-        if (!BankHelper.walkToNearestFullBank()) {
-            paint.setLastAntiBanAction("⚠ Geen bank gevonden!");
+        int opened = tryOpenBankVerified("handleWalkToBank");
+        if (opened > 0) {
+            return opened;
+        }
+        String bestAxe = findBestAvailableAxe();
+        if (effectiveWcFiremaking() && !firemakingFailed) {
+            if (!BankHelper.walkToNearestFullBank(bestAxe, "Tinderbox")) {
+                if (BankHelper.wasLastWalkSkippedDueToSnapshot()) {
+                    paint.setLastAntiBanAction("WC: snapshot bank leeg → GE/imps-trip");
+                } else {
+                    paint.setLastAntiBanAction("⚠ Geen bank gevonden!");
+                }
+                return 5000;
+            }
+        } else if (!BankHelper.walkToNearestFullBank(bestAxe)) {
+            if (BankHelper.wasLastWalkSkippedDueToSnapshot()) {
+                paint.setLastAntiBanAction("WC: snapshot bank leeg → GE/imps-trip");
+            } else {
+                paint.setLastAntiBanAction("⚠ Geen bank gevonden!");
+            }
             return 5000;
         }
         return antiBan.varyDelay(randomDelay(2000, 3000));
@@ -780,6 +953,11 @@ public class WoodcutterHandler {
             return antiBan.varyDelay(randomDelay(1200, 2000));
         }
 
+        int foresterTick = tryForesterCampfireFiremaking(local, logName);
+        if (foresterTick > 0) {
+            return foresterTick;
+        }
+
         int currentLogCount = Inventory.getCount(logName);
 
         // === STAP 2: Laatste log net verbrand (count = 0)? ===
@@ -800,22 +978,20 @@ public class WoodcutterHandler {
         boolean isDoingFiremaking = (currentAnim == ANIM_FIREMAKING || isBonfireAnimation(currentAnim));
 
         if (local.isMoving() || isDoingFiremaking) {
+            if (foresterCampfireTendPreferred || isForesterCampfireNearby(local, FORESTRY_DETECT_RADIUS)) {
+                bonfireInProgress = false;
+                ownFireLocation = null;
+                return antiBan.varyDelay(randomDelay(350, 700));
+            }
             // Inventory kan al leeg zijn terwijl pose nog “vuur” is — niet eindeloos wachten.
             if (getBestBurnableLog() == null) {
                 firemakingTransitionDelay = 0;
                 return finishBonfire("Geen brandbare logs (tijdens pose/movement)");
             }
-            // Alleen wachten op pose als we echt nog in firemaking-context zitten.
-            // Na "The fire has burned out" kan de pose nog kort blijven hangen terwijl er geen vuur meer is.
+            // Alleen wachten op pose als we echt nog in firemaking-context zitten (eigen vuur, geen Forestry-campfire).
             boolean hasNearbyFireContext = Production.isOpen()
                     || bonfireInProgress
-                    || ownFireLocation != null
-                    || TileObjects.getNearest(obj ->
-                    obj != null
-                            && obj.getName() != null
-                            && isFireObject(obj.getName())
-                            && obj.getWorldLocation() != null
-                            && obj.getWorldLocation().distanceTo(local.getWorldLocation()) <= 2) != null;
+                    || (ownFireLocation != null && findOwnFireNear(local, ownFireLocation, 2) != null);
             if (local.isMoving() || hasNearbyFireContext) {
                 return antiBan.varyDelay(randomDelay(600, 1200));
             }
@@ -885,43 +1061,10 @@ public class WoodcutterHandler {
             return finishBonfire("Log item niet gevonden");
         }
 
-        // Forestry: zelfde mechaniek als bonfire — log op Forester's Campfire → production-UI, volle FM-xp.
-        if (foresterCampfireTendPreferred) {
-            ITileObject foresterFire = TileObjects.getNearest(obj ->
-                    obj != null
-                            && obj.getName() != null
-                            && isForesterCampfireObject(obj.getName())
-                            && !COOKING_ONLY_FIRE_TILE.equals(obj.getWorldLocation())
-            );
-            if (foresterFire != null) {
-                WorldPoint fireWp = foresterFire.getWorldLocation();
-                int distToFire = fireWp.distanceTo(local.getWorldLocation());
-                if (distToFire > 2) {
-                    MovementHelper.walkTo(fireWp);
-                    paint.setLastAntiBanAction("Forestry: lopen naar Forester's Campfire");
-                    return antiBan.varyDelay(randomDelay(800, 1400));
-                }
-                logItem.useOn(foresterFire);
-                paint.setLastAntiBanAction("Forestry: tend — " + logName + " op Forester's Campfire");
-                bonfireFailCount = 0;
-                firemakingMoveTile = false;
-                return antiBan.varyDelay(randomDelay(1800, 2500));
-            }
-            debug("forester tend: geen Forester's Campfire in bereik — andere tegel");
-            foresterCampfireTendPreferred = false;
-            cantLightHereCount = 1;
-        }
-
-        // Alleen logs op ons eigen vuur — nooit andermans vuren in de buurt gebruiken.
-        if (ownFireLocation != null) {
+        // Alleen logs op ons eigen vuur — nooit Forestry- of andermans vuren als "eigen" vuur.
+        if (ownFireLocation != null && !foresterCampfireTendPreferred) {
             final WorldPoint anchor = ownFireLocation;
-            ITileObject ourFire = TileObjects.getNearest(obj ->
-                    obj != null
-                            && obj.getName() != null
-                            && isFireObject(obj.getName())
-                            && !COOKING_ONLY_FIRE_TILE.equals(obj.getWorldLocation())
-                            && obj.getWorldLocation().distanceTo(anchor) <= 1
-            );
+            ITileObject ourFire = findOwnFireNear(local, anchor, 1);
             if (ourFire != null) {
                 WorldPoint fireWp = ourFire.getWorldLocation();
                 int distToFire = fireWp.distanceTo(local.getWorldLocation());
@@ -944,8 +1087,15 @@ public class WoodcutterHandler {
 
         bonfireFailCount++;
 
-        // Geen eigen vuur (meer) → nieuw vuur met tinderbox
+        // Geen eigen vuur (meer) → nieuw vuur met tinderbox (niet als Forestry-campfire dichtbij is)
         if (bonfireFailCount >= MAX_BONFIRE_FAILS || ownFireLocation == null) {
+            if (isForesterCampfireNearby(local, FORESTRY_DETECT_RADIUS)) {
+                foresterCampfireTendPreferred = true;
+                int forestryTick = tryForesterCampfireFiremaking(local, logName);
+                if (forestryTick > 0) {
+                    return forestryTick;
+                }
+            }
             if (Inventory.contains("Tinderbox")) {
                 if (COOKING_ONLY_FIRE_TILE.equals(local.getWorldLocation())) {
                     moveRandomly(local);
@@ -992,6 +1142,7 @@ public class WoodcutterHandler {
         bonfireInProgress = false;
         ownFireLocation = null;
         foresterCampfireTendPreferred = false;
+        foresterTendMissStreak = 0;
         bonfireFailCount = 0;
         resetBonfireStall();
         lastFiremakingTime = System.currentTimeMillis();
@@ -1071,18 +1222,153 @@ public class WoodcutterHandler {
 
     private boolean isFireObject(String name) {
         if (name == null) return false;
-        String lower = name.toLowerCase();
+        String lower = name.toLowerCase(Locale.ROOT);
         return lower.equals("fire") || lower.contains("campfire") || lower.contains("camp fire");
+    }
+
+    /** Eigen vuur / bonfire — géén Forester's Campfire (Forestry). */
+    private boolean isOwnBonfireObject(String name) {
+        return isFireObject(name) && !isForesterCampfireObject(name);
     }
 
     /** Forestry-werelobject (niet elke gewone "Campfire"). */
     private boolean isForesterCampfireObject(String name) {
         if (name == null) return false;
-        String lower = name.toLowerCase(Locale.ROOT);
-        if (lower.contains("forester") && (lower.contains("campfire") || lower.contains("camp fire"))) {
+        String lower = name.toLowerCase(Locale.ROOT).replace('\u2019', '\'');
+        if (lower.contains("forester's campfire")) {
             return true;
         }
-        return lower.contains("forester's campfire");
+        return (lower.contains("forester") || lower.contains("forestry"))
+                && (lower.contains("campfire") || lower.contains("camp fire"));
+    }
+
+    private boolean isForesterCampfireNearby(IPlayer local, int radius) {
+        if (local == null || local.getWorldLocation() == null) {
+            return false;
+        }
+        return findNearestForesterCampfire(local, radius) != null;
+    }
+
+    private ITileObject findNearestForesterCampfire(IPlayer local, int maxDist) {
+        if (local == null || local.getWorldLocation() == null) {
+            return null;
+        }
+        WorldPoint me = local.getWorldLocation();
+        ITileObject best = null;
+        int bestDist = Integer.MAX_VALUE;
+        for (ITileObject obj : TileObjects.getAll(o -> o != null && o.getName() != null)) {
+            if (!isForesterCampfireObject(obj.getName())) {
+                continue;
+            }
+            WorldPoint wp = obj.getWorldLocation();
+            if (wp == null || COOKING_ONLY_FIRE_TILE.equals(wp)) {
+                continue;
+            }
+            int d = wp.distanceTo(me);
+            if (d <= maxDist && d < bestDist) {
+                bestDist = d;
+                best = obj;
+            }
+        }
+        return best;
+    }
+
+    private ITileObject findOwnFireNear(IPlayer local, WorldPoint anchor, int maxDistFromAnchor) {
+        if (anchor == null) {
+            return null;
+        }
+        return TileObjects.getNearest(obj ->
+                obj != null
+                        && obj.getName() != null
+                        && isOwnBonfireObject(obj.getName())
+                        && !COOKING_ONLY_FIRE_TILE.equals(obj.getWorldLocation())
+                        && obj.getWorldLocation() != null
+                        && obj.getWorldLocation().distanceTo(anchor) <= maxDistFromAnchor);
+    }
+
+    /**
+     * Forestry: logs op Forester's Campfire (production-UI). Vóór eigen vuur / tinderbox.
+     *
+     * @return delay &gt; 0 als actie ondernomen, 0 = door naar normale FM-flow
+     */
+    private int tryForesterCampfireFiremaking(IPlayer local, String logName) {
+        if (!effectiveWcFiremaking() || local == null || logName == null) {
+            return 0;
+        }
+        boolean forestryContext = foresterCampfireTendPreferred
+                || isForesterCampfireNearby(local, FORESTRY_DETECT_RADIUS);
+        if (!forestryContext) {
+            return 0;
+        }
+
+        foresterCampfireTendPreferred = true;
+        ownFireLocation = null;
+        bonfireInProgress = false;
+        resetBonfireStall();
+
+        IInventoryItem logItem = Inventory.getFirst(logName);
+        if (logItem == null) {
+            return 0;
+        }
+
+        ITileObject foresterFire = findNearestForesterCampfire(local, FORESTRY_TEND_SEARCH_RADIUS);
+        if (foresterFire == null) {
+            foresterTendMissStreak++;
+            debug("forester tend: geen object (miss #" + foresterTendMissStreak + ")");
+            if (foresterTendMissStreak >= FORESTRY_TEND_MISS_BEFORE_RELOCATE) {
+                moveAwayFromForesterCampfire(local);
+                foresterCampfireTendPreferred = false;
+                foresterTendMissStreak = 0;
+                cantLightHereCount = 1;
+                firemakingMoveTile = true;
+                paint.setLastAntiBanAction("Forestry: verder weg — eigen vuur");
+            }
+            return antiBan.varyDelay(randomDelay(900, 1500));
+        }
+
+        foresterTendMissStreak = 0;
+        WorldPoint fireWp = foresterFire.getWorldLocation();
+        int distToFire = fireWp.distanceTo(local.getWorldLocation());
+        if (distToFire > 2) {
+            MovementHelper.walkTo(fireWp);
+            paint.setLastAntiBanAction("Forestry: lopen naar Forester's Campfire (" + distToFire + ")");
+            return antiBan.varyDelay(randomDelay(800, 1400));
+        }
+
+        logItem.useOn(foresterFire);
+        paint.setLastAntiBanAction("Forestry: tend — " + logName + " op Forester's Campfire");
+        bonfireFailCount = 0;
+        firemakingMoveTile = false;
+        bonfireInProgress = true;
+        lastBonfireLogCount = Inventory.getCount(logName);
+        lastBonfireLogChangeTime = System.currentTimeMillis();
+        return antiBan.varyDelay(randomDelay(1800, 2500));
+    }
+
+    /** Loop verder weg van Forestry-campfire zodat eigen vuur wél mag (spel: 5+ tiles). */
+    private void moveAwayFromForesterCampfire(IPlayer local) {
+        if (local == null || local.getWorldLocation() == null) {
+            return;
+        }
+        ITileObject forester = findNearestForesterCampfire(local, FORESTRY_TEND_SEARCH_RADIUS);
+        WorldPoint me = local.getWorldLocation();
+        WorldPoint target;
+        if (forester != null && forester.getWorldLocation() != null) {
+            WorldPoint f = forester.getWorldLocation();
+            int dx = me.getX() - f.getX();
+            int dy = me.getY() - f.getY();
+            if (dx == 0 && dy == 0) {
+                dx = 1;
+            }
+            double len = Math.sqrt((double) dx * dx + (double) dy * dy);
+            int stepX = (int) Math.round((dx / len) * FORESTRY_MOVE_AWAY_TILES);
+            int stepY = (int) Math.round((dy / len) * FORESTRY_MOVE_AWAY_TILES);
+            target = new WorldPoint(me.getX() + stepX, me.getY() + stepY, me.getPlane());
+        } else {
+            target = new WorldPoint(me.getX() + FORESTRY_MOVE_AWAY_TILES, me.getY(), me.getPlane());
+        }
+        debug("forester: weglopen naar " + target + " (min ~" + FORESTRY_MOVE_AWAY_TILES + " tiles van Forestry-vuur)");
+        MovementHelper.walkTo(target);
     }
 
     private int dropAllLogs(String logName) {
@@ -1093,7 +1379,7 @@ public class WoodcutterHandler {
             var logs = Inventory.getAll(entryLog);
             if (logs != null && !logs.isEmpty()) {
                 for (var log : logs) {
-                    log.interact("Drop");
+                    InventoryActionHelper.interact(config, log, "Drop");
                     sleep(150, 350);
                 }
             }
@@ -1232,7 +1518,7 @@ public class WoodcutterHandler {
         if (logs != null && !logs.isEmpty()) {
             for (var log : logs) {
                 if (shouldAbortActions()) break;
-                log.interact("Drop");
+                InventoryActionHelper.interact(config, log, "Drop");
                 sleep(100, 300);
             }
             paint.addLogDropped();
@@ -1245,12 +1531,27 @@ public class WoodcutterHandler {
 
     private int handleWalkingToBank() {
         if (shouldAbortActions()) return 300;
-        if (Bank.isOpen()) return 600;
-        if (BankHelper.interactIfNearby()) {
-            return antiBan.varyDelay(randomDelay(1200, 1800));
+        if (Bank.isOpen()) {
+            if (shouldDepositWcLogsNow()) {
+                currentState = WcState.BANKING;
+                return handleBanking();
+            }
+            return 600;
         }
-        if (!BankHelper.walkToNearestFullBank()) {
-            paint.setLastAntiBanAction("⚠ Geen bank gevonden!");
+        int opened = tryOpenBankVerified("handleWalkingToBank");
+        if (opened > 0) {
+            return opened;
+        }
+        String bestAxe = findBestAvailableAxe();
+        boolean walked = effectiveWcFiremaking() && !firemakingFailed
+                ? BankHelper.walkToNearestFullBank(bestAxe, "Tinderbox")
+                : BankHelper.walkToNearestFullBank(bestAxe);
+        if (!walked) {
+            if (BankHelper.wasLastWalkSkippedDueToSnapshot()) {
+                paint.setLastAntiBanAction("WC: snapshot bank leeg → GE/imps-trip");
+            } else {
+                paint.setLastAntiBanAction("⚠ Geen bank gevonden!");
+            }
             return 5000;
         }
         return antiBan.varyDelay(randomDelay(2000, 3000));
@@ -1263,9 +1564,10 @@ public class WoodcutterHandler {
     private int handleBanking() {
         if (shouldAbortActions()) return 300;
         if (!Bank.isOpen()) {
-            tryOpenBank();
-            return antiBan.varyDelay(randomDelay(1500, 2000));
+            int opened = tryOpenBankVerified("handleBanking");
+            return opened > 0 ? opened : antiBan.varyDelay(randomDelay(1500, 2000));
         }
+        bankOpenFailStreak = 0;
 
         // Tel logs vóór deposit (voor stats)
         String logName = WoodcutterConfig.getLogName(getTargetTreeName());

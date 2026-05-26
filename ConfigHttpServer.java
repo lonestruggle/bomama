@@ -11,9 +11,9 @@ import java.nio.charset.StandardCharsets;
 
 /**
  * Eenvoudige HTTP server op poort 43120.
- * - GET /config.json → huidige config als JSON (voor React GUI sync)
- * - GET / → redirect naar de web GUI URL
- * - CORS headers voor cross-origin requests vanuit de React app
+ * - GET/POST /config.json → config JSON (optioneel voor externe tools / oude webhooks)
+ * - GET / → redirect-HTML naar {@link CombatBotConfig#webGuiUrl()} (externe GUI; geen embedded app in deze repo)
+ * - CORS headers voor cross-origin requests
  */
 public class ConfigHttpServer {
 
@@ -96,31 +96,43 @@ public class ConfigHttpServer {
     }
 
     /**
-     * Root handler: serveert een simpele HTML pagina met redirect naar de web GUI.
+     * Root: stuur door naar externe Web GUI URL uit config (geen embedded bundel).
      */
     private class RootHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange exchange) throws IOException {
             addCorsHeaders(exchange);
-
+            String method = exchange.getRequestMethod();
+            if ("OPTIONS".equalsIgnoreCase(method)) {
+                exchange.sendResponseHeaders(204, -1);
+                return;
+            }
+            if (!"GET".equalsIgnoreCase(method) && !"HEAD".equalsIgnoreCase(method)) {
+                exchange.sendResponseHeaders(405, -1);
+                return;
+            }
+            boolean head = "HEAD".equalsIgnoreCase(method);
             String guiUrl = config.webGuiUrl();
             if (guiUrl == null || guiUrl.isEmpty()) {
                 guiUrl = "https://id-preview--189c9144-0c91-40c6-81e5-f3542a0829c4.lovable.app";
             }
-
+            String safe = guiUrl.replace("&", "&amp;").replace("\"", "&quot;");
             String html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
                     + "<title>Combat Bot</title>"
-                    + "<meta http-equiv='refresh' content='0;url=" + guiUrl + "'>"
+                    + "<meta http-equiv='refresh' content='0;url=" + safe + "'>"
                     + "<style>body{background:#1a1a2e;color:#e0e0e0;font-family:Arial,sans-serif;display:flex;"
                     + "justify-content:center;align-items:center;height:100vh;margin:0;}"
-                    + "a{color:#4ade80;font-size:18px;}</style></head><body>"
+                    + "code{color:#94a3b8}a{color:#4ade80;font-size:18px;}</style></head><body>"
                     + "<div><h2>⚔ Combat Bot</h2>"
-                    + "<p>Je wordt doorgestuurd naar de <a href='" + guiUrl + "'>Web GUI</a>...</p>"
-                    + "<p style='font-size:12px;color:#888;'>Als het niet automatisch opent, klik op de link hierboven.</p>"
+                    + "<p>Config JSON: <code>http://localhost:43120/config.json</code></p>"
+                    + "<p><a href='" + safe + "'>Open Web GUI (extern)</a></p>"
                     + "</div></body></html>";
-
-            exchange.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
             byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
+            if (head) {
+                exchange.sendResponseHeaders(200, -1);
+                return;
+            }
             exchange.sendResponseHeaders(200, bytes.length);
             try (OutputStream os = exchange.getResponseBody()) {
                 os.write(bytes);
@@ -158,10 +170,12 @@ public class ConfigHttpServer {
         appendBool(sb, "wcFiremaking", config.wcFiremaking()); sb.append(",");
         appendBool(sb, "showWcOverlay", config.showWcOverlay()); sb.append(",");
         appendBool(sb, "miningEnabled", config.miningEnabled()); sb.append(",");
+        appendBool(sb, "miningDoricsQuestAuto", config.miningDoricsQuestAuto()); sb.append(",");
         appendBool(sb, "miningUseSpecificOre", config.miningUseSpecificOre()); sb.append(",");
         appendStr(sb, "miningOreName", config.miningOreName()); sb.append(",");
         appendBool(sb, "miningDropOre", config.miningDropOre()); sb.append(",");
         appendBool(sb, "showMiningOverlay", config.showMiningOverlay()); sb.append(",");
+        appendBool(sb, "showMiningRockTarget", config.showMiningRockTarget()); sb.append(",");
         appendBool(sb, "fishingEnabled", config.fishingEnabled()); sb.append(",");
         appendBool(sb, "fishingUseSpecificMethod", config.fishingUseSpecificMethod()); sb.append(",");
         appendStr(sb, "fishingSpotName", config.fishingSpotName()); sb.append(",");
@@ -214,6 +228,7 @@ public class ConfigHttpServer {
         appendInt(sb, "impsIdleRoamSeconds", config.impsIdleRoamSeconds()); sb.append(",");
         appendBool(sb, "impsAttackScorpions", config.impsAttackScorpions()); sb.append(",");
         appendInt(sb, "impsScorpionZoneRadius", config.impsScorpionZoneRadius()); sb.append(",");
+        appendBool(sb, "impsCompetitorWorldHop", config.impsCompetitorWorldHop()); sb.append(",");
         appendBool(sb, "impsGeSellEnabled", config.impsGeSellEnabled()); sb.append(",");
         appendInt(sb, "impsGeSellAfterBanks", config.impsGeSellAfterBanks()); sb.append(",");
         appendInt(sb, "impsGeSellPrice", config.impsGeSellPrice()); sb.append(",");
@@ -268,6 +283,9 @@ public class ConfigHttpServer {
                 if (colonIdx < 0) continue;
                 String key = pair.substring(0, colonIdx).trim().replace("\"", "");
                 String value = pair.substring(colonIdx + 1).trim().replace("\"", "");
+                if ("miningCenters".equals(key)) {
+                    value = CenterManager.dedupeMiningCentersBlob(value);
+                }
                 configManager.setConfiguration("combatbot", key, value);
             }
         } catch (Exception e) {

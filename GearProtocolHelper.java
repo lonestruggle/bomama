@@ -49,7 +49,7 @@ public final class GearProtocolHelper {
         }
 
         // Gebruik de 4-fase Varrock Teleport puzzel
-        VarrockTeleportHelper.prepareVarrockTeleport();
+        VarrockTeleportHelper.prepareVarrockTeleport(null);
     }
 
     private static int getItemQuantity(String name) {

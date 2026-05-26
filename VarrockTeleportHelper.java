@@ -62,7 +62,7 @@ public final class VarrockTeleportHelper {
             if (viaBook != null) return viaBook;
         }
         // Bestaande spell-flow vereist een open bank — hou dat gedrag intact.
-        return prepareVarrockTeleport();
+        return prepareVarrockTeleport(null);
     }
 
     /**
@@ -71,7 +71,7 @@ public final class VarrockTeleportHelper {
      * Returns {@code false} als chronicle uit staat / niet beschikbaar — caller doet zijn
      * bestaande spell-flow (Magic 25 Varrock teleport).
      */
-    public static boolean tryExecuteChronicleTeleport(String displayName) {
+    public static boolean tryExecuteChronicleTeleport(CombatBotConfig config, String displayName) {
         if (displayName == null || displayName.trim().isEmpty()) return false;
         boolean useChronicle = false;
         try {
@@ -84,7 +84,7 @@ public final class VarrockTeleportHelper {
 
         TeleportReadiness r = tryChroniclePath(displayName);
         if (r == TeleportReadiness.CHRONICLE_TELEPORT_READY) {
-            return ChronicleHelper.teleportToVarrock(displayName);
+            return ChronicleHelper.teleportToVarrock(config, displayName);
         }
         return false;
     }
@@ -136,11 +136,11 @@ public final class VarrockTeleportHelper {
      *
      * @return TELEPORT_READY als alle runes/staves in inventory zitten, WALK als het niet lukt.
      */
-    public static TeleportReadiness prepareVarrockTeleport() {
-        return prepareVarrockTeleport(true);
+    public static TeleportReadiness prepareVarrockTeleport(CombatBotConfig config) {
+        return prepareVarrockTeleport(config, true);
     }
 
-    public static TeleportReadiness prepareVarrockTeleport(boolean allowStaffFallback) {
+    public static TeleportReadiness prepareVarrockTeleport(CombatBotConfig config, boolean allowStaffFallback) {
         if (!Bank.isOpen()) {
             debug("prepareVarrockTeleport: bank niet open → WALK");
             return TeleportReadiness.WALK;
@@ -214,25 +214,25 @@ public final class VarrockTeleportHelper {
 
         // Alleen fire-kant mist
         if (allowStaffFallback && missingFire > 0 && missingAir == 0) {
-            if (tryWithdrawAndEquipStaff("fire")) {
+            if (tryWithdrawAndEquipStaff(config, "fire")) {
                 debug("prepareVarrockTeleport: fire staff gepakt/equipped (air al ok) → TELEPORT_READY");
                 return TeleportReadiness.TELEPORT_READY;
             }
         }
         // Alleen air-kant mist
         if (allowStaffFallback && missingAir > 0 && missingFire == 0) {
-            if (tryWithdrawAndEquipStaff("air")) {
+            if (tryWithdrawAndEquipStaff(config, "air")) {
                 debug("prepareVarrockTeleport: air staff gepakt/equipped (fire al ok) → TELEPORT_READY");
                 return TeleportReadiness.TELEPORT_READY;
             }
         }
         // Beide kanten missen: kies 1 staff + runes voor de andere kant
         if (allowStaffFallback && missingFire > 0 && missingAir > 0) {
-            if (tryWithdrawAndEquipStaff("fire") && ensureRuneInInventory("Air rune", 3)) {
+            if (tryWithdrawAndEquipStaff(config, "fire") && ensureRuneInInventory("Air rune", 3)) {
                 debug("prepareVarrockTeleport: fire staff + 3 air → TELEPORT_READY");
                 return TeleportReadiness.TELEPORT_READY;
             }
-            if (tryWithdrawAndEquipStaff("air") && ensureRuneInInventory("Fire rune", 1)) {
+            if (tryWithdrawAndEquipStaff(config, "air") && ensureRuneInInventory("Fire rune", 1)) {
                 debug("prepareVarrockTeleport: air staff + 1 fire → TELEPORT_READY");
                 return TeleportReadiness.TELEPORT_READY;
             }
@@ -272,7 +272,7 @@ public final class VarrockTeleportHelper {
         return Inventory.getCount(true, name);
     }
 
-    private static boolean tryWithdrawAndEquipStaff(String element) {
+    private static boolean tryWithdrawAndEquipStaff(CombatBotConfig config, String element) {
         if (hasEquippedStaffWithElement(element)) return true;
 
         String staffName = "Staff of " + element;
@@ -296,7 +296,7 @@ public final class VarrockTeleportHelper {
             return n.contains(element) && n.contains("staff");
         });
         if (invStaff == null) return false;
-        invStaff.interact("Wield");
+        InventoryActionHelper.interact(config, invStaff, "Wield");
         conditionalSleep();
         return hasEquippedStaffWithElement(element);
     }

@@ -191,21 +191,24 @@ public class AreaMenuListener {
     private void addCenterEntries(List<MenuEntry> entries, CombatBotPlugin.ActiveSkill skill, String skillName, WorldPoint tilePoint, String hexColor) {
         if (centerCallback == null) return;
 
+        /*
+         * Vastzetten van de tegel waarop het menu werd geopend: bij {@code onClick} is
+         * {@link Client#getSelectedSceneTile()} vaak null of een andere tegel (cursor/menu),
+         * waardoor een center op de verkeerde plek werd opgeslagen.
+         */
+        final WorldPoint menuTile = tilePoint;
+
         String centersData = getCentersForSkill(skill);
-        CenterManager.Center nearest = CenterManager.findNearest(centersData, tilePoint);
+        CenterManager.Center nearest = CenterManager.findNearest(centersData, menuTile);
         int radiusAdjustBuffer = (skill == CombatBotPlugin.ActiveSkill.IMPS) ? 30 : 3;
-        boolean hasNearbyCenter = nearest != null && nearest.point.distanceTo(tilePoint) <= nearest.radius + radiusAdjustBuffer;
+        boolean hasNearbyCenter = nearest != null && nearest.point.distanceTo(menuTile) <= nearest.radius + radiusAdjustBuffer;
 
         // Altijd: "Voeg center toe"
         MenuEntry addEntry = client.createMenuEntry(-1)
                 .setOption("Voeg center toe (" + skillName + ")")
                 .setTarget("<col=" + hexColor + ">Area center</col>")
                 .setType(MenuAction.RUNELITE)
-                .onClick(e -> {
-                    Tile t = client.getSelectedSceneTile();
-                    if (t == null) return;
-                    centerCallback.onAddCenter(skill, t.getWorldLocation());
-                });
+                .onClick(e -> centerCallback.onAddCenter(skill, menuTile));
         entries.add(addEntry);
 
         // Als er een center in de buurt is: radius +/- en verwijder
@@ -214,55 +217,35 @@ public class AreaMenuListener {
                     .setOption("Radius + (" + skillName + ") [r=" + nearest.radius + "]")
                     .setTarget("<col=" + hexColor + ">Area center</col>")
                     .setType(MenuAction.RUNELITE)
-                    .onClick(e -> {
-                        Tile t = client.getSelectedSceneTile();
-                        if (t == null) return;
-                        centerCallback.onAdjustRadius(skill, t.getWorldLocation(), 1);
-                    });
+                    .onClick(e -> centerCallback.onAdjustRadius(skill, menuTile, 1));
             entries.add(radiusUp);
 
             MenuEntry radiusUp5 = client.createMenuEntry(-1)
                     .setOption("Radius +5 (" + skillName + ") [r=" + nearest.radius + "]")
                     .setTarget("<col=" + hexColor + ">Area center</col>")
                     .setType(MenuAction.RUNELITE)
-                    .onClick(e -> {
-                        Tile t = client.getSelectedSceneTile();
-                        if (t == null) return;
-                        centerCallback.onAdjustRadius(skill, t.getWorldLocation(), 5);
-                    });
+                    .onClick(e -> centerCallback.onAdjustRadius(skill, menuTile, 5));
             entries.add(radiusUp5);
 
             MenuEntry radiusDown = client.createMenuEntry(-1)
                     .setOption("Radius - (" + skillName + ") [r=" + nearest.radius + "]")
                     .setTarget("<col=" + hexColor + ">Area center</col>")
                     .setType(MenuAction.RUNELITE)
-                    .onClick(e -> {
-                        Tile t = client.getSelectedSceneTile();
-                        if (t == null) return;
-                        centerCallback.onAdjustRadius(skill, t.getWorldLocation(), -1);
-                    });
+                    .onClick(e -> centerCallback.onAdjustRadius(skill, menuTile, -1));
             entries.add(radiusDown);
 
             MenuEntry radiusDown5 = client.createMenuEntry(-1)
                     .setOption("Radius -5 (" + skillName + ") [r=" + nearest.radius + "]")
                     .setTarget("<col=" + hexColor + ">Area center</col>")
                     .setType(MenuAction.RUNELITE)
-                    .onClick(e -> {
-                        Tile t = client.getSelectedSceneTile();
-                        if (t == null) return;
-                        centerCallback.onAdjustRadius(skill, t.getWorldLocation(), -5);
-                    });
+                    .onClick(e -> centerCallback.onAdjustRadius(skill, menuTile, -5));
             entries.add(radiusDown5);
 
             MenuEntry removeEntry = client.createMenuEntry(-1)
                     .setOption("Verwijder center (" + skillName + ")")
                     .setTarget("<col=" + hexColor + ">Area center</col>")
                     .setType(MenuAction.RUNELITE)
-                    .onClick(e -> {
-                        Tile t = client.getSelectedSceneTile();
-                        if (t == null) return;
-                        centerCallback.onRemoveCenter(skill, t.getWorldLocation());
-                    });
+                    .onClick(e -> centerCallback.onRemoveCenter(skill, menuTile));
             entries.add(removeEntry);
         }
     }

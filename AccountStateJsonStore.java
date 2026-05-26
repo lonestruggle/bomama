@@ -63,6 +63,16 @@ public final class AccountStateJsonStore {
         public long knownBankCoins;
         /** Laatst bekende coin stack in inventory (snapshot-moment). */
         public long knownInventoryCoins;
+        /** JSON: equipped itemnaam → quantity (alle slots, geen vaste key-lijst). */
+        public String knownEquippedItemQtyJson;
+        /** JSON: equipped itemnaam → item-id. */
+        public String knownEquippedItemIdJson;
+        /**
+         * JSON-array per slot: {@code [{"slot":"WEAPON","name":"Shortbow","id":841,"qty":1}, ...]}.
+         */
+        public String knownEquippedSlotsJson;
+        /** Epoch-ms laatste equipment-snapshot. */
+        public long lastEquippedSnapshotMs;
         /** Rolling gemiddelde (EWMA) van gp-opbrengst per Imps-banktrip voor dit account. */
         public int impsTripAvgGp;
         /** Aantal Imps-trip samples dat is meegenomen in de gemiddelde opbrengst. */
@@ -230,6 +240,38 @@ public final class AccountStateJsonStore {
         });
     }
 
+    public static void putEquippedSnapshot(String displayName, String knownEquippedItemQtyJson,
+                                           String knownEquippedItemIdJson, String knownEquippedSlotsJson) {
+        update(displayName, e -> {
+            e.knownEquippedItemQtyJson = knownEquippedItemQtyJson != null ? knownEquippedItemQtyJson : "";
+            e.knownEquippedItemIdJson = knownEquippedItemIdJson != null ? knownEquippedItemIdJson : "";
+            e.knownEquippedSlotsJson = knownEquippedSlotsJson != null ? knownEquippedSlotsJson : "";
+            e.lastEquippedSnapshotMs = System.currentTimeMillis();
+        });
+    }
+
+    public static java.util.List<EquippedSlotSnapshot> knownEquippedSlots(AccountEntry e) {
+        if (e == null || e.knownEquippedSlotsJson == null || e.knownEquippedSlotsJson.trim().isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        try {
+            EquippedSlotSnapshot[] arr = GSON.fromJson(e.knownEquippedSlotsJson, EquippedSlotSnapshot[].class);
+            if (arr == null || arr.length == 0) {
+                return java.util.Collections.emptyList();
+            }
+            java.util.List<EquippedSlotSnapshot> out = new java.util.ArrayList<>(arr.length);
+            for (EquippedSlotSnapshot row : arr) {
+                if (row != null && row.name != null && !row.name.isEmpty()) {
+                    out.add(row);
+                }
+            }
+            return out;
+        } catch (Throwable t) {
+            DebugLog.log("AccountStateJson", "knownEquippedSlots: " + t.getMessage());
+            return java.util.Collections.emptyList();
+        }
+    }
+
     @SuppressWarnings("unchecked")
     public static Map<String, Double> knownBankQtyMap(AccountEntry e) {
         if (e == null || e.knownBankItemQtyJson == null || e.knownBankItemQtyJson.trim().isEmpty()) {
@@ -260,6 +302,43 @@ public final class AccountStateJsonStore {
 
     public static boolean hasKnownBankItem(AccountEntry e, String itemName) {
         return knownBankQty(e, itemName) > 0;
+    }
+
+    @SuppressWarnings("unchecked")
+    public static Map<String, Integer> knownEquippedQtyMap(AccountEntry e) {
+        if (e == null || e.knownEquippedItemQtyJson == null || e.knownEquippedItemQtyJson.trim().isEmpty()) {
+            return new LinkedHashMap<>();
+        }
+        try {
+            Map<String, Double> raw = GSON.fromJson(e.knownEquippedItemQtyJson, Map.class);
+            if (raw == null) {
+                return new LinkedHashMap<>();
+            }
+            Map<String, Integer> out = new LinkedHashMap<>();
+            for (Map.Entry<String, Double> it : raw.entrySet()) {
+                if (it.getKey() == null) {
+                    continue;
+                }
+                Double v = it.getValue();
+                out.put(it.getKey(), v != null ? Math.max(0, v.intValue()) : 0);
+            }
+            return out;
+        } catch (Throwable t) {
+            DebugLog.log("AccountStateJson", "knownEquippedQtyMap: " + t.getMessage());
+            return new LinkedHashMap<>();
+        }
+    }
+
+    public static int knownEquippedQty(AccountEntry e, String itemName) {
+        if (itemName == null || itemName.trim().isEmpty()) {
+            return 0;
+        }
+        for (Map.Entry<String, Integer> it : knownEquippedQtyMap(e).entrySet()) {
+            if (it.getKey() != null && it.getKey().equalsIgnoreCase(itemName.trim())) {
+                return it.getValue() != null ? Math.max(0, it.getValue()) : 0;
+            }
+        }
+        return 0;
     }
 
     public static long knownCoinsApprox(AccountEntry e) {

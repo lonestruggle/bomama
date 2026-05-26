@@ -31,13 +31,19 @@ public class MiningConfig {
 
     /**
      * Geeft het beste erts terug dat gemijnd kan worden op basis van Mining level.
+     * Silver/gold worden overgeslagen: die zitten niet op de standaard F2P training-centers
+     * (bij lvl 20 zou anders Silver gekozen worden i.p.v. door-minen op ijzer).
      */
     public static String getBestOreForLevel(int miningLevel) {
         String bestOre = "Copper rocks";
         for (String[] entry : ORE_LEVELS) {
+            String rock = entry[0];
+            if (rock.contains("Silver") || rock.contains("Gold")) {
+                continue;
+            }
             int requiredLevel = Integer.parseInt(entry[1]);
             if (miningLevel >= requiredLevel) {
-                bestOre = entry[0];
+                bestOre = rock;
             }
         }
         return bestOre;

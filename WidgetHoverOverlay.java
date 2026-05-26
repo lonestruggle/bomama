@@ -23,8 +23,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Toont compacte widget-metadata voor het kleinste zichtbare widget onder de muiscursor
- * (zelfde id/iface-notatie als de widget-dump).
+ * Widget-info onder de muis: Storm {@link WidgetDebugHelper} + fallback RuneLite-widgetboom.
  */
 public class WidgetHoverOverlay extends Overlay {
 
@@ -40,13 +39,14 @@ public class WidgetHoverOverlay extends Overlay {
     private int lastMouseX = Integer.MIN_VALUE;
     private int lastMouseY = Integer.MIN_VALUE;
     private int lastScanTick = -1;
-    private Widget cachedWidget;
+    private WidgetDebugHelper.WidgetHoverInfo cachedStorm;
+    private Widget cachedRlWidget;
 
     @Inject
     WidgetHoverOverlay() {
-        setPosition(OverlayPosition.TOOLTIP);
+        setPosition(OverlayPosition.DYNAMIC);
         setLayer(OverlayLayer.ALWAYS_ON_TOP);
-        setPriority(OverlayPriority.LOW);
+        setPriority(OverlayPriority.HIGH);
     }
 
     @Override
@@ -64,38 +64,17 @@ public class WidgetHoverOverlay extends Overlay {
             lastMouseX = mouse.getX();
             lastMouseY = mouse.getY();
             lastScanTick = tick;
-            cachedWidget = findSmallestWidgetAt(mouse.getX(), mouse.getY());
+            cachedStorm = WidgetDebugHelper.findSmallestStormWidgetAt(mouse.getX(), mouse.getY());
+            cachedRlWidget = findSmallestRlWidgetAt(mouse.getX(), mouse.getY());
         }
 
-        Widget w = cachedWidget;
-        if (w == null) {
-            return null;
+        List<String> lines = buildLines(cachedStorm, cachedRlWidget);
+        if (lines.isEmpty()) {
+            lines.add("geen widget op pixel");
+            lines.add("canvas " + mouse.getX() + "," + mouse.getY());
         }
 
-        String name = clean(w.getName());
-        String text = clean(w.getText());
-        String actions = formatActions(w);
-        String human = WidgetDebugHelper.deriveHumanLabel(name, text, actions);
-        int packed = w.getId();
-        int ig = packed > 0 ? (packed >>> 16) : -1;
-        int ic = packed > 0 ? (packed & 0xFFFF) : -1;
-
-        List<String> lines = new ArrayList<>(8);
-        lines.add("humanLabel: " + (human.isEmpty() ? "—" : human));
-        lines.add("id=" + packed + "  iface=" + ig + "," + ic);
-        if (!name.isEmpty()) {
-            lines.add("name: " + trunc(name, 56));
-        }
-        if (!text.isEmpty()) {
-            lines.add("text: " + trunc(text, 56));
-        }
-        if (!actions.isEmpty()) {
-            lines.add("actions: " + trunc(actions, 56));
-        }
-        Rectangle b = w.getBounds();
-        if (b.width > 0 && b.height > 0) {
-            lines.add(String.format(Locale.ROOT, "bounds: %d,%d %dx%d", b.x, b.y, b.width, b.height));
-        }
+        setPreferredLocation(new java.awt.Point(mouse.getX() + 14, mouse.getY() + 14));
 
         g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
         Font font = new Font(Font.MONOSPACED, Font.PLAIN, 11);
@@ -121,6 +100,56 @@ public class WidgetHoverOverlay extends Overlay {
             y += lineH;
         }
         return new Dimension(boxW, boxH);
+    }
+
+    private static List<String> buildLines(WidgetDebugHelper.WidgetHoverInfo storm, Widget rl) {
+        List<String> lines = new ArrayList<>(10);
+        if (storm != null) {
+            lines.add("bron: Storm");
+            lines.add("humanLabel: " + (storm.humanLabel.isEmpty() ? "—" : storm.humanLabel));
+            lines.add("id=" + storm.packedId + "  iface=" + storm.ifaceGroup + "," + storm.ifaceChild);
+            if (!storm.name.isEmpty()) {
+                lines.add("name: " + trunc(storm.name, 56));
+            }
+            if (!storm.text.isEmpty()) {
+                lines.add("text: " + trunc(storm.text, 56));
+            }
+            if (!storm.actions.isEmpty()) {
+                lines.add("actions: " + trunc(storm.actions, 56));
+            }
+            if (storm.boundsW > 0 && storm.boundsH > 0) {
+                lines.add(String.format(Locale.ROOT, "canvas: %d,%d %dx%d",
+                        storm.canvasX, storm.canvasY, storm.boundsW, storm.boundsH));
+            }
+            return lines;
+        }
+        if (rl != null) {
+            lines.add("bron: RuneLite");
+            String name = clean(rl.getName());
+            String text = clean(rl.getText());
+            String actions = formatActions(rl);
+            String human = WidgetDebugHelper.deriveHumanLabel(name, text, actions);
+            int packed = rl.getId();
+            int ig = packed > 0 ? (packed >>> 16) : -1;
+            int ic = packed > 0 ? (packed & 0xFFFF) : -1;
+            lines.add("humanLabel: " + (human.isEmpty() ? "—" : human));
+            lines.add("id=" + packed + "  iface=" + ig + "," + ic);
+            if (!name.isEmpty()) {
+                lines.add("name: " + trunc(name, 56));
+            }
+            if (!text.isEmpty()) {
+                lines.add("text: " + trunc(text, 56));
+            }
+            if (!actions.isEmpty()) {
+                lines.add("actions: " + trunc(actions, 56));
+            }
+            Point loc = rl.getCanvasLocation();
+            if (loc != null && rl.getWidth() > 0 && rl.getHeight() > 0) {
+                lines.add(String.format(Locale.ROOT, "canvas: %d,%d %dx%d",
+                        loc.getX(), loc.getY(), rl.getWidth(), rl.getHeight()));
+            }
+        }
+        return lines;
     }
 
     private static String trunc(String s, int max) {
@@ -158,31 +187,45 @@ public class WidgetHoverOverlay extends Overlay {
         }
     }
 
-    private Widget findSmallestWidgetAt(int mx, int my) {
+    private Widget findSmallestRlWidgetAt(int mx, int my) {
         Best best = new Best();
         for (int g = 0; g <= MAX_GROUP; g++) {
             for (int c = 0; c <= MAX_CHILD; c++) {
                 Widget root = client.getWidget(g, c);
-                if (root == null) {
-                    continue;
+                if (root != null) {
+                    visitRlWidget(root, mx, my, best);
                 }
-                visitWidgetForHit(root, mx, my, best);
             }
         }
         return best.w;
     }
 
-    private void visitWidgetForHit(Widget w, int mx, int my, Best best) {
-        if (w == null || w.isHidden()) {
+    private void visitRlWidget(Widget w, int mx, int my, Best best) {
+        if (w == null) {
             return;
         }
-        Rectangle b = w.getBounds();
-        if (b.width > 0 && b.height > 0
-                && mx >= b.x && mx < b.x + b.width
-                && my >= b.y && my < b.y + b.height) {
-            int a = b.width * b.height;
-            if (a < best.area) {
-                best.area = a;
+        try {
+            if (w.isHidden()) {
+                return;
+            }
+        } catch (Throwable ignored) {
+            return;
+        }
+        try {
+            if (w.isSelfHidden()) {
+                return;
+            }
+        } catch (Throwable ignored) {
+        }
+        Point loc = w.getCanvasLocation();
+        int ww = w.getWidth();
+        int wh = w.getHeight();
+        if (loc != null && ww > 0 && wh > 0
+                && mx >= loc.getX() && mx < loc.getX() + ww
+                && my >= loc.getY() && my < loc.getY() + wh) {
+            int area = ww * wh;
+            if (area < best.area) {
+                best.area = area;
                 best.w = w;
             }
         }
@@ -190,7 +233,7 @@ public class WidgetHoverOverlay extends Overlay {
         if (ch != null) {
             for (Widget c : ch) {
                 if (c != null) {
-                    visitWidgetForHit(c, mx, my, best);
+                    visitRlWidget(c, mx, my, best);
                 }
             }
         }
@@ -198,7 +241,7 @@ public class WidgetHoverOverlay extends Overlay {
         if (ch != null) {
             for (Widget c : ch) {
                 if (c != null) {
-                    visitWidgetForHit(c, mx, my, best);
+                    visitRlWidget(c, mx, my, best);
                 }
             }
         }
@@ -207,12 +250,11 @@ public class WidgetHoverOverlay extends Overlay {
             if (nested != null) {
                 for (Widget c : nested) {
                     if (c != null) {
-                        visitWidgetForHit(c, mx, my, best);
+                        visitRlWidget(c, mx, my, best);
                     }
                 }
             }
         } catch (Throwable ignored) {
-            // optional API
         }
     }
 

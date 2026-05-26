@@ -3,7 +3,10 @@ package com.combatbot;
 import java.awt.*;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -53,6 +56,8 @@ public class CombatBotPaint {
 
     // === Current status per skill ===
     private String currentStatus = "Opstarten...";
+    /** Actieve mining-center (naam + tile + r); leeg als niet mining. */
+    private volatile String miningTargetOverlayLine = "";
 
     /** Starter-modus: overlay (geen aparte tile-overlay; zelfde panel als combat). */
     private String starterPhaseName = "";
@@ -68,6 +73,33 @@ public class CombatBotPaint {
     /** Imps: voltooide bank trips naar volgende GE-run / totaal (0 = niet tonen). */
     private int impsGeBankTripsDone = 0;
     private int impsGeBankTripsTotal = 0;
+
+    /** Beginner-clue kit checklist (overlay + panel). */
+    public enum BeginnerKitAvailability {
+        /** Nog nodig — inv/bank/GE. */
+        MISSING,
+        /** Al in inventory of equipped. */
+        IN_INVENTORY,
+        /** In bank (nog opnemen). */
+        IN_BANK,
+        /** Strange device — alleen Reldo. */
+        RELDO_ONLY
+    }
+
+    public static final class BeginnerKitLine {
+        public final String itemName;
+        public final BeginnerKitAvailability availability;
+
+        public BeginnerKitLine(String itemName, BeginnerKitAvailability availability) {
+            this.itemName = itemName != null ? itemName : "?";
+            this.availability = availability != null ? availability : BeginnerKitAvailability.MISSING;
+        }
+    }
+
+    private volatile boolean beginnerClueKitOverlayVisible;
+    private volatile List<BeginnerKitLine> beginnerClueKitLines = Collections.emptyList();
+    private volatile int beginnerClueKitHaveCount;
+    private volatile int beginnerClueKitTotalCount;
 
     // === Account switcher info ===
     private String currentAccount = "Geen";
@@ -184,7 +216,16 @@ public class CombatBotPaint {
     public void addFishBanked(int amount) { fishBanked.addAndGet(amount); }
 
     // --- Rotation ---
-    public void setActiveSkill(String skill) { this.activeSkill = skill; }
+    public void setActiveSkill(String skill) {
+        if (!"Mining".equals(skill) && "Mining".equals(this.activeSkill)) {
+            miningTargetOverlayLine = "";
+        }
+        this.activeSkill = skill;
+    }
+
+    public void setMiningTargetOverlayLine(String line) {
+        this.miningTargetOverlayLine = line != null ? line : "";
+    }
     public void setSecondsUntilSwitch(long seconds) { this.secondsUntilSwitch = seconds; }
     public void setTotalSwitchSeconds(long total) { this.totalSwitchSeconds = Math.max(1, total); }
     public void setRotationEnabled(boolean enabled) { this.rotationEnabled = enabled; }
@@ -321,6 +362,36 @@ public class CombatBotPaint {
     public String getCurrentAccountName() { return currentAccount; }
     public int getCurrentAccountNumber() { return currentAccountNum; }
     public int getTotalAccounts() { return totalAccounts; }
+
+    public void setBeginnerClueKitDisplay(List<BeginnerKitLine> lines, boolean visible, int haveCount, int totalCount) {
+        this.beginnerClueKitLines = lines != null ? new ArrayList<>(lines) : Collections.emptyList();
+        this.beginnerClueKitOverlayVisible = visible && !this.beginnerClueKitLines.isEmpty();
+        this.beginnerClueKitHaveCount = Math.max(0, haveCount);
+        this.beginnerClueKitTotalCount = Math.max(0, totalCount);
+    }
+
+    public void clearBeginnerClueKitDisplay() {
+        beginnerClueKitOverlayVisible = false;
+        beginnerClueKitLines = Collections.emptyList();
+        beginnerClueKitHaveCount = 0;
+        beginnerClueKitTotalCount = 0;
+    }
+
+    public boolean isBeginnerClueKitOverlayVisible() {
+        return beginnerClueKitOverlayVisible;
+    }
+
+    public List<BeginnerKitLine> getBeginnerClueKitLines() {
+        return beginnerClueKitLines;
+    }
+
+    public int getBeginnerClueKitHaveCount() {
+        return beginnerClueKitHaveCount;
+    }
+
+    public int getBeginnerClueKitTotalCount() {
+        return beginnerClueKitTotalCount;
+    }
 
     /** Seconden tot geplande account-wissel (Discord-samenvatting). */
     public long getAccountSecondsLeft() {
@@ -523,7 +594,94 @@ public class CombatBotPaint {
         g.drawString("Anti-ban: " + lastAntiBanAction, x + 10, y);
         y += lh;
 
-        return new Dimension(pw, (y - 14) + 20);
+        int totalH = (y - 14) + 20;
+        if (beginnerClueKitOverlayVisible && !beginnerClueKitLines.isEmpty()) {
+            int kitH = renderBeginnerClueKitPanel(g, x, y + 6, pw);
+            totalH += kitH + 6;
+        }
+
+        return new Dimension(pw, totalH);
+    }
+
+    /** Kit-lijst onder hoofd-overlay: groen = in inv, cyaan = bank, paars = Reldo, grijs = nog nodig. */
+    private int renderBeginnerClueKitPanel(Graphics2D g, int x, int y, int pw) {
+        List<BeginnerKitLine> lines = beginnerClueKitLines;
+        if (lines == null || lines.isEmpty()) {
+            return 0;
+        }
+        int lh = 14;
+        int cols = lines.size() > 22 ? 2 : 1;
+        int rows = (lines.size() + cols - 1) / cols;
+        int colW = cols == 2 ? (pw - 16) / 2 : pw - 16;
+        int headerH = 22;
+        int ph = headerH + rows * lh + 10;
+
+        g.setColor(new Color(0, 0, 0, 200));
+        g.fillRoundRect(x, y, pw, ph, 8, 8);
+        g.setColor(new Color(180, 140, 255, 220));
+        g.drawRoundRect(x, y, pw, ph, 8, 8);
+
+        g.setFont(new Font("Arial", Font.BOLD, 11));
+        g.setColor(new Color(255, 215, 120));
+        g.drawString("Clue kit " + beginnerClueKitHaveCount + "/" + beginnerClueKitTotalCount, x + 8, y + 14);
+        g.setFont(new Font("Arial", Font.PLAIN, 9));
+        g.setColor(new Color(140, 140, 150));
+        g.drawString("groen=inv  blauw=bank  grijs=GE", x + 8, y + headerH - 4);
+
+        g.setFont(new Font("Arial", Font.PLAIN, 10));
+        int row = 0;
+        int col = 0;
+        for (BeginnerKitLine line : lines) {
+            int lx = x + 8 + col * colW;
+            int ly = y + headerH + row * lh;
+            g.setColor(colorForKitAvailability(line.availability));
+            String prefix = prefixForKitAvailability(line.availability);
+            String label = line.itemName;
+            if (label.length() > 18) {
+                label = label.substring(0, 17) + "…";
+            }
+            g.drawString(prefix + label, lx, ly);
+            row++;
+            if (row >= rows) {
+                row = 0;
+                col++;
+            }
+        }
+        return ph;
+    }
+
+    private static Color colorForKitAvailability(BeginnerKitAvailability a) {
+        if (a == null) {
+            return new Color(170, 170, 170);
+        }
+        switch (a) {
+            case IN_INVENTORY:
+                return new Color(100, 255, 130);
+            case IN_BANK:
+                return new Color(100, 210, 255);
+            case RELDO_ONLY:
+                return new Color(200, 160, 255);
+            case MISSING:
+            default:
+                return new Color(175, 175, 185);
+        }
+    }
+
+    private static String prefixForKitAvailability(BeginnerKitAvailability a) {
+        if (a == null) {
+            return "○ ";
+        }
+        switch (a) {
+            case IN_INVENTORY:
+                return "✓ ";
+            case IN_BANK:
+                return "◆ ";
+            case RELDO_ONLY:
+                return "◎ ";
+            case MISSING:
+            default:
+                return "○ ";
+        }
     }
 
     /** Render XP info voor de actieve skill + totaal. */
@@ -704,6 +862,11 @@ public class CombatBotPaint {
 
             case "Mining":
                 y += lh;
+                if (miningTargetOverlayLine != null && !miningTargetOverlayLine.isEmpty()) {
+                    g.setColor(new Color(180, 220, 255));
+                    g.drawString("Spot: " + miningTargetOverlayLine, x + 10, y);
+                    y += lh;
+                }
                 g.setColor(new Color(205, 170, 100));
                 g.drawString("Erts gemijnd: " + getOresMined() + " (" + perHour(getOresMined()) + "/hr)", x + 10, y);
                 y += lh;

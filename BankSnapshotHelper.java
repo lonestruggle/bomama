@@ -93,6 +93,7 @@ public final class BankSnapshotHelper {
                 "Air rune", "Mind rune", "Chaos rune", "Law rune", "Fire rune", "Water rune", "Earth rune", "Body rune",
                 "Amulet of power", "Amulet of strength", "Amulet of accuracy", "Amulet of magic", "Amulet of defence",
                 "Hammer", "Garlic", "Stake",
+                "Clay", "Copper ore", "Iron ore",
                 "Black bead", "Red bead", "Yellow bead", "White bead", "Mind talisman", "Fiendish ashes",
                 "Brass key",
                 // Chronicle teleport (Diango)

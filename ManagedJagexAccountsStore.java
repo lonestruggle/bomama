@@ -18,6 +18,22 @@ public final class ManagedJagexAccountsStore {
     private static final String D = "\u001F";
     private static final String GROUP = "combatbot";
 
+    public static final String RANGED_AMMO_DEFAULT = "Bronze arrow";
+    /** Per account: beste pijl in bank (Rune → … → Bronze). */
+    public static final String RANGED_AMMO_BEST = "BEST";
+    public static final String RANGED_AMMO_BEST_LABEL = "Beste in bank";
+    public static final String[] RANGED_AMMO_TYPE_CHOICES = {
+            "Bronze arrow",
+            "Iron arrow",
+            "Steel arrow",
+            "Mithril arrow",
+            "Adamant arrow",
+            "Rune arrow"
+    };
+    private static final String[] RANGED_ARROWS_BEST_FIRST = {
+            "Rune arrow", "Adamant arrow", "Mithril arrow", "Steel arrow", "Iron arrow", "Bronze arrow"
+    };
+
     public static final class ManagedJagexAccountRow {
         public String displayName = "";
         public String characterId = "";
@@ -122,6 +138,25 @@ public final class ManagedJagexAccountsStore {
          */
         public boolean useChronicleForVarrock = false;
 
+        /**
+         * Per-center gedrag (drop/bank, FM, cook) — zie {@link AccountCenterBehaviorStore}.
+         * Lege regel in blob = volg globale skill-instelling voor die tile.
+         */
+        public String wcCenterBehaviorsBlob = "";
+        public String miningCenterBehaviorsBlob = "";
+        public String fishingCenterBehaviorsBlob = "";
+
+        /**
+         * Ranged ammo voor dit account (Combat, Imps, Giants, …): vaste pijl (bv. Bronze arrow)
+         * of {@link #RANGED_AMMO_BEST} voor beste in bank eerst.
+         */
+        public String rangedAmmoType = RANGED_AMMO_DEFAULT;
+        /**
+         * Imps concurrentie-hop op Karamja: alleen actief als globaal
+         * {@link CombatBotConfig#impsCompetitorWorldHop()} aan staat.
+         */
+        public boolean impsCompetitorWorldHopEnabled = true;
+
         public boolean isEmpty() {
             return displayName == null || displayName.trim().isEmpty();
         }
@@ -167,8 +202,70 @@ public final class ManagedJagexAccountsStore {
             r.startSkillOverride = startSkillOverride != null ? startSkillOverride : "";
             r.geBuyTogglesBlob = geBuyTogglesBlob != null ? geBuyTogglesBlob : "";
             r.useChronicleForVarrock = useChronicleForVarrock;
+            r.wcCenterBehaviorsBlob = wcCenterBehaviorsBlob != null ? wcCenterBehaviorsBlob : "";
+            r.miningCenterBehaviorsBlob = miningCenterBehaviorsBlob != null ? miningCenterBehaviorsBlob : "";
+            r.fishingCenterBehaviorsBlob = fishingCenterBehaviorsBlob != null ? fishingCenterBehaviorsBlob : "";
+            r.rangedAmmoType = normalizeRangedAmmoType(rangedAmmoType);
+            r.impsCompetitorWorldHopEnabled = impsCompetitorWorldHopEnabled;
             return r;
         }
+    }
+
+    public static String normalizeRangedAmmoType(String raw) {
+        if (raw == null || raw.trim().isEmpty()) {
+            return RANGED_AMMO_DEFAULT;
+        }
+        String t = raw.trim();
+        if (RANGED_AMMO_BEST.equalsIgnoreCase(t) || "best".equalsIgnoreCase(t)
+                || t.equalsIgnoreCase(RANGED_AMMO_BEST_LABEL)) {
+            return RANGED_AMMO_BEST;
+        }
+        for (String choice : RANGED_AMMO_TYPE_CHOICES) {
+            if (choice.equalsIgnoreCase(t)) {
+                return choice;
+            }
+        }
+        return RANGED_AMMO_DEFAULT;
+    }
+
+    public static String rangedAmmoUiLabel(String normalized) {
+        String n = normalizeRangedAmmoType(normalized);
+        return RANGED_AMMO_BEST.equals(n) ? RANGED_AMMO_BEST_LABEL : n;
+    }
+
+    public static String rangedAmmoFromUiLabel(String uiLabel) {
+        if (uiLabel == null || uiLabel.trim().isEmpty()) {
+            return RANGED_AMMO_DEFAULT;
+        }
+        if (RANGED_AMMO_BEST_LABEL.equalsIgnoreCase(uiLabel.trim())
+                || uiLabel.toLowerCase(Locale.ROOT).contains("beste in bank")) {
+            return RANGED_AMMO_BEST;
+        }
+        return normalizeRangedAmmoType(uiLabel);
+    }
+
+    public static String resolveRangedAmmoTypeForDisplayName(CombatBotConfig cfg, String displayName) {
+        if (cfg == null || displayName == null || displayName.trim().isEmpty()) {
+            return RANGED_AMMO_DEFAULT;
+        }
+        ManagedJagexAccountRow row = findRowForDisplayName(cfg, displayName);
+        if (row != null) {
+            return normalizeRangedAmmoType(row.rangedAmmoType);
+        }
+        return RANGED_AMMO_DEFAULT;
+    }
+
+    public static boolean useBestRangedAmmoForDisplayName(CombatBotConfig cfg, String displayName) {
+        return RANGED_AMMO_BEST.equals(resolveRangedAmmoTypeForDisplayName(cfg, displayName));
+    }
+
+    /** Volgorde voor bank-withdraw / GE (één type of beste-eerst). */
+    public static String[] rangedAmmoWithdrawOrder(CombatBotConfig cfg, String displayName) {
+        String n = resolveRangedAmmoTypeForDisplayName(cfg, displayName);
+        if (RANGED_AMMO_BEST.equals(n)) {
+            return RANGED_ARROWS_BEST_FIRST.clone();
+        }
+        return new String[] {n};
     }
 
     private static boolean nonBlankCenter(String s) {
@@ -300,6 +397,21 @@ public final class ManagedJagexAccountsStore {
                 } else {
                     r.useChronicleForVarrock = false;
                 }
+                if (p.length >= 40) {
+                    r.wcCenterBehaviorsBlob = get(p, 39);
+                }
+                if (p.length >= 41) {
+                    r.miningCenterBehaviorsBlob = get(p, 40);
+                }
+                if (p.length >= 42) {
+                    r.fishingCenterBehaviorsBlob = get(p, 41);
+                }
+                if (p.length >= 43) {
+                    r.rangedAmmoType = normalizeRangedAmmoType(get(p, 42));
+                }
+                if (p.length >= 44) {
+                    r.impsCompetitorWorldHopEnabled = "1".equals(get(p, 43));
+                }
             } else {
                 r.useGlobalCombatCenters = !nonBlankCenter(r.combatCenters);
                 r.useGlobalWcCenters = !nonBlankCenter(r.wcCenters);
@@ -315,6 +427,11 @@ public final class ManagedJagexAccountsStore {
                 r.giantsCombatStyleOverride = "";
                 r.geBuyTogglesBlob = "";
                 r.useChronicleForVarrock = false;
+                r.wcCenterBehaviorsBlob = "";
+                r.miningCenterBehaviorsBlob = "";
+                r.fishingCenterBehaviorsBlob = "";
+                r.rangedAmmoType = RANGED_AMMO_DEFAULT;
+                r.impsCompetitorWorldHopEnabled = true;
             }
             if (!r.isEmpty()) {
                 out.add(r);
@@ -389,7 +506,12 @@ public final class ManagedJagexAccountsStore {
                     .append(nz(r.targetMeleePriority)).append(D)
                     .append(nz(r.impsModeOverride)).append(D)
                     .append(nz(r.geBuyTogglesBlob)).append(D)
-                    .append(r.useChronicleForVarrock ? "1" : "0");
+                    .append(r.useChronicleForVarrock ? "1" : "0").append(D)
+                    .append(nz(r.wcCenterBehaviorsBlob)).append(D)
+                    .append(nz(r.miningCenterBehaviorsBlob)).append(D)
+                    .append(nz(r.fishingCenterBehaviorsBlob)).append(D)
+                    .append(nz(normalizeRangedAmmoType(r.rangedAmmoType))).append(D)
+                    .append(r.impsCompetitorWorldHopEnabled ? "1" : "0");
             sb.append('\n');
         }
         return sb.toString();
@@ -645,8 +767,8 @@ public final class ManagedJagexAccountsStore {
 
     /**
      * Giants-modus: per-account override op {@link CombatBotConfig#giantsMode()} (RSN = display name in tabel).
-     * Bij {@link ManagedJagexAccountRow#rotationUseCustomProfile}: “Giants uit” schakelt uit; “Giants aan” dwingt aan;
-     * lege override volgt de Giants-tab ({@link CombatBotConfig#giantsMode()}).
+     * Bij {@link ManagedJagexAccountRow#rotationUseCustomProfile}: {@code rotationPickGiants} = in rotatie (zoals Imps);
+     * alleen {@code giantsModeOverride} "0"/"1" forceert uit/aan. Zonder custom profiel: Giants-tab + override.
      */
     public static boolean resolveGiantsModeForDisplayName(CombatBotConfig cfg, String displayName) {
         if (cfg == null) {
@@ -677,7 +799,8 @@ public final class ManagedJagexAccountsStore {
                         return false;
                     }
                 }
-                return cfg.giantsMode();
+                // "Giants — in rotatie" aan = Giants in enabledSkills (niet afhankelijk van globale Giants-tab)
+                return true;
             }
             String focus = r.impsGiantsFocus != null ? r.impsGiantsFocus.trim() : "";
             if ("IMPS".equalsIgnoreCase(focus)) {

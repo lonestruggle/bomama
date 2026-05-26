@@ -105,9 +105,9 @@ final class EatForLootSpaceHelper {
 
         // 3) Eet
         if (food.hasAction("Eat")) {
-            food.interact("Eat");
+            InventoryActionHelper.interact(config, food, "Eat");
         } else {
-            food.interact("Drink");
+            InventoryActionHelper.interact(config, food, "Drink");
         }
         if (debugLog != null) {
             String fn = safeName(food.getName());

@@ -362,7 +362,7 @@ public class BarbarianHandler {
                         && i.getName().toLowerCase().contains("bones")
                         && i.hasAction("Bury"));
         if (bones != null) {
-            bones.interact("Bury");
+            InventoryActionHelper.interact(config, bones, "Bury");
             if (boneCount() <= 0) {
                 nextBuryThreshold = randomBuryThreshold();
             }
@@ -386,7 +386,7 @@ public class BarbarianHandler {
                                     a != null && (a.equalsIgnoreCase("Eat") || a.equalsIgnoreCase("Drink"))));
         }
         if (food != null) {
-            food.interact(food.hasAction("Eat") ? "Eat" : "Drink");
+            InventoryActionHelper.interact(config, food, food.hasAction("Eat") ? "Eat" : "Drink");
             return antiBan.varyDelay(randomDelay(1000, 1500));
         }
         return 600;
@@ -649,7 +649,7 @@ public class BarbarianHandler {
             if (!canUseMeleeTierItem(name, weapon)) continue;
             String action = item.hasAction("Wield") ? "Wield" : (item.hasAction("Wear") ? "Wear" : null);
             if (action == null) continue;
-            item.interact(action);
+            InventoryActionHelper.interact(config, item, action);
             sleep(400, 700);
             return;
         }

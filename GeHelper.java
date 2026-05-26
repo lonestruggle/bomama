@@ -1,8 +1,10 @@
 package com.combatbot;
 
 import net.storm.sdk.input.Keyboard;
+import net.storm.sdk.items.GrandExchange;
 
 import java.awt.event.KeyEvent;
+import java.util.List;
 import java.util.Random;
 
 /**
@@ -12,22 +14,32 @@ import java.util.Random;
 public final class GeHelper {
 
     private static final Random RANDOM = new Random();
-    private static final int TYPING_DELAY_MIN_MS = 120;
-    private static final int TYPING_DELAY_MAX_MS = 260;
+    private static final int TYPING_DELAY_MIN_MS = 95;
+    private static final int TYPING_DELAY_MAX_MS = 195;
+    private static final int CLEAR_BACKSPACE_COUNT = 14;
 
     /**
      * Alleen letters; geen Enter. OSRS GE filtert de lijst vaak live, maar sommige states hebben Enter
      * nodig — gebruik {@link #pressEnterAfterGeSearchTyping()} of {@link #typeItemNameAndSelectFirst(String)}.
      */
     public static void typeItemNameLetterByLetter(String itemName) {
-        if (itemName == null || itemName.isEmpty()) return;
+        typeItemNameLetterByLetter(itemName, null);
+    }
+
+    public static void typeItemNameLetterByLetter(String itemName, java.util.function.BooleanSupplier proceed) {
+        if (itemName == null || itemName.isEmpty()) {
+            return;
+        }
         for (int i = 0; i < itemName.length(); i++) {
+            if (!shouldProceed(proceed)) {
+                return;
+            }
             String ch = String.valueOf(itemName.charAt(i));
             Keyboard.type(ch, false);
             try {
                 Thread.sleep(TYPING_DELAY_MIN_MS + RANDOM.nextInt(Math.max(1, TYPING_DELAY_MAX_MS - TYPING_DELAY_MIN_MS)));
                 if (itemName.charAt(i) == ' ') {
-                    Thread.sleep(80 + RANDOM.nextInt(120));
+                    Thread.sleep(60 + RANDOM.nextInt(80));
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -105,24 +117,125 @@ public final class GeHelper {
     }
 
     /**
+     * GE-zoeken zonder blind Enter op het eerste resultaat (bv. Gilded spade vóór Spade).
+     * Selecteert alleen een rij waar de naam exact overeenkomt met {@code exactItemName}.
+     */
+    public static boolean typeItemNameAndSelectExactFresh(String exactItemName) {
+        return typeItemNameAndSelectExactFresh(exactItemName, null);
+    }
+
+    /**
+     * @param proceed null of altijd doorgaan; false = stop (bot uit / GE sluiten)
+     */
+    public static boolean typeItemNameAndSelectExactFresh(String exactItemName,
+            java.util.function.BooleanSupplier proceed) {
+        if (exactItemName == null || exactItemName.isEmpty() || !shouldProceed(proceed)) {
+            return false;
+        }
+        clearSearchInputBestEffort(proceed);
+        if (!shouldProceed(proceed)) {
+            return false;
+        }
+        String query = geSearchQuery(exactItemName);
+        typeItemNameLetterByLetter(query, proceed);
+        if (!shouldProceed(proceed)) {
+            return false;
+        }
+        try {
+            Thread.sleep(280 + RANDOM.nextInt(320));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        if (selectExactGeSearchResult(exactItemName)) {
+            return true;
+        }
+        pressEnterAfterGeSearchTyping();
+        try {
+            Thread.sleep(350 + RANDOM.nextInt(400));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        long deadline = System.currentTimeMillis() + 2800L;
+        while (System.currentTimeMillis() < deadline) {
+            if (!shouldProceed(proceed)) {
+                return false;
+            }
+            if (selectExactGeSearchResult(exactItemName)) {
+                return true;
+            }
+            try {
+                Thread.sleep(120 + RANDOM.nextInt(160));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    public static boolean matchesExactGeItemName(String expected, String actual) {
+        if (expected == null || actual == null) {
+            return false;
+        }
+        return expected.trim().equalsIgnoreCase(actual.trim());
+    }
+
+    private static String geSearchQuery(String exactItemName) {
+        if ("Spade".equalsIgnoreCase(exactItemName.trim())) {
+            return "spade";
+        }
+        return exactItemName;
+    }
+
+    private static boolean selectExactGeSearchResult(String exactItemName) {
+        try {
+            List<GrandExchange.GESearchResult> results = GrandExchange.getSearchResults();
+            if (results == null || results.isEmpty()) {
+                return false;
+            }
+            for (GrandExchange.GESearchResult result : results) {
+                if (result == null || result.getItemName() == null) {
+                    continue;
+                }
+                if (matchesExactGeItemName(exactItemName, result.getItemName())) {
+                    result.chooseOption();
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /**
      * Best-effort clearing for GE search field.
      * We avoid key combos and simply send multiple backspaces/deletes.
      */
     public static void clearSearchInputBestEffort() {
+        clearSearchInputBestEffort(null);
+    }
+
+    /** Kort wissen — geen 30+ backspaces (blokkeerde client en overschreef typen). */
+    public static void clearSearchInputBestEffort(java.util.function.BooleanSupplier proceed) {
         try {
-            for (int i = 0; i < 28; i++) {
+            for (int i = 0; i < CLEAR_BACKSPACE_COUNT; i++) {
+                if (!shouldProceed(proceed)) {
+                    return;
+                }
                 Keyboard.type(String.valueOf((char) KeyEvent.VK_BACK_SPACE), false);
-                Thread.sleep(18 + RANDOM.nextInt(28));
+                Thread.sleep(12 + RANDOM.nextInt(18));
             }
-            for (int i = 0; i < 6; i++) {
-                Keyboard.type(String.valueOf((char) KeyEvent.VK_DELETE), false);
-                Thread.sleep(18 + RANDOM.nextInt(28));
-            }
-            Thread.sleep(130 + RANDOM.nextInt(220));
+            Thread.sleep(80 + RANDOM.nextInt(120));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (Exception ignored) {
             // best-effort
         }
+    }
+
+    private static boolean shouldProceed(java.util.function.BooleanSupplier proceed) {
+        return proceed == null || proceed.getAsBoolean();
     }
 }

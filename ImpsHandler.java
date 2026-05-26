@@ -1,7 +1,11 @@
 package com.combatbot;
 
 import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.MenuAction;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.callback.ClientThread;
 import net.storm.api.domain.actors.INPC;
 import net.storm.api.domain.actors.IPlayer;
 import net.storm.api.domain.items.IInventoryItem;
@@ -27,6 +31,7 @@ import net.storm.api.magic.SpellBook;
 import net.storm.api.widgets.Tab;
 import net.storm.sdk.widgets.Tabs;
 import net.storm.sdk.widgets.Widgets;
+import net.storm.sdk.widgets.Dialog;
 import net.storm.api.domain.widgets.IWidget;
 import net.runelite.api.Skill;
 
@@ -36,6 +41,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Random;
+import java.util.function.BooleanSupplier;
 
 /**
  * ImpsHandler - Speciale combat modus voor het killen van Imps op Karamja.
@@ -67,6 +73,17 @@ public class ImpsHandler {
 
     /** Optioneel: voor {@link AccountQuestProgressStore#setHammerFromImp} bij Hammer ground-loot. */
     private ConfigManager questProgressConfigManager;
+
+    private Client rlClient;
+    private ClientThread rlClientThread;
+    private BooleanSupplier competitorWorldHopEnabled;
+    private int pendingImpsHopTargetWorld = -1;
+    private int pendingImpsHopStartWorld = -1;
+    private int pendingImpsHopRetryCount = 0;
+    private long pendingImpsHopRequestedMs = 0L;
+    private long lastImpsWorldHopMs = 0L;
+    private static final long IMPS_WORLD_HOP_COOLDOWN_MS = 14_000L;
+    private static final long IMPS_HOP_VERIFY_TIMEOUT_MS = 22_000L;
 
     private static final String[] WIZARD_HAT_LOOT_NAMES = {"Blue wizard hat", "Wizard hat"};
 
@@ -133,9 +150,31 @@ public class ImpsHandler {
     }
 
     private static final int BOAT_FARE = 30;
+    /** Musa Point Customs officer (OSRS npc id 380). */
+    private static final int CUSTOMS_OFFICER_NPC_ID = 380;
+    /** Port Sarim → Karamja: Seaman Lorris, Seaman Thresnor, Captain Tobias. */
+    private static final int[] PORT_SARIM_BOAT_NPC_IDS = {364, 365, 326};
+    private static final int PORT_SARIM_BOAT_NPC_SEARCH_RADIUS = 22;
+    /**
+     * Aanlooptile vóór Customs officer — niet op NPC-tegel (2956,3143), anders pathfinder Talk-to.
+     */
+    private static final WorldPoint KARAMJA_BOAT_APPROACH = new WorldPoint(2954, 3144, 0);
 
     // Locaties
     private static final WorldPoint KARAMJA_DOCK_NPC = new WorldPoint(2956, 3143, 0);
+    /** Karamja-box: vier door gebruiker opgegeven hoeken (rechthoek = min/max X/Y daarvan). */
+    private static final WorldPoint KARAMJA_BOX_CORNER_1 = new WorldPoint(2962, 3130, 0);
+    private static final WorldPoint KARAMJA_BOX_CORNER_2 = new WorldPoint(2960, 3190, 0);
+    private static final WorldPoint KARAMJA_BOX_CORNER_3 = new WorldPoint(2816, 3210, 0);
+    private static final WorldPoint KARAMJA_BOX_CORNER_4 = new WorldPoint(2815, 3136, 0);
+    private static final int KARAMJA_REGION_MIN_X = minX(KARAMJA_BOX_CORNER_1, KARAMJA_BOX_CORNER_2,
+            KARAMJA_BOX_CORNER_3, KARAMJA_BOX_CORNER_4);
+    private static final int KARAMJA_REGION_MAX_X = maxX(KARAMJA_BOX_CORNER_1, KARAMJA_BOX_CORNER_2,
+            KARAMJA_BOX_CORNER_3, KARAMJA_BOX_CORNER_4);
+    private static final int KARAMJA_REGION_MIN_Y = minY(KARAMJA_BOX_CORNER_1, KARAMJA_BOX_CORNER_2,
+            KARAMJA_BOX_CORNER_3, KARAMJA_BOX_CORNER_4);
+    private static final int KARAMJA_REGION_MAX_Y = maxY(KARAMJA_BOX_CORNER_1, KARAMJA_BOX_CORNER_2,
+            KARAMJA_BOX_CORNER_3, KARAMJA_BOX_CORNER_4);
     private static final WorldPoint PORTSARIM_DOCK_WAYPOINT = new WorldPoint(3028, 3210, 0);
     private static final WorldPoint PORTSARIM_DOCK_NPC = new WorldPoint(3027, 3218, 0);
     private static final WorldPoint PORTSARIM_DEPOSIT_BOX = new WorldPoint(3029, 3210, 0);
@@ -211,6 +250,19 @@ public class ImpsHandler {
     private long lastPreferredStaffWithdrawMs = 0;
     private static final int MAX_PREFERRED_STAFF_WITHDRAW_ATTEMPTS = 2;
     private static final long PREFERRED_STAFF_WITHDRAW_COOLDOWN_MS = 2200;
+    /** Voorkom withdraw↔deposit arrow-lus tijdens gear prep. */
+    private String gearPrepLastArrowWithdrawName = "";
+    private int gearPrepArrowWithdrawStreak = 0;
+    private static final int GEAR_PREP_ARROW_WITHDRAW_MAX_STREAK = 4;
+    /** Voorkom armor withdraw-lus (zelfde slot/item zonder equip). */
+    private String gearPrepLastArmourWithdrawKey = "";
+    private int gearPrepArmourWithdrawStreak = 0;
+    private static final int GEAR_PREP_ARMOUR_WITHDRAW_MAX_STREAK = 4;
+    /** Eén batch-withdraw van alle armor-slots vóór equip (equip sluit bank-UI). */
+    private boolean gearPrepArmourBatchWithdrawDone = false;
+    /** Na bank-withdraw: alleen uit inventory equippen — bank niet opnieuw openen per stuk. */
+    private boolean gearPrepInvEquipPhase = false;
+    private static final int GEAR_PREP_MIN_ARROWS = 100;
 
     // Loot pickup cooldown - voorkom te snel klikken
     private long lastLootPickupTime = 0;
@@ -353,6 +405,8 @@ public class ImpsHandler {
     // Combat style fallback state (Tier 2 failsafe)
     private CombatBotConfig.ImpsCombatStyle effectiveStyle = null;
     private boolean fallbackStyleActive = false;
+    /** Detecteert account/config-wissel melee↔mage tijdens imps-run. */
+    private CombatBotConfig.ImpsCombatStyle lastObservedImpsBaselineStyle = null;
     // Mage spell override voor runtime-fallback (bv. Fire Strike -> Wind Strike bij air-rune/coin problemen)
     private CombatBotConfig.ImpsMageSpell forcedMageSpell = null;
     // Als bank alleen noted/ongeldige withdraw geeft, forceer dit item direct naar GE-flow.
@@ -384,6 +438,14 @@ public class ImpsHandler {
     private static final long TELEPORT_COOLDOWN_MS = 15_000;
     private long lastBoatClickTime = 0;
     private static final long BOAT_CLICK_COOLDOWN_MS = 6_000;
+    /** Gear prep: alleen na mislukte boot-pogingen — fallback Home teleport (primair = zelfde boot als loot-dump). */
+    private boolean gearPrepKaramjaUseHomeTele = false;
+    /** Na Home tele cast: geen dock/officer-klik tot grace verloopt of mainland. */
+    private long karamjaHomeTeleExitGraceUntilMs = 0L;
+    private static final long KARAMJA_HOME_TELE_EXIT_GRACE_MS = 50_000L;
+    /** Gear prep boot-fouten op Karamja vóór Home-tele-fallback. */
+    private int gearPrepKaramjaBoatFailStreak = 0;
+    private static final int GEAR_PREP_KARAMJA_BOAT_FAIL_FALLBACK = 3;
     /** Anti-spam voor informatieve boot-debugregels ("geen boot-NPC..."). */
     private long lastBoatMissingNpcDebugLogMs = 0L;
     /** Anti-spam voor movement-debug (rally/hunt-center looplogs). */
@@ -394,8 +456,19 @@ public class ImpsHandler {
      */
     private long lastBoatTowardKaramjaInteractMs;
     private static final long BOAT_TOWARD_KARAMJA_GRACE_MS = 40_000L;
+    /** Min. wacht na Pay-fare vóór opnieuw klikken (zelfde tile). */
+    private static final long PORT_SARIM_CROSSING_MIN_WAIT_MS = 12_000L;
+    /** Geen beweging op starttile na deze tijd → herpositioneren / retry. */
+    private static final long PORT_SARIM_CROSSING_STUCK_MS = 20_000L;
+    private static final int PORT_SARIM_BOAT_INTERACT_RANGE = 3;
+    private static final int PORT_SARIM_MAX_PAY_RETRIES_SAME_SPOT = 3;
+    /** {@link #payFareBack()} mag normale flow hervatten na {@link #handleAwaitingPortSarimCrossing}. */
+    private static final int PAY_FARE_RESUME_NORMAL = Integer.MIN_VALUE;
     /** True vanaf Pay-fare met genoeg gp tot Musa Point of timeout — voorkomt grace op mislukte/teloze NPC-klik. */
     private boolean awaitingPortSarimToKaramjaCrossing = false;
+    private WorldPoint portSarimCrossingStartTile;
+    private int portSarimPayAttemptsSameTile;
+    private int portSarimCoinsSnapshotBeforePay = -1;
     private boolean teleportUsedForDockTrip = false;
     private boolean varrockTeleportUsedThisGeTrip = false;
     /** Zelflerend route-voorkeur: bij herhaalde dock-stucks eerst via tussenpunt lopen. */
@@ -413,10 +486,65 @@ public class ImpsHandler {
     private static final int LEARNED_SCORPION_HOTSPOT_RADIUS = 4;
 
     /** Reset lichte runtime-state zodat de handler "schoon" opnieuw kan starten. */
+    /**
+     * LoopWatch / stuck-recovery: breek bank-gear-lus (armor withdraw, deposit, …).
+     */
+    public void recoverFromStuckLoop(String statusBucket) {
+        gearPrepLastArmourWithdrawKey = "";
+        gearPrepArmourWithdrawStreak = 0;
+        gearPrepArmourBatchWithdrawDone = false;
+        gearPrepInvEquipPhase = false;
+        gearPrepLastArrowWithdrawName = "";
+        gearPrepArrowWithdrawStreak = 0;
+        preferredStaffWithdrawAttempts = MAX_PREFERRED_STAFF_WITHDRAW_ATTEMPTS;
+        gearPrepKaramjaUseHomeTele = false;
+        karamjaHomeTeleExitGraceUntilMs = 0L;
+        gearPrepKaramjaBoatFailStreak = 0;
+        resetPortSarimBoatCrossingState();
+        lastBoatClickTime = 0L;
+        boolean boatStuck = isBoatStuckStatusBucket(statusBucket);
+        if (!boatStuck) {
+            preparingGear = true;
+            gearPrepComplete = false;
+        } else {
+            preparingGear = false;
+            if (hasAdequateGearForStyle(getEffectiveStyle()) && getCoinCount() >= impsRuntimeMinCoins()) {
+                gearPrepComplete = true;
+            }
+        }
+        try {
+            if (Bank.isOpen()) {
+                Bank.close();
+            }
+        } catch (Exception ignored) {
+        }
+        chatLog("[LoopWatch] Imps herstel" + (statusBucket != null && !statusBucket.isEmpty()
+                ? " (" + statusBucket + ")" : "")
+                + (boatStuck ? " — boot-state reset (geen gear-prep)" : " — bank gesloten, prep streaks reset"));
+    }
+
+    private static boolean isBoatStuckStatusBucket(String statusBucket) {
+        if (statusBucket == null || statusBucket.isEmpty()) {
+            return false;
+        }
+        String b = statusBucket.toLowerCase(Locale.ROOT);
+        return b.contains("boat") || b.contains("karamja_dock") || b.contains("port_sarim") || b.contains("naar_karamja");
+    }
+
+    private void resetPortSarimBoatCrossingState() {
+        awaitingPortSarimToKaramjaCrossing = false;
+        lastBoatTowardKaramjaInteractMs = 0L;
+        portSarimCrossingStartTile = null;
+        portSarimPayAttemptsSameTile = 0;
+        portSarimCoinsSnapshotBeforePay = -1;
+    }
+
     public void resetState() {
+        clearPendingImpsWorldHop();
         preparingGear = false;
         gearPrepComplete = false;
         isBankingTrip = false;
+        karamjaSharedBoatTrip = false;
         isRestocking = false;
         walkingToHuntArea = false;
         outsideTargetCooldownUntilMs = 0L;
@@ -449,6 +577,7 @@ public class ImpsHandler {
         geAmmoItemName = null;
         effectiveStyle = null;
         fallbackStyleActive = false;
+        lastObservedImpsBaselineStyle = null;
         forcedMageSpell = null;
         mageAutocastAppliedFor = null;
         forceGeMissingItem = null;
@@ -467,6 +596,12 @@ public class ImpsHandler {
         lastImpsRangedEmptyQuiverGameMessageMs = 0L;
         preferredStaffWithdrawAttempts = 0;
         lastPreferredStaffWithdrawMs = 0;
+        gearPrepLastArrowWithdrawName = "";
+        gearPrepArrowWithdrawStreak = 0;
+        gearPrepLastArmourWithdrawKey = "";
+        gearPrepArmourWithdrawStreak = 0;
+        gearPrepArmourBatchWithdrawDone = false;
+        gearPrepInvEquipPhase = false;
         scatteringBatchStarted = false;
         scatterAshesRemainingThisBatch = 0;
         nextAshScatterThreshold = 0;
@@ -485,7 +620,10 @@ public class ImpsHandler {
         lastStarterHomeGeSkipDiagnosticLogMs = 0;
         lastStarterHomeTeleportDiagLogMs = 0;
         lastBoatTowardKaramjaInteractMs = 0L;
-        awaitingPortSarimToKaramjaCrossing = false;
+        gearPrepKaramjaUseHomeTele = false;
+        karamjaHomeTeleExitGraceUntilMs = 0L;
+        gearPrepKaramjaBoatFailStreak = 0;
+        resetPortSarimBoatCrossingState();
     }
 
     public void setPreferAlternateKaramjaDockRoute(boolean preferAlternate) {
@@ -520,6 +658,22 @@ public class ImpsHandler {
         return starterSkillBridge ? 5 : 15;
     }
 
+    /**
+     * Volledige combat-kit al aan: geen 15 vrije slots eisen (alleen ruimte voor coins/law/deposit).
+     */
+    private int minFreeSlotsRequiredForGearPrep(CombatBotConfig.ImpsCombatStyle style) {
+        int equipSwap = InventoryEquipHelper.minFreeSlotsForStyleEquip(style);
+        if (hasAdequateGearForStyle(style)) {
+            if (impsMeleeSkipsArmour(style)) {
+                return Math.max(starterSkillBridge ? 3 : 5, equipSwap);
+            }
+            if (StyleArmourBankHelper.hasCoreArmourEquipped(style)) {
+                return Math.max(starterSkillBridge ? 3 : 5, equipSwap);
+            }
+        }
+        return Math.max(minFreeSlotsForGearPrepComplete(), equipSwap);
+    }
+
     private String impsLocalRsnOrNull() {
         IPlayer local = Players.getLocal();
         if (local == null || local.getName() == null || local.getName().trim().isEmpty()) {
@@ -535,6 +689,25 @@ public class ImpsHandler {
             return config.impsCombatStyle();
         }
         return ManagedJagexAccountsStore.resolveImpsCombatStyleForDisplayName(config, rsn);
+    }
+
+    /** Ammo-telling voor Imps ranged: inv + quiver; bij vast type ook andere bruikbare ammo als fallback. */
+    private int getImpsEffectiveArrowCount() {
+        if (RangedAmmoPreference.useBestInBank(config)) {
+            return getTotalArrows();
+        }
+        String pref = RangedAmmoPreference.preferredItemName(config);
+        int prefTotal = getItemQuantity(pref);
+        if (prefTotal >= GEAR_PREP_MIN_ARROWS) {
+            return prefTotal;
+        }
+        int rngLvl;
+        try {
+            rngLvl = Skills.getLevel(Skill.RANGED);
+        } catch (Exception e) {
+            rngLvl = 1;
+        }
+        return Math.max(prefTotal, RangedAmmoKit.getTotalUsableRangedAmmoCount(rngLvl));
     }
 
     /** Haal de effectieve combat style op (kan afwijken van config na fallback). */
@@ -902,6 +1075,17 @@ public class ImpsHandler {
         this.questProgressConfigManager = questProgressConfigManager;
     }
 
+    public void setWorldHopClient(Client client, ClientThread clientThread) {
+        this.rlClient = client;
+        this.rlClientThread = clientThread;
+    }
+
+    public void setCompetitorWorldHopEnabled(BooleanSupplier enabled) {
+        if (enabled != null) {
+            this.competitorWorldHopEnabled = enabled;
+        }
+    }
+
     private String tryLocalRsnForQuest() {
         try {
             IPlayer lp = Players.getLocal();
@@ -950,6 +1134,146 @@ public class ImpsHandler {
     }
 
     /** True als dit NPC het geconfigureerde imp-doelwit is (ID of naam \"Imp\"). */
+    private boolean impsCompetitorWorldHopEnabled() {
+        if (competitorWorldHopEnabled != null) {
+            try {
+                return competitorWorldHopEnabled.getAsBoolean();
+            } catch (Exception ignored) {
+            }
+        }
+        return config.impsCompetitorWorldHop();
+    }
+
+    private boolean hasOtherPlayerOnImpInHuntArea(IPlayer local) {
+        if (local == null) {
+            return false;
+        }
+        try {
+            List<INPC> contested = NPCs.getAll(npc ->
+                    isImpNpc(npc)
+                            && !npc.isDead()
+                            && isInHuntingArea(npc.getWorldLocation())
+                            && NpcCombatTargetHelper.isNpcInCombatWithOther(npc, local));
+            return contested != null && !contested.isEmpty();
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private Client resolveRlClient() {
+        if (rlClient != null) {
+            return rlClient;
+        }
+        try {
+            Object wrapped = net.storm.sdk.game.Client.getClient().getWrapped();
+            if (wrapped instanceof Client) {
+                rlClient = (Client) wrapped;
+                return rlClient;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private void clearPendingImpsWorldHop() {
+        pendingImpsHopTargetWorld = -1;
+        pendingImpsHopStartWorld = -1;
+        pendingImpsHopRetryCount = 0;
+        pendingImpsHopRequestedMs = 0L;
+    }
+
+    private int processPendingImpsWorldHop() {
+        if (pendingImpsHopTargetWorld <= 0 || pendingImpsHopRequestedMs <= 0L) {
+            return 0;
+        }
+        if (AccountSwitchWorldHop.tryAcceptWorldHopConfirmation()) {
+            return antiBan.varyDelay(randomDelay(400, 800));
+        }
+        Client rl = resolveRlClient();
+        if (rl == null) {
+            return antiBan.varyDelay(randomDelay(1200, 2000));
+        }
+        if (AccountSwitchWorldHop.isWorldRecentlyRejected(pendingImpsHopTargetWorld)) {
+            int retry = AccountSwitchWorldHop.pickRandomF2pWorldId(rl);
+            if (retry > 0 && retry != pendingImpsHopTargetWorld
+                    && AccountSwitchWorldHop.scheduleHopToWorld(rl, rlClientThread, retry)) {
+                pendingImpsHopStartWorld = rl.getWorld();
+                pendingImpsHopTargetWorld = retry;
+                pendingImpsHopRetryCount = 0;
+                pendingImpsHopRequestedMs = System.currentTimeMillis();
+                paint.setCurrentStatus("Imps: 🌍 Andere wereld (w" + retry + ")…");
+                return antiBan.varyDelay(randomDelay(2000, 3500));
+            }
+        }
+        GameState gs = rl.getGameState();
+        if (gs == GameState.HOPPING) {
+            paint.setCurrentStatus("Imps: 🌍 Wereld wisselen (laden)…");
+            return antiBan.varyDelay(randomDelay(1100, 2000));
+        }
+        int cur = rl.getWorld();
+        if (cur == pendingImpsHopTargetWorld
+                || (pendingImpsHopStartWorld > 0 && cur != pendingImpsHopStartWorld)) {
+            clearPendingImpsWorldHop();
+            return 0;
+        }
+        long since = System.currentTimeMillis() - pendingImpsHopRequestedMs;
+        paint.setCurrentStatus("Imps: 🌍 Wereld wisselen → w" + pendingImpsHopTargetWorld + "…");
+        if (since < IMPS_HOP_VERIFY_TIMEOUT_MS) {
+            return antiBan.varyDelay(randomDelay(900, 1600));
+        }
+        if (pendingImpsHopRetryCount >= 2) {
+            paint.setLastAntiBanAction("Imps: 🌍 hop timeout — later opnieuw");
+            clearPendingImpsWorldHop();
+            return antiBan.varyDelay(randomDelay(1500, 2600));
+        }
+        pendingImpsHopRetryCount++;
+        pendingImpsHopRequestedMs = System.currentTimeMillis();
+        if (AccountSwitchWorldHop.scheduleHopToWorld(rl, rlClientThread, pendingImpsHopTargetWorld)) {
+            paint.setLastAntiBanAction("Imps: 🌍 hop retry " + pendingImpsHopRetryCount
+                    + " → w" + pendingImpsHopTargetWorld);
+        }
+        return antiBan.varyDelay(randomDelay(2000, 3500));
+    }
+
+    private int tryImpsCompetitorWorldHop(IPlayer local) {
+        if (!impsCompetitorWorldHopEnabled() || !hasOtherPlayerOnImpInHuntArea(local)) {
+            return 0;
+        }
+        return tryScheduleImpsWorldHop("andere speler op imp");
+    }
+
+    private int tryScheduleImpsWorldHop(String reason) {
+        Client rl = resolveRlClient();
+        if (rl == null) {
+            return 0;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastImpsWorldHopMs < IMPS_WORLD_HOP_COOLDOWN_MS && pendingImpsHopTargetWorld <= 0) {
+            return 0;
+        }
+        try {
+            int target = AccountSwitchWorldHop.pickRandomF2pWorldId(rl);
+            if (!AccountSwitchWorldHop.scheduleHopToWorld(rl, rlClientThread, target)) {
+                return 0;
+            }
+            pendingImpsHopStartWorld = rl.getWorld();
+            pendingImpsHopTargetWorld = target;
+            pendingImpsHopRetryCount = 0;
+            pendingImpsHopRequestedMs = now;
+            lastImpsWorldHopMs = now;
+            walkingToHuntArea = false;
+            pickingUpLoot = false;
+            currentTarget = null;
+            isRoaming = false;
+            paint.setLastAntiBanAction("Imps: 🌍 " + reason + " → w" + target);
+            paint.setCurrentStatus("Imps: 🌍 Wereld wisselen (concurrentie)");
+            chatLog("🌍 Wereld-hop: " + reason + " (w" + pendingImpsHopStartWorld + " → w" + target + ")");
+            return antiBan.varyDelay(randomDelay(2500, 4000));
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     private boolean isImpNpc(INPC npc) {
         if (npc == null) {
             return false;
@@ -1016,11 +1340,21 @@ public class ImpsHandler {
         teleportRuneWithdrawAttempts = 0;
         meleeOpenerAirWithdrawAttempts = 0;
         meleeOpenerMindWithdrawAttempts = 0;
+        gearPrepLastArrowWithdrawName = "";
+        gearPrepArrowWithdrawStreak = 0;
+        gearPrepLastArmourWithdrawKey = "";
+        gearPrepArmourWithdrawStreak = 0;
+        gearPrepArmourBatchWithdrawDone = false;
+        gearPrepInvEquipPhase = false;
         // Alleen overslaan als ook genoeg coins op zak (boot Musa Point = 30 gp; starter-bridge gebruikt zelfde minimum).
         // Anders markeerde we gear als "klaar" zonder gp → handleInsufficientCoinsForBoatFare sloeg bank-trek over.
         if (style != CombatBotConfig.ImpsCombatStyle.MELEE
-                && hasAdequateGearForStyle(style)
-                && getCoinCount() >= impsRuntimeMinCoins()) {
+                && hasCombatReadyGearForStyle(style)
+                && getCoinCount() >= impsRuntimeMinCoins()
+                && Inventory.getFreeSlots() >= minFreeSlotsRequiredForGearPrep(style)) {
+            if (style == CombatBotConfig.ImpsCombatStyle.MAGE) {
+                equipGear(CombatBotConfig.ImpsCombatStyle.MAGE);
+            }
             gearPrepComplete = true;
             preparingGear = false;
             chatLog("[OK] Gear voor " + style + " al aanwezig en genoeg gp (" + getCoinCount() + "), geen preparation nodig.");
@@ -1060,19 +1394,256 @@ public class ImpsHandler {
     }
 
     private boolean hasMageCombatReady() {
-        CombatBotConfig.ImpsMageSpell spell = getActiveMageSpell();
-        boolean hasStaffEquipped = Equipment.contains(item -> {
-            if (item == null || item.getName() == null) return false;
-            return item.getName().toLowerCase(Locale.ROOT).contains("staff");
-        });
-        boolean hasStaffInInv = Inventory.contains(item -> {
-            if (item == null || item.getName() == null) return false;
-            return item.getName().toLowerCase(Locale.ROOT).contains("staff");
-        });
-        if (!hasStaffEquipped && !hasStaffInInv) {
+        if (!isStaffEquippedForMage()) {
             return false;
         }
         return hasRunesForAtLeastOneCast();
+    }
+
+    private boolean isStaffEquippedForMage() {
+        return Equipment.contains(item -> item != null && item.getName() != null
+                && item.getName().toLowerCase(Locale.ROOT).contains("staff"));
+    }
+
+    /** Mage gear prep: melee niet in keep-list (fallback MELEE in config telt dan niet). */
+    private boolean isStrictMageGearPrep() {
+        return preparingGear
+                && getEffectiveStyle() == CombatBotConfig.ImpsCombatStyle.MAGE
+                && !fallbackStyleActive;
+    }
+
+    private boolean shouldRetainMeleeWeaponsDuringGearPrep() {
+        if (isStrictMageGearPrep()) {
+            return false;
+        }
+        CombatBotConfig.ImpsCombatStyle style = getEffectiveStyle();
+        CombatBotConfig.ImpsCombatStyle fallback = config.impsFallbackStyle();
+        return style == CombatBotConfig.ImpsCombatStyle.MELEE
+                || (fallbackStyleActive && fallback == CombatBotConfig.ImpsCombatStyle.MELEE);
+    }
+
+    /** Imps melee: geen armor (gewicht) — alleen wapen + coins/runes. */
+    private boolean impsMeleeSkipsArmour() {
+        return getEffectiveStyle() == CombatBotConfig.ImpsCombatStyle.MELEE;
+    }
+
+    private boolean impsMeleeSkipsArmour(CombatBotConfig.ImpsCombatStyle style) {
+        return style == CombatBotConfig.ImpsCombatStyle.MELEE;
+    }
+
+    /**
+     * Bank open: melee-armor uit inv/equipment wegleggen (imps rennen veel, imps zijn zwak).
+     * @return delay &gt; 0 als actie gedaan
+     */
+    private int bankImpsMeleeArmourIfNeeded() {
+        if (!impsMeleeSkipsArmour() || !Bank.isOpen()) {
+            return 0;
+        }
+        for (net.storm.api.domain.items.IInventoryItem item : Inventory.getAll()) {
+            if (item == null || item.getName() == null) {
+                continue;
+            }
+            if (!StyleArmourBankHelper.isMeleeStyleArmourItemName(item.getName())) {
+                continue;
+            }
+            Bank.depositAll(item.getName());
+            chatLog("[Bank] Imps melee: armor naar bank (licht blijven): " + item.getName());
+            sleep(300, 500);
+            return antiBan.varyDelay(randomDelay(400, 700));
+        }
+        if (StyleArmourBankHelper.tryUnequipOneMeleeStyleArmourPiece()) {
+            chatLog("[Bank] Imps melee: armor uit slot (licht blijven)");
+            return antiBan.varyDelay(randomDelay(500, 900));
+        }
+        return 0;
+    }
+
+    /**
+     * Melee in wapen-slot blokkeert staff wield. Haal melee uit equipment en bank inv-melee tijdens mage prep.
+     */
+    private int clearEquippedMeleeWeaponBlockingMage() {
+        if (getEffectiveStyle() != CombatBotConfig.ImpsCombatStyle.MAGE
+                && !isStrictMageGearPrep()) {
+            return 0;
+        }
+        try {
+            var equipped = Equipment.getAll(item -> item != null && item.getName() != null
+                    && isCombatMeleeWeaponName(item.getName().toLowerCase(Locale.ROOT)));
+            if (equipped != null) {
+                for (var eq : equipped) {
+                    if (eq == null) {
+                        continue;
+                    }
+                    for (String action : new String[]{"Remove", "Unequip"}) {
+                        if (eq.hasAction(action)) {
+                            eq.interact(action);
+                            chatLog("Mage switch: melee uit slot (" + eq.getName() + ", " + action + ")");
+                            return antiBan.varyDelay(randomDelay(550, 950));
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            debugLog("clearEquippedMeleeWeaponBlockingMage: " + e.getMessage());
+        }
+        if (Bank.isOpen() && isStrictMageGearPrep()) {
+            for (String weapon : meleeWeaponUpgradeOrder()) {
+                if (Inventory.contains(weapon)) {
+                    Bank.deposit(weapon, Integer.MAX_VALUE);
+                    chatLog("Mage prep: melee wapen naar bank: " + weapon);
+                    return antiBan.varyDelay(randomDelay(500, 900));
+                }
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Sluit gear prep af: equip + voor MAGE staff verplicht gedragen; voor MELEE wapen aan.
+     * @return delay &gt; 0 als nog bezig, 0 als niet klaar, -1 als afgerond
+     */
+    private int tryCompleteGearPreparation(CombatBotConfig.ImpsCombatStyle style) {
+        if (getCoinCount() < impsRuntimeMinCoins()) {
+            return 0;
+        }
+        if (Inventory.getFreeSlots() < minFreeSlotsRequiredForGearPrep(style)) {
+            return 0;
+        }
+        if (!hasAdequateGearForStyle(style)) {
+            return 0;
+        }
+        if (style == CombatBotConfig.ImpsCombatStyle.MAGE) {
+            int clearMelee = clearEquippedMeleeWeaponBlockingMage();
+            if (clearMelee > 0) {
+                return clearMelee;
+            }
+            if (!hasMageSetup()) {
+                return 0;
+            }
+            equipGear(CombatBotConfig.ImpsCombatStyle.MAGE);
+            if (!isStaffEquippedForMage()) {
+                if (Inventory.contains(item -> item != null && item.getName() != null
+                        && item.getName().toLowerCase(Locale.ROOT).contains("staff"))) {
+                    return antiBan.varyDelay(randomDelay(700, 1100));
+                }
+                return 0;
+            }
+            selectAutocastSpell(getActiveMageSpell());
+            if (tryEquipStyleArmour(CombatBotConfig.ImpsCombatStyle.MAGE)) {
+                return antiBan.varyDelay(randomDelay(650, 1050));
+            }
+            if (isFireStrikeAirGateActive() && fireStrikeAirDepartureGateFails()) {
+                return 0;
+            }
+        } else if (style == CombatBotConfig.ImpsCombatStyle.MELEE) {
+            equipGear(CombatBotConfig.ImpsCombatStyle.MELEE);
+            if (!impsMeleeSkipsArmour(style) && tryEquipStyleArmour(style)) {
+                return antiBan.varyDelay(randomDelay(650, 1050));
+            }
+            if (!hasMeleeWeapon()) {
+                return 0;
+            }
+        } else if (style == CombatBotConfig.ImpsCombatStyle.RANGED) {
+            equipGear(CombatBotConfig.ImpsCombatStyle.RANGED);
+            if (tryEquipStyleArmour(style)) {
+                return antiBan.varyDelay(randomDelay(650, 1050));
+            }
+            if (!hasCombatReadyGearForStyle(style)) {
+                return 0;
+            }
+        }
+        if (Bank.isOpen()) {
+            Bank.close();
+            sleep(400, 700);
+        }
+        gearPrepComplete = true;
+        preparingGear = false;
+        EquipmentStylePlanner.ArmorStyle worn = EquipmentStylePlanner.inferStyleFromEquipped(
+                BankSnapshotPlanner.currentDisplayName());
+        chatLog("[OK] Gear preparation compleet voor " + style + " (uitgerust"
+                + (worn != EquipmentStylePlanner.ArmorStyle.UNKNOWN ? ", armor: " + worn : "") + ")");
+        return -1;
+    }
+
+    /**
+     * Equip-fase na één bank-withdraw: bank blijft dicht, geen {@code tryOpenBankAtGrandExchange} per armor-stuk.
+     * @return delay &gt; 0 als nog bezig, -1 als afgerond via {@link #tryCompleteGearPreparation}
+     */
+    private int handleGearPrepEquipPhase(CombatBotConfig.ImpsCombatStyle style) {
+        paint.setCurrentStatus("Imps: Gear aantrekken (bank dicht)...");
+
+        if (style == CombatBotConfig.ImpsCombatStyle.MAGE) {
+            int clearMelee = clearEquippedMeleeWeaponBlockingMage();
+            if (clearMelee > 0) {
+                return clearMelee;
+            }
+        }
+
+        boolean amuletEquipped = Equipment.contains(item -> item != null && item.getName() != null
+                && item.getName().toLowerCase(Locale.ROOT).contains("amulet"));
+        if (!amuletEquipped) {
+            String invAmulet = bestInventoryAmuletForStyle(style);
+            if (invAmulet != null) {
+                IInventoryItem amulet = Inventory.getFirst(item -> item != null && item.getName() != null
+                        && item.getName().equalsIgnoreCase(invAmulet));
+                if (amulet != null) {
+                    InventoryActionHelper.interact(config, amulet, amulet.hasAction("Wear") ? "Wear" : "Wield");
+                    chatLog(invAmulet + " aangedaan");
+                    return antiBan.varyDelay(randomDelay(600, 1000));
+                }
+            }
+        }
+
+        equipGear(style);
+        if (!impsMeleeSkipsArmour(style) && tryEquipStyleArmour(style)) {
+            return antiBan.varyDelay(randomDelay(650, 1050));
+        }
+
+        int prepDone = tryCompleteGearPreparation(style);
+        if (prepDone == -1) {
+            gearPrepInvEquipPhase = false;
+            return randomDelay(600, 1000);
+        }
+        if (prepDone > 0) {
+            return prepDone;
+        }
+
+        if (hasAdequateGearForStyle(style) && getCoinCount() >= impsRuntimeMinCoins()) {
+            chatLog("[!] Gear prep equip-fase: items op zak maar equip mislukt — bank opnieuw");
+        }
+        gearPrepInvEquipPhase = false;
+        gearPrepArmourBatchWithdrawDone = false;
+        return antiBan.varyDelay(randomDelay(600, 1000));
+    }
+
+    /** Bank-withdraw klaar → sluit bank en start equip-fase. */
+    private int beginGearPrepEquipPhase(CombatBotConfig.ImpsCombatStyle style) {
+        gearPrepInvEquipPhase = true;
+        if (Bank.isOpen()) {
+            Bank.close();
+            sleep(400, 700);
+        }
+        return handleGearPrepEquipPhase(style);
+    }
+
+    /** Config/account style gewijzigd (bv. melee→mage): opnieuw banken + equippen. */
+    private void maybeRestartGearPrepOnBaselineStyleChange() {
+        CombatBotConfig.ImpsCombatStyle baseline = impsCombatStyleBaselineForAccount();
+        if (lastObservedImpsBaselineStyle == null) {
+            lastObservedImpsBaselineStyle = baseline;
+            return;
+        }
+        if (baseline == lastObservedImpsBaselineStyle) {
+            return;
+        }
+        chatLog("[~] Imps combat style gewijzigd: " + lastObservedImpsBaselineStyle + " -> " + baseline
+                + " — gear prep opnieuw");
+        lastObservedImpsBaselineStyle = baseline;
+        effectiveStyle = null;
+        fallbackStyleActive = false;
+        mageAutocastAppliedFor = null;
+        preparingGear = true;
+        gearPrepComplete = false;
     }
 
     private boolean hasMeleeWeapon() {
@@ -1108,7 +1679,11 @@ public class ImpsHandler {
         if (inventoryOrEquipBestRangedBowProgressRank() >= Integer.MAX_VALUE) {
             return false;
         }
-        return getTotalArrows() >= 100;
+        return hasRangedAmmoSufficientForTrip();
+    }
+
+    private boolean hasRangedAmmoSufficientForTrip() {
+        return getImpsEffectiveArrowCount() >= GEAR_PREP_MIN_ARROWS;
     }
 
     private boolean hasMageSetup() {
@@ -1715,6 +2290,69 @@ public class ImpsHandler {
         return preparingGear && !gearPrepComplete;
     }
 
+    private static int minX(WorldPoint a, WorldPoint b, WorldPoint c, WorldPoint d) {
+        return Math.min(Math.min(a.getX(), b.getX()), Math.min(c.getX(), d.getX()));
+    }
+
+    private static int maxX(WorldPoint a, WorldPoint b, WorldPoint c, WorldPoint d) {
+        return Math.max(Math.max(a.getX(), b.getX()), Math.max(c.getX(), d.getX()));
+    }
+
+    private static int minY(WorldPoint a, WorldPoint b, WorldPoint c, WorldPoint d) {
+        return Math.min(Math.min(a.getY(), b.getY()), Math.min(c.getY(), d.getY()));
+    }
+
+    private static int maxY(WorldPoint a, WorldPoint b, WorldPoint c, WorldPoint d) {
+        return Math.max(Math.max(a.getY(), b.getY()), Math.max(c.getY(), d.getY()));
+    }
+
+    /** Musa Point / Karamja eiland — binnen {@link #KARAMJA_BOX_CORNER_1}…{@link #KARAMJA_BOX_CORNER_4} box. */
+    public static boolean isOnKaramja(WorldPoint pos) {
+        if (pos == null || pos.getPlane() != 0) {
+            return false;
+        }
+        int x = pos.getX();
+        int y = pos.getY();
+        return x >= KARAMJA_REGION_MIN_X && x <= KARAMJA_REGION_MAX_X
+                && y >= KARAMJA_REGION_MIN_Y && y <= KARAMJA_REGION_MAX_Y;
+    }
+
+    public static boolean isOnKaramja(IPlayer local) {
+        return local != null && isOnKaramja(local.getWorldLocation());
+    }
+
+    /**
+     * Gedeeld Karamja → Port Sarim: zelfde boot als loot-dump ({@link #travelFromKaramjaToPortSarim} + Travel).
+     * Voor skill-wissel / gear prep op mainland — geen gear-prep Home-tele shortcut.
+     *
+     * @return tick-delay &gt; 0 als actie gestart; 0 als speler niet op Karamja
+     */
+    public int travelToPortSarimFromKaramja(IPlayer local) {
+        if (!isOnKaramja(local)) {
+            karamjaSharedBoatTrip = false;
+            return 0;
+        }
+        WorldPoint pos = local.getWorldLocation();
+        // Zelfde state-reset als handleBankingTrip op Karamja (loot-dump)
+        gearPrepKaramjaUseHomeTele = false;
+        gearPrepKaramjaBoatFailStreak = 0;
+        karamjaSharedBoatTrip = true;
+        return travelFromKaramjaToPortSarim(local, pos, true);
+    }
+
+    /** {@code true} tijdens gedeelde Karamja-boot (gear prep / skill-wissel / BankHelper) — zelfde {@link #payFare()} als loot-dump. */
+    private boolean karamjaSharedBoatTrip = false;
+
+    private boolean isLootDumpStyleKaramjaBoat() {
+        return isBankingTrip || karamjaSharedBoatTrip;
+    }
+
+    private void clearKaramjaSharedBoatIfMainland(WorldPoint pos) {
+        if (pos != null && !isOnKaramja(pos)) {
+            karamjaSharedBoatTrip = false;
+        }
+    }
+
     /**
      * Start banking van beads/talisman voor skill rotatie.
      */
@@ -1735,6 +2373,7 @@ public class ImpsHandler {
         try {
             IPlayer local = Players.getLocal();
             if (local == null) return 1000;
+            maybeRestartGearPrepOnBaselineStyleChange();
             if (config.impsGeSellEnabled()) {
                 paint.setImpsGeBankTripProgress(bankTripCount, Math.max(1, config.impsGeSellAfterBanks()));
             } else {
@@ -1767,6 +2406,11 @@ public class ImpsHandler {
 
             if (starterPostGeWealthCheck) {
                 return handleStarterPostGeWealthCheck(local);
+            }
+
+            int hopWait = processPendingImpsWorldHop();
+            if (hopWait > 0) {
+                return hopWait;
             }
 
             // [OK] FAILSAFE: als shouldSwitchToNormal al gezet is, stop DIRECT
@@ -1946,10 +2590,9 @@ public class ImpsHandler {
 
             // Check of we in het hunting gebied zijn (Karamja)
             WorldPoint myPos = local.getWorldLocation();
-            boolean onKaramja = myPos.getY() < 3200;
+            boolean onKaramja = isOnKaramja(myPos);
             if (onKaramja) {
-                lastBoatTowardKaramjaInteractMs = 0L;
-                awaitingPortSarimToKaramjaCrossing = false;
+                resetPortSarimBoatCrossingState();
             } else {
                 karamjaPortBoatNpcMissingSinceMs = 0L;
             }
@@ -1982,6 +2625,14 @@ public class ImpsHandler {
                 return payFareBack();
             }
 
+            if (!preparingGear && !isBankingTrip && !isSellingAtGe && !coinRecoveryMode
+                    && !isBuyingLawRunesAtGe && !isBuyingAmmoAtGe) {
+                int competitorHop = tryImpsCompetitorWorldHop(local);
+                if (competitorHop > 0) {
+                    return competitorHop;
+                }
+            }
+
             // Check of we in het hunting gebied zijn
             WorldPoint huntArea = getHuntingArea();
             int huntRadius = getHuntingRadius();
@@ -1996,15 +2647,14 @@ public class ImpsHandler {
             int arrivalRadius = Math.min(huntRadius, Math.max(1, config.impsArrivalRadius()));
             // Hysteresis tegen heen-en-weer:
             // - Buiten hunting radius: terug naar center/area lopen.
-            // - Eenmaal binnen hunting radius: NIET blijven center-chasen op arrivalRadius.
-            // - Alleen strakke arrivalRadius gebruiken als we al in "walk-to-hunt" state zitten.
+            // - Eenmaal binnen arrivalRadius: pas "aangekomen" — niet al bij dist <= huntRadius (anders jagen halverwege).
             boolean outsideHuntArea = distToHunt > (huntRadius + 1);
             if (!walkingToHuntArea && outsideHuntArea) {
                 walkingToHuntArea = true;
             }
             if (walkingToHuntArea) {
 
-                boolean atHunt = distToHunt <= arrivalRadius || distToHunt <= huntRadius;
+                boolean atHunt = distToHunt <= arrivalRadius;
                 if (atHunt) {
                     walkingToHuntArea = false;
                     chatLog("[OK] Aangekomen bij hunt-center (dist=" + distToHunt + "/" + arrivalRadius + " tiles)");
@@ -2323,6 +2973,7 @@ public class ImpsHandler {
         }
         if (RangedAmmoKit.inventoryHasUsableRangedAmmo(rngLvl)) {
             String equipped = RangedAmmoKit.tryEquipRangedAmmoFromInventoryReturningDisplayName(
+                    config,
                     rngLvl,
                     lastImpsRangedEmptyQuiverGameMessageMs,
                     (a, b) -> sleep(a, b),
@@ -2346,9 +2997,9 @@ public class ImpsHandler {
     /** Failsafe: bij MAGE moet staff gedragen zijn voor we aanvallen. Retourneert >0 om te wachten/equippen/naar bank. */
     private int ensureStaffEquippedBeforeAttack(IPlayer local) {
         if (getEffectiveStyle() != CombatBotConfig.ImpsCombatStyle.MAGE) return 0;
-        boolean staffEquipped = Equipment.contains(item ->
-                item != null && item.getName() != null && item.getName().toLowerCase().contains("staff"));
-        if (staffEquipped) return 0;
+        if (isStaffEquippedForMage()) return 0;
+        int clearMelee = clearEquippedMeleeWeaponBlockingMage();
+        if (clearMelee > 0) return clearMelee;
         boolean staffInInv = Inventory.contains(item ->
                 item != null && item.getName() != null && item.getName().toLowerCase().contains("staff"));
         if (staffInInv) {
@@ -2979,7 +3630,7 @@ public class ImpsHandler {
                 item != null && item.getName() != null && isWizardHatLootName(item.getName()));
         if (hat == null) return;
         String action = hat.hasAction("Wear") ? "Wear" : (hat.hasAction("Wield") ? "Wield" : "Wear");
-        hat.interact(action);
+        InventoryActionHelper.interact(config, hat, action);
         debugLog((hat.getName() != null ? hat.getName() : "Wizard hat") + " equipped: " + action);
         sleep(600, 1000);
     }
@@ -3136,7 +3787,7 @@ public class ImpsHandler {
     private int handleScatterAshes() {
         IInventoryItem ashes = Inventory.getFirst("Fiendish ashes");
         if (ashes != null) {
-            ashes.interact("Scatter");
+            InventoryActionHelper.interact(config, ashes, "Scatter");
             if (scatterAshesRemainingThisBatch > 0) {
                 scatterAshesRemainingThisBatch--;
             }
@@ -3189,20 +3840,10 @@ public class ImpsHandler {
         }
         switch (style) {
             case RANGED: {
-                int totalArrows = getTotalArrows();
-                if (totalArrows < 100) {
-                    debugLog("checkIfRestockNeeded: arrows " + totalArrows + " < 100");
-                    return true;
-                }
-                int rngLvl;
-                try {
-                    rngLvl = Skills.getLevel(Skill.RANGED);
-                } catch (Exception e) {
-                    rngLvl = 1;
-                }
-                if (RangedAmmoKit.getEquippedRangedAmmoQuantity() <= 0
-                        && !RangedAmmoKit.inventoryHasUsableRangedAmmo(rngLvl)) {
-                    debugLog("checkIfRestockNeeded: quiver leeg en geen equippable arrows in inv (totaal=" + totalArrows + ")");
+                if (!hasRangedAmmoSufficientForTrip()) {
+                    debugLog("checkIfRestockNeeded: ranged ammo < " + GEAR_PREP_MIN_ARROWS
+                            + " (effectief=" + getImpsEffectiveArrowCount()
+                            + ", pref=" + RangedAmmoPreference.preferredItemName(config) + ")");
                     return true;
                 }
                 break;
@@ -3328,7 +3969,7 @@ public class ImpsHandler {
         try {
             IPlayer lp = Players.getLocal();
             if (starterSkillBridge && starterBridgeFirstGeCyclePending && lp != null
-                    && lp.getWorldLocation() != null && lp.getWorldLocation().getY() < 3200) {
+                    && lp.getWorldLocation() != null && isOnKaramja(lp.getWorldLocation())) {
                 onKaramjaStarterFirst = true;
             }
         } catch (Throwable ignored) {
@@ -3376,38 +4017,53 @@ public class ImpsHandler {
         return false;
     }
 
+    private void addGearPrepKeepName(List<String> keep, String name) {
+        if (name == null || name.isEmpty()) {
+            return;
+        }
+        for (String k : keep) {
+            if (k != null && k.equalsIgnoreCase(name)) {
+                return;
+            }
+        }
+        keep.add(name);
+    }
+
     /** Gear prep: houd ALLEEN strikt benodigde items; de rest moet naar bank. */
     private List<String> getGearPrepKeepNames() {
         List<String> keep = new ArrayList<>(getFullKeepList());
-        if (!keep.contains("Coins")) keep.add("Coins");
-        if (getEffectiveStyle() != CombatBotConfig.ImpsCombatStyle.MAGE) return keep;
-        CombatBotConfig.ImpsMageSpell spell = getActiveMageSpell();
-        if (spell == null) return keep;
-        String pref = spell.getPreferredStaff();
-        if (pref != null) {
-            pref = pref.trim();
-            if (!pref.isEmpty()) {
-                boolean found = false;
-                for (String k : keep) {
-                    if (k != null && k.equalsIgnoreCase(pref)) { found = true; break; }
-                }
-                if (!found) keep.add(pref);
+        addGearPrepKeepName(keep, "Coins");
+        CombatBotConfig.ImpsCombatStyle prepStyle = getEffectiveStyle();
+        if (!impsMeleeSkipsArmour(prepStyle)) {
+            for (String armourName : StyleArmourBankHelper.armourItemNamesForStyle(prepStyle)) {
+                addGearPrepKeepName(keep, armourName);
             }
         }
-        String el = spell.getElementalRune();
-        if (el == null) return keep;
-        el = el.toLowerCase().replace(" rune", "");
-        String[] staves = el.equals("air") ? new String[]{"Staff of air", "Mystic air staff", "Air staff"}
-                : el.equals("fire") ? new String[]{"Staff of fire", "Mystic fire staff", "Fire staff"}
-                : el.equals("water") ? new String[]{"Staff of water", "Mystic water staff", "Water staff"}
-                : el.equals("earth") ? new String[]{"Staff of earth", "Mystic earth staff", "Earth staff"}
-                : new String[0];
-        for (String st : staves) {
-            boolean found = false;
-            for (String k : keep) {
-                if (k != null && k.equalsIgnoreCase(st)) { found = true; break; }
+        if (prepStyle == CombatBotConfig.ImpsCombatStyle.RANGED) {
+            for (String bow : RANGED_BOW_BEST_FIRST) {
+                addGearPrepKeepName(keep, bow);
             }
-            if (!found) keep.add(st);
+        }
+        if (prepStyle == CombatBotConfig.ImpsCombatStyle.MAGE) {
+            CombatBotConfig.ImpsMageSpell spell = getActiveMageSpell();
+            if (spell != null) {
+                String pref = spell.getPreferredStaff();
+                if (pref != null) {
+                    addGearPrepKeepName(keep, pref.trim());
+                }
+                String el = spell.getElementalRune();
+                if (el != null) {
+                    el = el.toLowerCase().replace(" rune", "");
+                    String[] staves = el.equals("air") ? new String[]{"Staff of air", "Mystic air staff", "Air staff"}
+                            : el.equals("fire") ? new String[]{"Staff of fire", "Mystic fire staff", "Fire staff"}
+                            : el.equals("water") ? new String[]{"Staff of water", "Mystic water staff", "Water staff"}
+                            : el.equals("earth") ? new String[]{"Staff of earth", "Mystic earth staff", "Earth staff"}
+                            : new String[0];
+                    for (String st : staves) {
+                        addGearPrepKeepName(keep, st);
+                    }
+                }
+            }
         }
         return keep;
     }
@@ -3442,8 +4098,21 @@ public class ImpsHandler {
         if (item.getId() == GENIE_LAMP_ITEM_ID) return true;
         String name = item.getName();
 
-        // Houd altijd currently equipped gear aan (veilig).
+        String lower = name.toLowerCase();
+        boolean isMeleeWeapon = isCombatMeleeWeaponName(lower);
+        if (isMeleeWeapon && !shouldRetainMeleeWeaponsDuringGearPrep()) {
+            return false;
+        }
+
+        // Equipped gear behouden, behalve melee-wapen tijdens strikte mage prep / imps-melee armor.
         if (Equipment.contains(eq -> eq != null && eq.getName() != null && eq.getName().equalsIgnoreCase(name))) {
+            if (isMeleeWeapon && isStrictMageGearPrep()) {
+                return false;
+            }
+            if (impsMeleeSkipsArmour()
+                    && StyleArmourBankHelper.isMeleeStyleArmourItemName(name)) {
+                return false;
+            }
             return true;
         }
 
@@ -3453,24 +4122,27 @@ public class ImpsHandler {
         }
 
         // Houd alleen wapens die bij huidige/fallback Imps combat style passen.
-        String lower = name.toLowerCase();
         CombatBotConfig.ImpsCombatStyle style = getEffectiveStyle();
         CombatBotConfig.ImpsCombatStyle fallback = config.impsFallbackStyle();
-        boolean keepMeleeWeapon = style == CombatBotConfig.ImpsCombatStyle.MELEE || fallback == CombatBotConfig.ImpsCombatStyle.MELEE;
+        boolean keepMeleeWeapon = shouldRetainMeleeWeaponsDuringGearPrep();
         boolean keepRangedWeapon = style == CombatBotConfig.ImpsCombatStyle.RANGED || fallback == CombatBotConfig.ImpsCombatStyle.RANGED;
         boolean keepMageWeapon = style == CombatBotConfig.ImpsCombatStyle.MAGE || fallback == CombatBotConfig.ImpsCombatStyle.MAGE;
 
-        boolean isMeleeWeapon = isCombatMeleeWeaponName(lower);
         if (isMeleeWeapon && keepMeleeWeapon) return true;
         if (isRangedBowItemName(name) && keepRangedWeapon) return true;
         if ((lower.contains("staff") || lower.contains("wand")) && keepMageWeapon) return true;
 
-        // Armor/amulet/cape etc. mag wel blijven.
+        if (impsMeleeSkipsArmour() && StyleArmourBankHelper.isMeleeStyleArmourItemName(name)) {
+            return false;
+        }
+
+        // Armor/amulet/cape etc. mag wel blijven (niet imps-melee armor — zie hierboven).
         if (lower.contains("shield") || lower.contains("defender")
                 || lower.contains("helm") || lower.contains("hat") || lower.contains("hood")
                 || lower.contains("plate") || lower.contains("chain") || lower.contains("robe")
                 || lower.contains("legs") || lower.contains("skirt") || lower.contains("chaps")
-                || lower.contains("boots") || lower.contains("gloves") || lower.contains("vambraces")
+                || (lower.contains("boots") && !StyleArmourBankHelper.isCosmeticOrNonCombatFootwear(name))
+                || lower.contains("gloves") || lower.contains("vambraces")
                 || lower.contains("cape") || lower.contains("cloak") || lower.contains("amulet")
                 || lower.contains("necklace") || lower.contains("ring") || lower.contains("bracelet")
                 || lower.contains("quiver") || lower.contains("body")) {
@@ -3486,8 +4158,12 @@ public class ImpsHandler {
     private static final int MAX_DEPOSIT_BOX_FAILS = 5;
 
     private int handleBankingTrip(IPlayer local) {
+        // Loot-dump boot: nooit gear-prep Home-tele-fallback state meenemen
+        gearPrepKaramjaUseHomeTele = false;
+        gearPrepKaramjaBoatFailStreak = 0;
+
         WorldPoint myPos = local.getWorldLocation();
-        boolean onKaramja = myPos.getY() < 3200;
+        boolean onKaramja = isOnKaramja(myPos);
 
         debugLog("handleBankingTrip() pos=" + myPos.getX() + "," + myPos.getY() + " karamja=" + onKaramja);
 
@@ -3531,60 +4207,7 @@ public class ImpsHandler {
         }
 
         if (onKaramja) {
-            // Terugboot Musa Point → Port Sarim kost BOAT_FARE gp. Zonder dat bedrag dock niet stalken:
-            // dat veroorzaakte een loop (dock ↔ coin-recovery/goblins).
-            if (getCoinCount() < BOAT_FARE) {
-                chatLog("[bank-trip] Op Karamja zonder " + BOAT_FARE + " gp voor terugboot (" + getCoinCount()
-                        + ") — geen dock-lopen; coin-recovery / GE.");
-                isBankingTrip = false;
-                isRestocking = false;
-                return handleInsufficientCoinsForBoatFare(local);
-            }
-            int distToDock = myPos.distanceTo(KARAMJA_DOCK_NPC);
-            if (distToDock > 10) {
-                long now = System.currentTimeMillis();
-                boolean canReclick = (now - lastWalkClickTime) > WALK_RECLICK_INTERVAL_MS;
-                if (!canReclick && local.isMoving()) {
-                    paint.setCurrentStatus("Imps: -> Karamja dock (" + distToDock + " tiles)"
-                            + (preferAlternateKaramjaDockRoute ? " alt" : ""));
-                    return antiBan.varyDelay(randomDelay(800, 1400));
-                }
-                paint.setCurrentStatus("Imps: -> Karamja dock (" + distToDock + " tiles)"
-                        + (preferAlternateKaramjaDockRoute ? " alt" : ""));
-                // Uitzondering: naar dock mag we door scorpion-zone - ren er doorheen
-                if (isPointInScorpionRadius(myPos)) {
-                    ensureRunEnabledForScorpionZone();
-                }
-                WorldPoint dockTarget = KARAMJA_DOCK_NPC;
-                if (preferAlternateKaramjaDockRoute
-                        && distToDock > 18
-                        && myPos.distanceTo(KARAMJA_DOCK_ALT_WAYPOINT) > 4) {
-                    dockTarget = KARAMJA_DOCK_ALT_WAYPOINT;
-                }
-                int stepMin = configuredImpsStepMin();
-                int stepMax = configuredImpsStepMax(stepMin);
-
-                if (distToDock > stepMax) {
-                    int dx = dockTarget.getX() - myPos.getX();
-                    int dy = dockTarget.getY() - myPos.getY();
-                    double dist = Math.sqrt(dx * dx + dy * dy);
-                    int stepLen = Math.min(distToDock - 1, randomDelay(stepMin, stepMax));
-                    int stepX = myPos.getX() + (int) (dx / dist * stepLen);
-                    int stepY = myPos.getY() + (int) (dy / dist * stepLen);
-                    WorldPoint stepToDock = new WorldPoint(stepX, stepY, dockTarget.getPlane());
-                    if (isPointInScorpionRadius(stepToDock)) {
-                        ensureRunEnabledForScorpionZone();
-                    }
-                    MovementHelper.walkTo(stepToDock);
-                } else {
-                    MovementHelper.walkTo(dockTarget);
-                }
-
-                lastWalkClickTime = now;
-                return antiBan.varyDelay(randomDelay(1500, 2500));
-            }
-            paint.setCurrentStatus("Imps: [boat] Boot naar Port Sarim");
-            return payFare();
+            return travelFromKaramjaToPortSarim(local, myPos, true);
         }
 
         // ===================== SCENARIO A: RESTOCK -> Volwaardige bank =====================
@@ -3903,10 +4526,9 @@ public class ImpsHandler {
         // Stap 3: Supplies aanvullen op basis van combat style
         switch (style) {
             case RANGED: {
-                int totalArrows = getTotalArrows();
+                int totalArrows = getImpsEffectiveArrowCount();
                 if (totalArrows < 500) {
-                    String[] arrowTypes = {"Rune arrow", "Adamant arrow", "Mithril arrow", "Steel arrow", "Iron arrow", "Bronze arrow"};
-                    for (String arrow : arrowTypes) {
+                    for (String arrow : RangedAmmoPreference.withdrawOrder(config)) {
                         if (Bank.contains(arrow)) {
                             Bank.withdraw(arrow, Integer.MAX_VALUE);
                             chatLog("Restock: alle " + arrow + " opgehaald");
@@ -3923,9 +4545,9 @@ public class ImpsHandler {
                     sleep(400, 700);
                     return antiBan.varyDelay(randomDelay(400, 800));
                 }
-                if (withdrawBestRangedArmorPieceFromBank()) {
-                    sleep(400, 700);
-                    return antiBan.varyDelay(randomDelay(400, 800));
+                int restockArmour = handleStyleArmourAtBank(CombatBotConfig.ImpsCombatStyle.RANGED);
+                if (restockArmour > 0) {
+                    return restockArmour;
                 }
                 break;
             }
@@ -4085,32 +4707,47 @@ public class ImpsHandler {
         if (name == null || name.isEmpty()) return false;
         IInventoryItem lamp = Inventory.getFirst(item -> item != null && item.getId() == GENIE_LAMP_ITEM_ID);
         if (lamp != null && lamp.getName() != null && lamp.getName().equalsIgnoreCase(name)) return true;
+        String lower = name.toLowerCase();
+        boolean isMeleeWeapon = isCombatMeleeWeaponName(lower);
+        if (isMeleeWeapon && !shouldRetainMeleeWeaponsDuringGearPrep()) {
+            return false;
+        }
         if (Equipment.contains(eq -> eq != null && eq.getName() != null && eq.getName().equalsIgnoreCase(name))) {
+            if (isMeleeWeapon && isStrictMageGearPrep()) {
+                return false;
+            }
+            if (impsMeleeSkipsArmour()
+                    && StyleArmourBankHelper.isMeleeStyleArmourItemName(name)) {
+                return false;
+            }
             return true;
         }
         // Check tegen dynamische keep list (inclusief spell-specifieke runes)
         for (String keep : getFullKeepList()) {
             if (keep.equalsIgnoreCase(name)) return true;
         }
-        String lower = name.toLowerCase();
         // Alle runes behouden
         if (lower.endsWith(" rune") || lower.equals("rune")) return true;
         CombatBotConfig.ImpsCombatStyle style = getEffectiveStyle();
         CombatBotConfig.ImpsCombatStyle fallback = config.impsFallbackStyle();
-        boolean keepMeleeWeapon = style == CombatBotConfig.ImpsCombatStyle.MELEE || fallback == CombatBotConfig.ImpsCombatStyle.MELEE;
+        boolean keepMeleeWeapon = shouldRetainMeleeWeaponsDuringGearPrep();
         boolean keepRangedWeapon = style == CombatBotConfig.ImpsCombatStyle.RANGED || fallback == CombatBotConfig.ImpsCombatStyle.RANGED;
         boolean keepMageWeapon = style == CombatBotConfig.ImpsCombatStyle.MAGE || fallback == CombatBotConfig.ImpsCombatStyle.MAGE;
-        boolean isMeleeWeapon = isCombatMeleeWeaponName(lower);
         if (isMeleeWeapon && keepMeleeWeapon) return true;
         if (isRangedBowItemName(name) && keepRangedWeapon) return true;
         if ((lower.contains("staff") || lower.contains("wand")) && keepMageWeapon) return true;
+
+        if (impsMeleeSkipsArmour() && StyleArmourBankHelper.isMeleeStyleArmourItemName(name)) {
+            return false;
+        }
 
         return lower.contains("arrow")
                 || lower.contains("shield") || lower.contains("defender")
                 || lower.contains("helm") || lower.contains("hat") || lower.contains("hood")
                 || lower.contains("plate") || lower.contains("chain") || lower.contains("robe")
                 || lower.contains("legs") || lower.contains("skirt") || lower.contains("chaps")
-                || lower.contains("boots") || lower.contains("gloves") || lower.contains("vambraces")
+                || (lower.contains("boots") && !StyleArmourBankHelper.isCosmeticOrNonCombatFootwear(name))
+                || lower.contains("gloves") || lower.contains("vambraces")
                 || lower.contains("cape") || lower.contains("cloak") || lower.contains("amulet")
                 || lower.contains("necklace") || lower.contains("ring") || lower.contains("bracelet")
                 || lower.contains("quiver") || lower.contains("body");
@@ -4122,20 +4759,40 @@ public class ImpsHandler {
      * om loot te dumpen (deposit box) of naar een volwaardige bank te gaan. Daarna weer naar Karamja via {@link #payFareBack()}.
      */
     private int payFare() {
+        IPlayer localEarly = Players.getLocal();
+        WorldPoint myEarly = localEarly != null ? localEarly.getWorldLocation() : null;
+        clearKaramjaSharedBoatIfMainland(myEarly);
+        if (!isLootDumpStyleKaramjaBoat() && preparingGear && gearPrepKaramjaUseHomeTele
+                && myEarly != null && isOnKaramja(myEarly)) {
+            return gearPrepExitKaramjaViaHomeTeleport(localEarly, myEarly);
+        }
+
+        int dialogDelay = tryHandleBoatTravelDialog();
+        if (dialogDelay > 0) {
+            return dialogDelay;
+        }
+
         long now = System.currentTimeMillis();
-        // Voorkom dubbel-klikken op de sailor terwijl we al een travel-actie hebben gestart
+        // Voorkom dubbel-klikken op Customs terwijl oversteek loopt
         if (now - lastBoatClickTime < BOAT_CLICK_COOLDOWN_MS) {
-            IPlayer local = Players.getLocal();
-            if (local != null && local.isMoving()) {
+            IPlayer localCooldown = Players.getLocal();
+            if (localCooldown != null && localCooldown.isMoving()) {
                 return antiBan.varyDelay(randomDelay(800, 1400));
+            }
+            if (myEarly != null && isOnKaramja(myEarly)) {
+                paint.setCurrentStatus("Imps: [boat] Wacht op oversteek…");
+                return antiBan.varyDelay(randomDelay(1200, 2000));
             }
         }
 
-        INPC travelNpc = findTravelNpc();
+        IPlayer local = Players.getLocal();
+        WorldPoint my = local != null ? local.getWorldLocation() : null;
+
+        INPC travelNpc = findKaramjaCustomsOfficer();
 
         if (travelNpc != null) {
             karamjaPortBoatNpcMissingSinceMs = 0L;
-            chatLog("[boat] Karamja → Port Sarim (loot/bank-trip) — NPC: " + travelNpc.getName());
+            chatLog("[boat] Karamja → Port Sarim — NPC: " + travelNpc.getName());
             lastBoatClickTime = now;
             if (travelNpc.hasAction("Travel")) {
                 travelNpc.interact("Travel");
@@ -4144,38 +4801,160 @@ public class ImpsHandler {
             } else {
                 travelNpc.interact("Talk-to");
             }
+            if (!isLootDumpStyleKaramjaBoat() && preparingGear) {
+                gearPrepKaramjaBoatFailStreak = 0;
+            }
             return antiBan.varyDelay(randomDelay(3000, 5000));
         }
 
         // NOOIT gangplank/crossplank gebruiken!
-        maybeLogBoatMissingNpcDebug("[boat] Geen boot-NPC bij Karamja-dock — dichter lopen…");
-        IPlayer local = Players.getLocal();
-        WorldPoint my = local != null ? local.getWorldLocation() : null;
+        maybeLogBoatMissingNpcDebug("[boat] Geen Customs officer bij dock — dichter lopen…");
         if (my != null) {
-            int dDock = my.distanceTo(KARAMJA_DOCK_NPC);
+            int dDock = distanceToKaramjaBoatDock(my);
             if (dDock <= 16) {
                 if (karamjaPortBoatNpcMissingSinceMs == 0L) {
                     karamjaPortBoatNpcMissingSinceMs = now;
                 } else if (now - karamjaPortBoatNpcMissingSinceMs >= KARAMJA_BOAT_NPC_MISSING_FORCE_ALT_MS) {
                     preferAlternateKaramjaDockRoute = true;
-                    chatLog("[boat] Lang geen Customs/Seaman bij dock — alternatieve aanloop (geen loopbrug-hang)");
+                    chatLog("[boat] Lang geen Customs officer bij dock — alternatieve aanloop (geen loopbrug-hang)");
                     karamjaPortBoatNpcMissingSinceMs = now - 10_000L;
                 }
             } else {
                 karamjaPortBoatNpcMissingSinceMs = 0L;
             }
+            return walkTowardKaramjaBoatDockStepped(my, now, "");
         }
 
-        boolean canReclick = (now - lastWalkClickTime) > WALK_RECLICK_INTERVAL_MS;
-        if (local != null && local.isMoving() && !canReclick) {
+        return antiBan.varyDelay(randomDelay(1500, 2500));
+    }
+
+    private void markKaramjaHomeTeleExitPending() {
+        long now = System.currentTimeMillis();
+        karamjaHomeTeleExitGraceUntilMs = now + KARAMJA_HOME_TELE_EXIT_GRACE_MS;
+        gearPrepKaramjaUseHomeTele = true;
+    }
+
+    /** Tel boot-fout tijdens gear prep; na drempel → Home teleport fallback. Niet tijdens loot-dump. */
+    private void recordGearPrepKaramjaBoatFailure() {
+        if (isLootDumpStyleKaramjaBoat() || !preparingGear || gearPrepKaramjaUseHomeTele) {
+            return;
+        }
+        gearPrepKaramjaBoatFailStreak++;
+        if (gearPrepKaramjaBoatFailStreak >= GEAR_PREP_KARAMJA_BOAT_FAIL_FALLBACK) {
+            chatLog("[gear-prep] Boot/Travel " + gearPrepKaramjaBoatFailStreak
+                    + "x mislukt — fallback Home teleport (loot-dump boot eerst geprobeerd)");
+            gearPrepKaramjaBoatFailStreak = 0;
+            gearPrepKaramjaUseHomeTele = true;
+        }
+    }
+
+    /**
+     * Gear prep fallback: Home teleport naar mainland als boot/Travel op Karamja blijft falen.
+     */
+    private int gearPrepExitKaramjaViaHomeTeleport(IPlayer local, WorldPoint myPos) {
+        if (local == null || myPos == null) {
             return antiBan.varyDelay(randomDelay(800, 1400));
         }
-        WorldPoint walkGoal = KARAMJA_DOCK_NPC;
-        if (preferAlternateKaramjaDockRoute && my != null
-                && my.distanceTo(KARAMJA_DOCK_ALT_WAYPOINT) > 4) {
-            walkGoal = KARAMJA_DOCK_ALT_WAYPOINT;
+        gearPrepKaramjaUseHomeTele = true;
+
+        if (Dialog.isOpen()) {
+            dismissBoatTalkDialog();
+            chatLog("[gear-prep] Talk-dialoog gesloten — Home tele fallback");
+            return antiBan.varyDelay(randomDelay(450, 750));
         }
-        MovementHelper.walkTo(walkGoal);
+
+        long now = System.currentTimeMillis();
+        if ((now - lastTeleportTime) <= TELEPORT_COOLDOWN_MS) {
+            paint.setCurrentStatus("Imps: gear prep wacht Home tele (geen Customs officer)");
+            return antiBan.varyDelay(randomDelay(900, 1500));
+        }
+
+        SpellBook.Standard home = SpellBook.Standard.HOME_TELEPORT;
+        if (home.canCast()) {
+            paint.setCurrentStatus("Imps: gear prep Home teleport fallback (Karamja → mainland bank)");
+            chatLog("[gear-prep] Home teleport fallback vanaf Karamja (boot faalde)");
+            markKaramjaHomeTeleExitPending();
+            try {
+                Magic.cast(home);
+                lastTeleportTime = now;
+            } catch (Exception e) {
+                chatLog("[!] Gear prep Home teleport fout: " + e.getMessage());
+                return antiBan.varyDelay(randomDelay(1200, 2000));
+            }
+            return antiBan.varyDelay(randomDelay(4500, 7000));
+        }
+
+        paint.setCurrentStatus("Imps: gear prep wacht Home tele beschikbaar");
+        return antiBan.varyDelay(randomDelay(1500, 2300));
+    }
+
+    /**
+     * Gear prep op Karamja: zelfde dock + {@link #payFare()} als loot-dump; Home tele alleen na herhaalde boot-fout.
+     * Pas op mainland (Port Sarim+) volgt normale gear-prep bank-flow in {@link #handleGearPreparation}.
+     */
+    private int travelFromKaramjaToPortSarim(IPlayer local, WorldPoint myPos, boolean bankingTripContext) {
+        if (local == null || myPos == null) {
+            return antiBan.varyDelay(randomDelay(800, 1400));
+        }
+        if (!isOnKaramja(myPos)) {
+            karamjaSharedBoatTrip = false;
+            return 0;
+        }
+        if (!bankingTripContext && gearPrepKaramjaUseHomeTele) {
+            return gearPrepExitKaramjaViaHomeTeleport(local, myPos);
+        }
+        if (getCoinCount() < BOAT_FARE) {
+            if (bankingTripContext) {
+                chatLog("[bank-trip] Op Karamja zonder " + BOAT_FARE + " gp voor terugboot (" + getCoinCount()
+                        + ") — geen dock-lopen; coin-recovery / GE.");
+                isBankingTrip = false;
+                isRestocking = false;
+            }
+            return handleInsufficientCoinsForBoatFare(local);
+        }
+        int distToDock = distanceToKaramjaBoatDock(myPos);
+        if (distToDock > 10) {
+            long now = System.currentTimeMillis();
+            String suffix = bankingTripContext ? "" : " gear prep";
+            return walkTowardKaramjaBoatDockStepped(myPos, now, suffix);
+        }
+        paint.setCurrentStatus("Imps: [boat] Boot naar Port Sarim" + (bankingTripContext ? "" : " (gear prep)"));
+        return payFare();
+    }
+
+    /** Zelfde stepped walk als loot-dump bank-trip naar Customs officer. */
+    private int walkTowardKaramjaBoatDockStepped(WorldPoint myPos, long now, String statusSuffix) {
+        IPlayer local = Players.getLocal();
+        int distToDock = distanceToKaramjaBoatDock(myPos);
+        boolean canReclick = (now - lastWalkClickTime) > WALK_RECLICK_INTERVAL_MS;
+        if (local != null && local.isMoving() && !canReclick) {
+            paint.setCurrentStatus("Imps: -> Karamja dock (" + distToDock + " tiles)" + statusSuffix
+                    + (preferAlternateKaramjaDockRoute ? " alt" : ""));
+            return antiBan.varyDelay(randomDelay(800, 1400));
+        }
+        paint.setCurrentStatus("Imps: -> Karamja dock (" + distToDock + " tiles)" + statusSuffix
+                + (preferAlternateKaramjaDockRoute ? " alt" : ""));
+        if (isPointInScorpionRadius(myPos)) {
+            ensureRunEnabledForScorpionZone();
+        }
+        WorldPoint dockTarget = getKaramjaBoatWalkTarget();
+        int stepMin = configuredImpsStepMin();
+        int stepMax = configuredImpsStepMax(stepMin);
+        if (distToDock > stepMax) {
+            int dx = dockTarget.getX() - myPos.getX();
+            int dy = dockTarget.getY() - myPos.getY();
+            double dist = Math.sqrt(dx * dx + dy * dy);
+            int stepLen = Math.min(distToDock - 1, randomDelay(stepMin, stepMax));
+            int stepX = myPos.getX() + (int) (dx / dist * stepLen);
+            int stepY = myPos.getY() + (int) (dy / dist * stepLen);
+            WorldPoint stepToDock = new WorldPoint(stepX, stepY, dockTarget.getPlane());
+            if (isPointInScorpionRadius(stepToDock)) {
+                ensureRunEnabledForScorpionZone();
+            }
+            MovementHelper.walkTo(stepToDock);
+        } else {
+            MovementHelper.walkTo(dockTarget);
+        }
         lastWalkClickTime = now;
         return antiBan.varyDelay(randomDelay(1500, 2500));
     }
@@ -4283,9 +5062,10 @@ public class ImpsHandler {
                 paint.setCurrentStatus("Imps: coin-recovery melee wapen halen");
                 return withdrawMeleeGear();
             }
-            if (withdrawBestMeleeArmorPieceFromBank()) {
-                paint.setCurrentStatus("Imps: coin-recovery armor uit bank halen");
-                return antiBan.varyDelay(randomDelay(600, 1000));
+            int recoveryArmour = impsMeleeSkipsArmour() ? 0 : handleStyleArmourAtBank(CombatBotConfig.ImpsCombatStyle.MELEE);
+            if (recoveryArmour > 0) {
+                paint.setCurrentStatus("Imps: coin-recovery armor uit bank");
+                return recoveryArmour;
             }
         }
         coinRecoveryBankChecked = true;
@@ -4317,7 +5097,7 @@ public class ImpsHandler {
         }
 
         WorldPoint pos = local.getWorldLocation();
-        boolean onKaramja = pos.getY() < 3200;
+        boolean onKaramja = isOnKaramja(pos);
         if (onKaramja) {
             return handleCoinRecoveryHomeTeleportThenGe(local);
         }
@@ -4353,6 +5133,10 @@ public class ImpsHandler {
             return 1000;
         }
         WorldPoint pos = local.getWorldLocation();
+        if (isOnKaramja(pos) && Dialog.isOpen()) {
+            dismissBoatTalkDialog();
+            return antiBan.varyDelay(randomDelay(450, 750));
+        }
         if (pos.distanceTo(LUMBRIDGE_HOME_TELEPORT_ANCHOR) <= 22 && pos.getPlane() == 0) {
             coinRecoveryGeSellPending = false;
             if (inventoryContainsAnyGeSellListItem()) {
@@ -4388,6 +5172,7 @@ public class ImpsHandler {
             try {
                 Magic.cast(home);
                 lastTeleportTime = now;
+                markKaramjaHomeTeleExitPending();
             } catch (Exception e) {
                 chatLog("[!] Coin-recovery Home teleport fout: " + e.getMessage());
             }
@@ -4395,6 +5180,11 @@ public class ImpsHandler {
         }
 
         paint.setCurrentStatus("Imps: home teleport cooldown actief, farm imps verder");
+        if (preparingGear || gearPrepKaramjaUseHomeTele
+                || System.currentTimeMillis() < karamjaHomeTeleExitGraceUntilMs) {
+            paint.setCurrentStatus("Imps: coin-recovery wacht Home tele (geen Customs officer)");
+            return antiBan.varyDelay(randomDelay(900, 1500));
+        }
         if (isPlayerInHuntingArea(local)) {
             // Geen teleport beschikbaar: niet stilstaan; op Karamja doorgaan met imps tot inventory-trip.
             return handleKilling(local);
@@ -4408,9 +5198,6 @@ public class ImpsHandler {
             return 1000;
         }
         equipGear(CombatBotConfig.ImpsCombatStyle.MELEE);
-        if (wearBestMeleeArmorFromInventory()) {
-            return antiBan.varyDelay(randomDelay(650, 1050));
-        }
 
         ITileItem groundCoins = TileItems.getNearest(item ->
                 item != null && item.getName() != null
@@ -4466,22 +5253,32 @@ public class ImpsHandler {
      * of terugkeren na {@link #payFare()} / bankieren.
      */
     private int payFareBack() {
+        IPlayer local = Players.getLocal();
+        if (local == null) {
+            return 2000;
+        }
+        WorldPoint myPos = local.getWorldLocation();
+        if (myPos != null && isOnKaramja(myPos)) {
+            resetPortSarimBoatCrossingState();
+            walkingToHuntArea = true;
+            return antiBan.varyDelay(randomDelay(400, 700));
+        }
+
         long now = System.currentTimeMillis();
-        // Voorkom dubbel-klikken op de sailor terwijl we al een travel-actie hebben gestart
         if (now - lastBoatClickTime < BOAT_CLICK_COOLDOWN_MS) {
-            IPlayer local = Players.getLocal();
-            if (local != null && local.isMoving()) {
+            if (local.isMoving()) {
                 return antiBan.varyDelay(randomDelay(800, 1400));
             }
         }
 
-        INPC travelNpc = findTravelNpc();
+        INPC travelNpc = findTravelNpc(false);
 
         if (travelNpc != null) {
             int coins = getCoinCount();
             boolean canAffordFare = coins >= BOAT_FARE;
             if (!canAffordFare && !awaitingPortSarimToKaramjaCrossing) {
-                maybeLogBoatMissingNpcDebug("[boat] Pay geblokkeerd: " + coins + " gp < " + BOAT_FARE + " (geen actieve oversteek na betaling)");
+                maybeLogBoatMissingNpcDebug("[boat] Pay geblokkeerd: " + coins + " gp < " + BOAT_FARE
+                        + " (geen actieve oversteek na betaling)");
                 return antiBan.varyDelay(randomDelay(700, 1300));
             }
             if (canAffordFare) {
@@ -4500,14 +5297,75 @@ public class ImpsHandler {
             return antiBan.varyDelay(randomDelay(3000, 5000));
         }
 
-        // Geen teleport naar Falador/Lumbridge - path naar Port Sarim dock (laat path bepalen hoe we lopen)
-        IPlayer local = Players.getLocal();
+        return walkTowardPortSarimBoatDock(local, myPos);
+    }
+
+    /**
+     * Wacht op echte oversteek; geen Pay-fare-spam zolang we nog op dezelfde tile staan.
+     * @return {@link #PAY_FARE_RESUME_NORMAL} om opnieuw Pay-fare te proberen
+     */
+    private int handleAwaitingPortSarimCrossing(IPlayer local, WorldPoint myPos, long now) {
+        if (myPos != null && isOnKaramja(myPos)) {
+            resetPortSarimBoatCrossingState();
+            walkingToHuntArea = true;
+            chatLog("[boat] Op Karamja aangekomen");
+            return antiBan.varyDelay(randomDelay(400, 700));
+        }
+        if (local.isMoving() || local.getAnimation() != -1) {
+            lastBoatTowardKaramjaInteractMs = now;
+            portSarimPayAttemptsSameTile = 0;
+            paint.setCurrentStatus("Imps: [boat] Oversteek bezig…");
+            return antiBan.varyDelay(randomDelay(1500, 2500));
+        }
+        if (portSarimCoinsSnapshotBeforePay >= 0 && getCoinCount() < portSarimCoinsSnapshotBeforePay - 20) {
+            portSarimCoinsSnapshotBeforePay = -1;
+            lastBoatTowardKaramjaInteractMs = now;
+            paint.setCurrentStatus("Imps: [boat] Tarief betaald — wacht op Karamja…");
+            return antiBan.varyDelay(randomDelay(2000, 3500));
+        }
+        long sinceInteract = now - lastBoatTowardKaramjaInteractMs;
+        if (sinceInteract < PORT_SARIM_CROSSING_MIN_WAIT_MS) {
+            paint.setCurrentStatus("Imps: [boat] Wacht op oversteek…");
+            return antiBan.varyDelay(randomDelay(1200, 2000));
+        }
+        boolean sameStartTile = portSarimCrossingStartTile != null && myPos != null
+                && portSarimCrossingStartTile.equals(myPos);
+        if (sameStartTile) {
+            if (sinceInteract < PORT_SARIM_CROSSING_STUCK_MS) {
+                paint.setCurrentStatus("Imps: [boat] Wacht op oversteek…");
+                return antiBan.varyDelay(randomDelay(1200, 2000));
+            }
+            portSarimPayAttemptsSameTile++;
+            if (portSarimPayAttemptsSameTile < PORT_SARIM_MAX_PAY_RETRIES_SAME_SPOT) {
+                chatLog("[!][boat] Geen oversteek na Pay-fare (" + portSarimPayAttemptsSameTile + "/"
+                        + PORT_SARIM_MAX_PAY_RETRIES_SAME_SPOT + ") — nieuwe poging");
+                awaitingPortSarimToKaramjaCrossing = false;
+                portSarimCoinsSnapshotBeforePay = -1;
+                lastBoatClickTime = 0L;
+                return PAY_FARE_RESUME_NORMAL;
+            }
+            chatLog("[!][boat] Dock vast op " + myPos.getX() + "," + myPos.getY()
+                    + " — loop opnieuw naar Seaman");
+            resetPortSarimBoatCrossingState();
+            return walkTowardPortSarimBoatDock(local, myPos);
+        }
+        if (sinceInteract < BOAT_TOWARD_KARAMJA_GRACE_MS) {
+            paint.setCurrentStatus("Imps: [boat] Naar Karamja…");
+            return antiBan.varyDelay(randomDelay(1500, 2500));
+        }
+        chatLog("[!][boat] Oversteek-timeout (" + (sinceInteract / 1000) + "s) — opnieuw Pay-fare");
+        resetPortSarimBoatCrossingState();
+        return PAY_FARE_RESUME_NORMAL;
+    }
+
+    private int walkTowardPortSarimBoatDock(IPlayer local, WorldPoint myPos) {
         if (local == null) {
             return 2000;
         }
         maybeLogBoatMissingNpcDebug("[boat] Geen boot-NPC in de buurt — lopen naar Port Sarim dock…");
         MovementHelper.walkTo(PORTSARIM_DOCK_NPC);
-        paint.setCurrentStatus("Imps: -> Port Sarim dock (" + local.getWorldLocation().distanceTo(PORTSARIM_DOCK_NPC) + " tiles)");
+        int dist = myPos != null ? myPos.distanceTo(PORTSARIM_DOCK_NPC) : 0;
+        paint.setCurrentStatus("Imps: -> Port Sarim dock (" + dist + " tiles)");
         return antiBan.varyDelay(randomDelay(1200, 2200));
     }
 
@@ -4532,12 +5390,436 @@ public class ImpsHandler {
     }
 
     private INPC findTravelNpc() {
+        IPlayer local = Players.getLocal();
+        boolean onKaramja = local != null && local.getWorldLocation() != null
+                && isOnKaramja(local.getWorldLocation());
+        return findTravelNpc(onKaramja);
+    }
+
+    /** Musa Point: alleen Customs officer (npc 380), niet Seaman op andere eilanden. */
+    private INPC findKaramjaCustomsOfficer() {
+        try {
+            INPC byId = NPCs.getNearest(npc -> npc != null && npc.getId() == CUSTOMS_OFFICER_NPC_ID);
+            if (byId != null) {
+                return byId;
+            }
+        } catch (Exception ignored) {
+        }
         return NPCs.getNearest(npc -> {
             String name = npc.getName();
-            if (name == null) return false;
-            String lower = name.toLowerCase();
+            return name != null && name.equalsIgnoreCase("Customs officer");
+        });
+    }
+
+    private WorldPoint getKaramjaBoatWalkTarget() {
+        if (preferAlternateKaramjaDockRoute) {
+            return KARAMJA_DOCK_ALT_WAYPOINT;
+        }
+        return KARAMJA_BOAT_APPROACH;
+    }
+
+    private int distanceToKaramjaBoatDock(WorldPoint my) {
+        if (my == null) {
+            return Integer.MAX_VALUE;
+        }
+        INPC customs = findKaramjaCustomsOfficer();
+        if (customs != null && customs.getWorldLocation() != null) {
+            return my.distanceTo(customs.getWorldLocation());
+        }
+        return my.distanceTo(getKaramjaBoatWalkTarget());
+    }
+
+    /**
+     * Zoek boot-NPC. Op Karamja: alleen Customs officer.
+     */
+    private INPC findTravelNpc(boolean onKaramja) {
+        if (onKaramja) {
+            return findKaramjaCustomsOfficer();
+        }
+        return NPCs.getNearest(npc -> {
+            String name = npc.getName();
+            if (name == null) {
+                return false;
+            }
+            String lower = name.toLowerCase(Locale.ROOT);
             return lower.contains("customs") || lower.contains("seaman") || lower.contains("captain tobias");
         });
+    }
+
+    /** Port Sarim dock: Seaman / Captain Tobias binnen straal van {@link #PORTSARIM_DOCK_NPC}. */
+    private INPC findPortSarimBoatNpc() {
+        WorldPoint dock = PORTSARIM_DOCK_NPC;
+        INPC best = null;
+        int bestScore = Integer.MIN_VALUE;
+        try {
+            for (INPC npc : NPCs.getAll()) {
+                if (npc == null) {
+                    continue;
+                }
+                if (!isPortSarimBoatNpcCandidate(npc)) {
+                    continue;
+                }
+                WorldPoint wp = npc.getWorldLocation();
+                if (wp == null || dock.distanceTo(wp) > PORT_SARIM_BOAT_NPC_SEARCH_RADIUS) {
+                    continue;
+                }
+                int score = scoreBoatTravelNpc(npc, false);
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = npc;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        if (best != null) {
+            return best;
+        }
+        return NPCs.getNearest(npc -> {
+            if (npc == null || npc.getWorldLocation() == null) {
+                return false;
+            }
+            return dock.distanceTo(npc.getWorldLocation()) <= PORT_SARIM_BOAT_NPC_SEARCH_RADIUS
+                    && isPortSarimBoatNpcCandidate(npc);
+        });
+    }
+
+    private static boolean isPortSarimBoatNpcCandidate(INPC npc) {
+        try {
+            int id = npc.getId();
+            for (int boatId : PORT_SARIM_BOAT_NPC_IDS) {
+                if (id == boatId) {
+                    return true;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        String name = npc.getName();
+        if (name == null) {
+            return false;
+        }
+        String lower = name.toLowerCase(Locale.ROOT);
+        return lower.contains("seaman") || lower.contains("captain tobias");
+    }
+
+    private int scoreBoatTravelNpc(INPC npc, boolean onKaramja) {
+        String name = npc.getName() != null ? npc.getName().toLowerCase(Locale.ROOT) : "";
+        int score = 0;
+        if (name.contains("customs officer")) {
+            score += 200;
+        } else if (name.contains("customs")) {
+            score += 150;
+        }
+        if (npcActionIndexForBoat(npc, onKaramja) >= 0) {
+            score += 120;
+        }
+        if (onKaramja && name.contains("seaman")) {
+            score -= 50;
+        }
+        try {
+            IPlayer local = Players.getLocal();
+            if (local != null && local.getWorldLocation() != null && npc.getWorldLocation() != null) {
+                int dist = local.getWorldLocation().distanceTo(npc.getWorldLocation());
+                score += Math.max(0, 40 - dist);
+            }
+        } catch (Exception ignored) {
+        }
+        return score;
+    }
+
+    /** Travel / Pay-fare — nooit Talk-to. Karamja: Travel is bovenste menu-optie (zie screenshot). */
+    private boolean interactBoatTravelNpc(INPC travelNpc, boolean fromKaramja) {
+        if (travelNpc == null) {
+            return false;
+        }
+        if (fromKaramja) {
+            return interactKaramjaCustomsTravel(travelNpc);
+        }
+        return interactMainlandBoatNpc(travelNpc);
+    }
+
+    /**
+     * Musa Point Customs officer: {@code Travel} (menu-optie 1) — zelfde code als loot-dump.
+     */
+    private boolean interactKaramjaCustomsTravel(INPC npc) {
+        return interactBoatNpcByActionIndex(npc, true);
+    }
+
+    private boolean interactMainlandBoatNpc(INPC npc) {
+        return interactBoatNpcByActionIndex(npc, false);
+    }
+
+    /**
+     * NPC-menu: altijd de echte index van Travel/Pay-fare — nooit blind {@code NPC_FIRST_OPTION}
+     * (dat is vaak Talk-to of Walk here, niet de boot-actie).
+     */
+    private boolean interactBoatNpcByActionIndex(INPC npc, boolean fromKaramja) {
+        if (npc == null) {
+            return false;
+        }
+        String npcName = npc.getName() != null ? npc.getName() : "NPC";
+        int idx = npcActionIndexForBoat(npc, fromKaramja);
+        if (idx >= 0) {
+            String actionLabel = safeNpcActionAt(npc, idx);
+            MenuAction menuAction = menuActionForNpcOptionIndex(idx);
+            if (menuAction != null
+                    && tryInvokeNpcMenuAction(npc, menuAction, actionLabel, npcName)) {
+                chatLog("[boat] menu " + menuAction + " idx=" + idx + " \"" + actionLabel + "\" → " + npcName);
+                return true;
+            }
+            try {
+                npc.interact(idx);
+                chatLog("[boat] interact(" + idx + ") \"" + actionLabel + "\" → " + npcName);
+                return true;
+            } catch (Throwable ignored) {
+            }
+        }
+
+        String[] byName = fromKaramja
+                ? new String[] {"Travel", "Port Sarim", "Pay-fare", "Pay-Fare"}
+                : new String[] {"Pay-fare", "Pay-Fare", "Pay fare", "Travel"};
+        for (String action : byName) {
+            try {
+                npc.interact(action);
+                chatLog("[boat] interact(\"" + action + "\") → " + npcName);
+                return true;
+            } catch (Throwable ignored) {
+            }
+        }
+
+        logNpcBoatActionsOnce(npc, fromKaramja);
+        return false;
+    }
+
+    private static MenuAction menuActionForNpcOptionIndex(int index) {
+        switch (index) {
+            case 0:
+                return MenuAction.NPC_FIRST_OPTION;
+            case 1:
+                return MenuAction.NPC_SECOND_OPTION;
+            case 2:
+                return MenuAction.NPC_THIRD_OPTION;
+            case 3:
+                return MenuAction.NPC_FOURTH_OPTION;
+            case 4:
+                return MenuAction.NPC_FIFTH_OPTION;
+            default:
+                return null;
+        }
+    }
+
+    /** {@link net.storm.sdk.game.Client#invokeMenuAction} — zelfde params als loot-dump fallback. */
+    private boolean tryInvokeNpcMenuAction(INPC npc, MenuAction menuAction, String option, String target) {
+        if (npc == null || menuAction == null) {
+            return false;
+        }
+        int npcIndex;
+        int npcId;
+        try {
+            npcIndex = npc.getIndex();
+            npcId = npc.getId();
+        } catch (Throwable t) {
+            return false;
+        }
+        try {
+            net.storm.sdk.game.Client.invokeMenuAction(
+                    npcIndex, 0, menuAction.getId(), npcId, npcIndex, -1, option, target);
+            return true;
+        } catch (Throwable t1) {
+            try {
+                net.storm.sdk.game.Client.invokeMenuAction(
+                        npcIndex, 0, menuAction.getId(), npcIndex, npcId, -1, option, target);
+                return true;
+            } catch (Throwable t2) {
+                return false;
+            }
+        }
+    }
+
+    /**
+     * OSRS Musa Point Customs officer: {@code Travel} of {@code Port Sarim} (niet Talk-to).
+     * @return menu-index &gt;= 0, of -1
+     */
+    private int npcActionIndexForBoat(INPC npc, boolean fromKaramja) {
+        if (npc == null) {
+            return -1;
+        }
+        String[] actions = npc.getActions();
+        if (actions == null || actions.length == 0) {
+            return -1;
+        }
+        String[] preferred = fromKaramja
+                ? new String[] {"Travel", "Port Sarim", "Pay-fare", "Pay-Fare", "Pay fare"}
+                : new String[] {"Pay-fare", "Pay-Fare", "Pay fare", "Travel"};
+        for (String pref : preferred) {
+            for (int i = 0; i < actions.length; i++) {
+                String a = actions[i];
+                if (a == null) {
+                    continue;
+                }
+                if (isNpcMenuActionExcluded(a.toLowerCase(Locale.ROOT))) {
+                    continue;
+                }
+                if (a.equalsIgnoreCase(pref)) {
+                    return i;
+                }
+            }
+        }
+        for (int i = 0; i < actions.length; i++) {
+            String a = actions[i];
+            if (a == null) {
+                continue;
+            }
+            String low = a.toLowerCase(Locale.ROOT);
+            if (isNpcMenuActionExcluded(low)) {
+                continue;
+            }
+            if (fromKaramja) {
+                if (low.contains("travel") || low.contains("port sarim")
+                        || (low.contains("pay") && low.contains("fare"))) {
+                    return i;
+                }
+            } else if ((low.contains("pay") && low.contains("fare")) || low.contains("travel")) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static String safeNpcActionAt(INPC npc, int index) {
+        try {
+            String[] actions = npc.getActions();
+            if (actions != null && index >= 0 && index < actions.length) {
+                return actions[index];
+            }
+        } catch (Exception ignored) {
+        }
+        return "";
+    }
+
+    private long lastNpcBoatActionDebugLogMs = 0L;
+
+    private void logNpcBoatActionsOnce(INPC npc, boolean fromKaramja) {
+        long now = System.currentTimeMillis();
+        if (now - lastNpcBoatActionDebugLogMs < 8_000L) {
+            return;
+        }
+        lastNpcBoatActionDebugLogMs = now;
+        if (npc == null) {
+            return;
+        }
+        StringBuilder sb = new StringBuilder("[boat] NPC menu " + npc.getName() + " id=" + npc.getId() + ": ");
+        String[] actions = npc.getActions();
+        if (actions == null) {
+            sb.append("(geen actions)");
+        } else {
+            for (int i = 0; i < actions.length; i++) {
+                if (i > 0) {
+                    sb.append(" | ");
+                }
+                sb.append(i).append("=").append(actions[i]);
+            }
+        }
+        sb.append(" (gekozen idx=").append(npcActionIndexForBoat(npc, fromKaramja)).append(")");
+        chatLog(sb.toString());
+    }
+
+    private static boolean isNpcMenuActionExcluded(String low) {
+        if (low == null || low.isEmpty()) {
+            return true;
+        }
+        return low.equals("talk-to") || low.equals("talk") || low.equals("examine")
+                || low.contains("walk here") || low.equals("walk")
+                || low.contains("attack") || low.contains("pickpocket");
+    }
+
+    private static boolean isBoatDialogExcludedOption(String option) {
+        if (option == null) {
+            return true;
+        }
+        String low = option.toLowerCase(Locale.ROOT);
+        return low.contains("walk here") || low.equals("walk")
+                || low.equals("no") || low.contains("cancel") || low.contains("never mind")
+                || low.equals("talk-to") || low.equals("talk");
+    }
+
+    private static boolean isBoatDialogOption(String option) {
+        if (option == null || isBoatDialogExcludedOption(option)) {
+            return false;
+        }
+        String low = option.toLowerCase(Locale.ROOT);
+        return low.contains("travel") || low.contains("port sarim")
+                || (low.contains("pay") && low.contains("fare"))
+                || low.contains("journey") || low.contains("ship") || low.contains("sail")
+                || low.contains("yes") || low.contains("karamja") || low.contains("musa");
+    }
+
+    private static boolean boatDialogOptionMatches(String option, String needle) {
+        if (option == null || needle == null || isBoatDialogExcludedOption(option)) {
+            return false;
+        }
+        return option.equalsIgnoreCase(needle)
+                || option.toLowerCase(Locale.ROOT).contains(needle.toLowerCase(Locale.ROOT));
+    }
+
+    /** Choose-menu na Pay-fare/Travel: expliciet Travel/Pay-fare, nooit Walk here. */
+    private boolean chooseBoatDialogOption() {
+        if (!Dialog.isViewingOptions()) {
+            return false;
+        }
+        String[] preferred = {
+                "Travel", "Pay-fare", "Pay fare", "Port Sarim", "Yes", "Okay", "Ok"
+        };
+        for (String key : preferred) {
+            if (Dialog.hasOption(s -> boatDialogOptionMatches(s, key))) {
+                Dialog.chooseOption(s -> boatDialogOptionMatches(s, key));
+                chatLog("[boat] Dialoog choose: \"" + key + "\"");
+                return true;
+            }
+        }
+        if (Dialog.hasOption(ImpsHandler::isBoatDialogOption)) {
+            Dialog.chooseOption(ImpsHandler::isBoatDialogOption);
+            chatLog("[boat] Dialoog choose: boot-optie (Travel/Pay-fare)");
+            return true;
+        }
+        chatLog("[boat] Dialoog choose-menu open — geen Travel/Pay-fare optie gevonden");
+        return false;
+    }
+
+    private void dismissBoatTalkDialog() {
+        try {
+            net.storm.sdk.input.Keyboard.type(String.valueOf((char) java.awt.event.KeyEvent.VK_ESCAPE), false);
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** Boot-dialoog: opties / bevestiging (continue), niet meteen Escape (breekt Pay-fare-bevestiging). */
+    private int tryHandleBoatTravelDialog() {
+        try {
+            if (!Dialog.isOpen()) {
+                return 0;
+            }
+            if (Dialog.isViewingOptions()) {
+                if (chooseBoatDialogOption()) {
+                    lastBoatTowardKaramjaInteractMs = System.currentTimeMillis();
+                    return antiBan.varyDelay(randomDelay(600, 1000));
+                }
+                return antiBan.varyDelay(randomDelay(400, 700));
+            }
+            if (Dialog.canContinue()) {
+                Dialog.continueSpace();
+                chatLog("[boat] Dialoog: doorgaan (tarief/bevestiging)");
+                lastBoatTowardKaramjaInteractMs = System.currentTimeMillis();
+                return antiBan.varyDelay(randomDelay(600, 1000));
+            }
+            dismissBoatTalkDialog();
+            chatLog("[boat] Talk-to venster gesloten (Escape) — opnieuw Pay-fare");
+            if (!isLootDumpStyleKaramjaBoat() && preparingGear && !gearPrepKaramjaUseHomeTele) {
+                recordGearPrepKaramjaBoatFailure();
+            }
+            return antiBan.varyDelay(randomDelay(450, 750));
+        } catch (Exception ignored) {
+        }
+        return 0;
     }
 
     // ===================== FOOD =====================
@@ -4567,7 +5849,7 @@ public class ImpsHandler {
                         )
         );
         if (food != null) {
-            food.interact("Eat");
+            InventoryActionHelper.interact(config, food, "Eat");
             return antiBan.varyDelay(randomDelay(1200, 1800));
         }
         return 600;
@@ -4618,7 +5900,7 @@ public class ImpsHandler {
             // EN er een chronicle in inv ligt met charges (of cards om te laden).
             if (teleportSpell == SpellBook.Standard.VARROCK_TELEPORT) {
                 String rsn = impsLocalRsnOrNull();
-                if (VarrockTeleportHelper.tryExecuteChronicleTeleport(rsn)) {
+                if (VarrockTeleportHelper.tryExecuteChronicleTeleport(config, rsn)) {
                     chatLog("[TP] Chronicle (Diango) gebruikt i.p.v. Varrock-spell");
                     lastTeleportTime = now;
                     lastWalkClickTime = now;
@@ -4664,16 +5946,36 @@ public class ImpsHandler {
             fallbackStyleActive = false;
         }
 
+        WorldPoint gearPrepPos = local.getWorldLocation();
+        if (gearPrepPos != null && !isOnKaramja(gearPrepPos)) {
+            gearPrepKaramjaUseHomeTele = false;
+            gearPrepKaramjaBoatFailStreak = 0;
+        }
+        // Op Karamja: exact loot-dump pad — travelFromKaramjaToPortSarim(..., true) → payFare()
+        if (gearPrepPos != null && isOnKaramja(gearPrepPos)) {
+            paint.setCurrentStatus("Imps: gear prep → Port Sarim (zelfde boot als loot-dump)");
+            if (gearPrepKaramjaUseHomeTele) {
+                return gearPrepExitKaramjaViaHomeTeleport(local, gearPrepPos);
+            }
+            return travelToPortSarimFromKaramja(local);
+        }
+
+        // Equip-fase: bank dicht houden tot alles aangetrokken is
+        if (gearPrepInvEquipPhase) {
+            if (Bank.isOpen()) {
+                Bank.close();
+                sleep(400, 700);
+                return antiBan.varyDelay(randomDelay(400, 700));
+            }
+            return handleGearPrepEquipPhase(style);
+        }
+
         // 1. Check of we al gear + coins hebben ZONDER bank te openen
         if (hasAdequateGearForStyle(style)) {
-            // Heeft gear in inventory? Doe het dan aan.
+            // Heeft gear in inventory? Doe het dan aan (zonder bank te openen).
             if (hasGearInInventory(style)) {
-                paint.setCurrentStatus("Imps: Gear aantrekken...");
-                equipGear(style);
-                if (style == CombatBotConfig.ImpsCombatStyle.RANGED && wearBestRangedArmorFromInventory()) {
-                    return antiBan.varyDelay(randomDelay(650, 1050));
-                }
-                return antiBan.varyDelay(randomDelay(600, 1200));
+                gearPrepInvEquipPhase = true;
+                return handleGearPrepEquipPhase(style);
             }
 
             int coins = getCoinCount();
@@ -4688,18 +5990,27 @@ public class ImpsHandler {
                             + getItemQuantity("Air rune") + "/" + disp + ")");
                 }
             }
-            if (coins >= impsRuntimeMinCoins() && freeSlots >= minFreeSlotsForGearPrepComplete() && gateSatisfied) {
-                gearPrepComplete = true;
-                preparingGear = false;
-                chatLog("[OK] Gear, coins en ruimte (" + minFreeSlotsForGearPrepComplete() + "+) aanwezig. Starten!");
-                return randomDelay(600, 1000);
+            if (coins >= impsRuntimeMinCoins() && freeSlots >= minFreeSlotsRequiredForGearPrep(style) && gateSatisfied) {
+                int prepDone = tryCompleteGearPreparation(style);
+                if (prepDone == -1) {
+                    return randomDelay(600, 1000);
+                }
+                if (prepDone > 0) {
+                    return prepDone;
+                }
             }
         }
 
         // 2. Bank niet open -> loop naar dichtstbijzijnde volwaardige bank (NOOIT deposit box voor gear prep)
         if (!Bank.isOpen()) {
             paint.setCurrentStatus("Imps: -> Bank (Gear prep)");
-            // Check of we bij een bank zijn - probeer te openen
+            WorldPoint myPos = local.getWorldLocation();
+            if (myPos != null && BankHelper.isNearGrandExchange(myPos)) {
+                if (BankHelper.tryOpenBankAtGrandExchange()) {
+                    return antiBan.varyDelay(randomDelay(1200, 2000));
+                }
+                return antiBan.varyDelay(randomDelay(800, 1400));
+            }
             if (BankHelper.interactIfNearby()) {
                 return antiBan.varyDelay(randomDelay(1500, 2500));
             }
@@ -4752,37 +6063,18 @@ public class ImpsHandler {
             } catch (Exception ignored) {
             }
             List<String> keepNames = getGearPrepKeepNames();
-            Bank.depositAllExcept(keepNames.toArray(new String[0]));
+            BankDepositHelper.depositAllExceptKeep(keepNames.toArray(new String[0]));
             sleep(800, 1200);
             if (hasGearPrepDepositItems()) {
-                // Deposit overbodige items 1-voor-1 (geen depositInventory om keep-items te beschermen)
-                var remaining = Inventory.getAll(item -> {
-                    if (item == null || item.getName() == null) return false;
-                    for (String k : keepNames) {
-                        if (k.equalsIgnoreCase(item.getName())) return false;
-                    }
-                    if (shouldKeepItem(item)) return false;
-                    return true;
-                });
-                if (remaining != null) {
-                    for (var rem : remaining) {
-                        if (shouldAbortActions()) {
-                            break;
-                        }
-                        if (rem != null && rem.getName() != null) {
-                            Bank.depositAll(rem.getName());
-                            sleep(100, 250);
-                        }
-                    }
-                }
+                BankDepositHelper.depositAllExceptKeep(keepNames.toArray(new String[0]));
                 sleep(400, 600);
             }
             return antiBan.varyDelay(randomDelay(600, 1000));
         }
 
         // 3b. Extra ruimte-check
-        if (Inventory.getFreeSlots() < minFreeSlotsForGearPrepComplete()) {
-            paint.setCurrentStatus("Imps: Ruimte maken (min. " + minFreeSlotsForGearPrepComplete() + " slots)...");
+        if (Inventory.getFreeSlots() < minFreeSlotsRequiredForGearPrep(style)) {
+            paint.setCurrentStatus("Imps: Ruimte maken (min. " + minFreeSlotsRequiredForGearPrep(style) + " slots)...");
             return antiBan.varyDelay(randomDelay(500, 900));
         }
 
@@ -4810,6 +6102,13 @@ public class ImpsHandler {
             chatLog("[gear-prep] Nog te weinig gp voor boot (" + getCoinCount() + "/" + impsRuntimeMinCoins()
                     + ") en geen coins uit bank beschikbaar — eerst coin-recovery.");
             return handleGearPrepCoinsWithdrawExhausted(local);
+        }
+
+        if (impsMeleeSkipsArmour(style)) {
+            int bankMeleeArmour = bankImpsMeleeArmourIfNeeded();
+            if (bankMeleeArmour > 0) {
+                return bankMeleeArmour;
+            }
         }
 
         // 4a. Optioneel in MELEE: Air+Mind runes meenemen om imps 1x met Air Strike te openen.
@@ -4889,26 +6188,36 @@ public class ImpsHandler {
             }
         }
 
-        // 4c. Beste amulet per style: niet alleen Amulet of power.
+        // 4c. Beste amulet per style: ophalen uit bank (aantrekken in equip-fase).
         boolean amuletEquipped = Equipment.contains(item -> item != null && item.getName() != null
                 && item.getName().toLowerCase().contains("amulet"));
         if (!amuletEquipped) {
             String invAmulet = bestInventoryAmuletForStyle(style);
             if (invAmulet != null) {
-                IInventoryItem amulet = Inventory.getFirst(item -> item != null && item.getName() != null
-                        && item.getName().equalsIgnoreCase(invAmulet));
-                if (amulet != null) {
-                    amulet.interact(amulet.hasAction("Wear") ? "Wear" : "Wield");
-                    chatLog(invAmulet + " aangedaan");
-                    return antiBan.varyDelay(randomDelay(600, 1000));
+                // Al op zak — equip-fase trekt hem aan
+            } else {
+                String bankAmulet = bestBankAmuletForStyle(style);
+                if (bankAmulet != null) {
+                    Bank.withdraw(bankAmulet, 1);
+                    chatLog(bankAmulet + " opgehaald uit bank");
+                    return antiBan.varyDelay(randomDelay(500, 900));
                 }
             }
-            String bankAmulet = bestBankAmuletForStyle(style);
-            if (bankAmulet != null) {
-                Bank.withdraw(bankAmulet, 1);
-                chatLog(bankAmulet + " opgehaald uit bank");
-                return antiBan.varyDelay(randomDelay(500, 900));
+        }
+
+        // 4c2. Ranged: boog + arrows in dezelfde banksessie (equip sluit bank-UI).
+        if (style == CombatBotConfig.ImpsCombatStyle.RANGED) {
+            int rangedWithdraw = withdrawRangedGearFromBankIfNeeded();
+            if (rangedWithdraw > 0) {
+                return rangedWithdraw;
             }
+        }
+
+        // 4d. Style-armor: batch-withdraw (equip pas na bank-sluit) — imps melee: skip (gewicht)
+        int armourTick = impsMeleeSkipsArmour(style) ? bankImpsMeleeArmourIfNeeded()
+                : handleStyleArmourAtBank(style);
+        if (armourTick > 0) {
+            return armourTick;
         }
 
         // 5. Check of we nu adequate gear hebben (incl. Fire Strike air-gate alleen voor MAGE)
@@ -4920,8 +6229,11 @@ public class ImpsHandler {
                     chatLog("Melee wapen upgrade opgehaald: " + weaponUpgrade);
                     return antiBan.varyDelay(randomDelay(600, 1000));
                 }
-                if (withdrawBestMeleeArmorPieceFromBank()) {
-                    return antiBan.varyDelay(randomDelay(600, 1000));
+                if (!impsMeleeSkipsArmour(style)) {
+                    armourTick = handleStyleArmourAtBank(style);
+                    if (armourTick > 0) {
+                        return armourTick;
+                    }
                 }
             }
             if (style == CombatBotConfig.ImpsCombatStyle.RANGED) {
@@ -4931,8 +6243,9 @@ public class ImpsHandler {
                     chatLog("Ranged boog upgrade opgehaald: " + bowUp);
                     return antiBan.varyDelay(randomDelay(600, 1000));
                 }
-                if (withdrawBestRangedArmorPieceFromBank()) {
-                    return antiBan.varyDelay(randomDelay(600, 1000));
+                armourTick = handleStyleArmourAtBank(style);
+                if (armourTick > 0) {
+                    return armourTick;
                 }
             }
             if (isFireStrikeAirGateActive() && style == CombatBotConfig.ImpsCombatStyle.MAGE) {
@@ -4943,12 +6256,7 @@ public class ImpsHandler {
                     return withdrawMageGear();
                 }
             }
-            Bank.close();
-            sleep(600, 1000);
-            gearPrepComplete = true;
-            preparingGear = false;
-            chatLog("[OK] Gear preparation compleet voor " + style + "!");
-            return antiBan.varyDelay(randomDelay(800, 1200));
+            return beginGearPrepEquipPhase(style);
         }
 
         // 5b. Alleen naar GE/fallback als bank de benodigde items echt niet heeft (zelfde checks als withdraw)
@@ -4998,16 +6306,10 @@ public class ImpsHandler {
                 if (!haveUsableBow) {
                     return false;
                 }
-                if (getTotalArrows() >= 100) {
+                if (getImpsEffectiveArrowCount() >= GEAR_PREP_MIN_ARROWS) {
                     return true;
                 }
-                String[] arrowTypes = {"Bronze arrow", "Iron arrow", "Steel arrow", "Mithril arrow", "Adamant arrow", "Rune arrow"};
-                for (String arrow : arrowTypes) {
-                    if (Bank.contains(arrow)) {
-                        return true;
-                    }
-                }
-                return false;
+                return RangedAmmoPreference.bankHasPreferredAmmo(config);
             }
 
             case MAGE: {
@@ -5056,10 +6358,13 @@ public class ImpsHandler {
     private String getMissingAmmoItem(CombatBotConfig.ImpsCombatStyle style) {
         switch (style) {
             case RANGED:
-                if (getTotalArrows() >= 100) return null;
-                if (Bank.isOpen() && Bank.contains(item -> item != null && item.getName() != null && item.getName().toLowerCase().contains("arrow")))
+                if (getImpsEffectiveArrowCount() >= GEAR_PREP_MIN_ARROWS) {
                     return null;
-                return "Bronze arrow";
+                }
+                if (Bank.isOpen() && RangedAmmoPreference.bankHasPreferredAmmo(config)) {
+                    return null;
+                }
+                return RangedAmmoPreference.geBuyItemName(config);
             case MAGE: {
                 CombatBotConfig.ImpsMageSpell spell = getActiveMageSpell();
                 String element = spell.getElementalRune().toLowerCase().replace(" rune", "");
@@ -5343,11 +6648,14 @@ public class ImpsHandler {
 
             // Check of fallback gear al beschikbaar is
             if (hasAdequateGearForStyle(fallback)) {
-                if (Bank.isOpen()) { Bank.close(); sleep(600, 1000); }
-                gearPrepComplete = true;
-                preparingGear = false;
-                chatLog("[OK] Fallback " + fallback + " gear al aanwezig!");
-                return antiBan.varyDelay(randomDelay(800, 1200));
+                int prepDone = tryCompleteGearPreparation(fallback);
+                if (prepDone == -1) {
+                    chatLog("[OK] Fallback " + fallback + " gear al aanwezig!");
+                    return antiBan.varyDelay(randomDelay(800, 1200));
+                }
+                if (prepDone > 0) {
+                    return prepDone;
+                }
             }
 
             if (bankHasRequiredItemsForStyle(fallback)) {
@@ -5633,6 +6941,7 @@ public class ImpsHandler {
         IInventoryItem weapon = null;
 
         if (style == CombatBotConfig.ImpsCombatStyle.MAGE) {
+            clearEquippedMeleeWeaponBlockingMage();
             // Deterministische staff selectie i.p.v. "Inventory.getFirst" (kan heen-en-weer wisselen).
             CombatBotConfig.ImpsMageSpell spell = getActiveMageSpell();
             String preferred = spell != null ? spell.getPreferredStaff() : null;
@@ -5712,11 +7021,12 @@ public class ImpsHandler {
             }
         }
         if (weapon != null) {
-            // Probeer Wield; sommige clients gebruiken Wear voor staves
-            String action = (style == CombatBotConfig.ImpsCombatStyle.MAGE && !weapon.hasAction("Wield"))
-                    ? (weapon.hasAction("Wear") ? "Wear" : "Wield")
-                    : "Wield";
-            weapon.interact(action);
+            if (!InventoryEquipHelper.tryWieldOrWear(config, weapon)) {
+                debugLog("equipGear: geen ruimte voor " + weapon.getName()
+                        + " (need " + InventoryEquipHelper.minFreeSlotsToWield(weapon.getName())
+                        + " free, have " + InventoryEquipHelper.freeSlots() + ")");
+                return;
+            }
             chatLog("Gear equipped: " + weapon.getName());
             sleep(800, 1200);
 
@@ -5754,11 +7064,25 @@ public class ImpsHandler {
             return antiBan.varyDelay(randomDelay(400, 800));
         }
 
-        if (withdrawBestMeleeArmorPieceFromBank()) {
-            return antiBan.varyDelay(randomDelay(600, 1000));
+        int armourTick = impsMeleeSkipsArmour() ? bankImpsMeleeArmourIfNeeded()
+                : handleStyleArmourAtBank(CombatBotConfig.ImpsCombatStyle.MELEE);
+        if (armourTick > 0) {
+            return armourTick;
         }
 
-        chatLog("[OK] Melee wapen + basis armor al aanwezig");
+        equipGear(CombatBotConfig.ImpsCombatStyle.MELEE);
+        if (!impsMeleeSkipsArmour() && tryEquipStyleArmour(CombatBotConfig.ImpsCombatStyle.MELEE)) {
+            return antiBan.varyDelay(randomDelay(650, 1050));
+        }
+        int prepDone = tryCompleteGearPreparation(CombatBotConfig.ImpsCombatStyle.MELEE);
+        if (prepDone == -1) {
+            chatLog("[OK] Melee wapen al aanwezig (uitgerust, geen armor — imps melee)");
+            return antiBan.varyDelay(randomDelay(300, 600));
+        }
+        if (prepDone > 0) {
+            return prepDone;
+        }
+        chatLog("[OK] Melee wapen al aanwezig (geen armor — imps melee)");
         return antiBan.varyDelay(randomDelay(300, 600));
     }
 
@@ -5776,25 +7100,16 @@ public class ImpsHandler {
     }
 
     private boolean isMeleeRecoveryGearReady() {
-        return hasMeleeWeapon()
-                && hasAnyInventoryOrEquipped(
-                        "Rune full helm", "Rune med helm", "Adamant full helm", "Adamant med helm",
-                        "Mithril full helm", "Mithril med helm", "Black full helm", "Black med helm",
-                        "Steel full helm", "Steel med helm", "Iron full helm", "Iron med helm",
-                        "Bronze full helm", "Bronze med helm")
-                && hasAnyInventoryOrEquipped(
-                        "Rune platebody", "Adamant platebody", "Mithril platebody", "Black platebody",
-                        "Steel platebody", "Iron platebody", "Bronze platebody",
-                        "Rune chainbody", "Adamant chainbody", "Mithril chainbody", "Black chainbody",
-                        "Steel chainbody", "Iron chainbody", "Bronze chainbody")
-                && hasAnyInventoryOrEquipped(
-                        "Rune platelegs", "Adamant platelegs", "Mithril platelegs", "Black platelegs",
-                        "Steel platelegs", "Iron platelegs", "Bronze platelegs",
-                        "Rune plateskirt", "Adamant plateskirt", "Mithril plateskirt", "Black plateskirt",
-                        "Steel plateskirt", "Iron plateskirt", "Bronze plateskirt")
-                && hasAnyInventoryOrEquipped(
-                        "Rune kiteshield", "Adamant kiteshield", "Mithril kiteshield", "Black kiteshield",
-                        "Steel kiteshield", "Iron kiteshield", "Bronze kiteshield", "Wooden shield");
+        return hasMeleeWeapon();
+    }
+
+    /** HEAD/BODY/LEGS/SHIELD: live inv+equip, snapshot-slot, of melee-plate/hele in dat slot. */
+    private boolean meleeArmorSlotReady(String slotName, String... itemNames) {
+        String rsn = BankSnapshotPlanner.currentDisplayName();
+        if (EquipmentStylePlanner.slotMatchesStyle(rsn, slotName, EquipmentStylePlanner.ArmorStyle.MELEE)) {
+            return true;
+        }
+        return hasAnyInventoryOrEquipped(itemNames);
     }
 
     private boolean withdrawBestMeleeArmorPieceFromBank() {
@@ -5837,10 +7152,15 @@ public class ImpsHandler {
                 best = Math.max(best, meleeTier(name));
             }
         }
+        String rsn = BankSnapshotPlanner.currentDisplayName();
+        best = Math.max(best, EquipmentStylePlanner.bestMeleeTierFromSnapshot(rsn, names, this::meleeTier));
         return best;
     }
 
     private boolean canUseMeleeTierItem(String name, boolean weapon) {
+        if (!weapon && name != null && StyleArmourBankHelper.requiresDragonSlayerToWear(name)) {
+            return StyleArmourBankHelper.canWear(CombatBotConfig.ImpsCombatStyle.MELEE, name);
+        }
         int required = meleeTierRequiredLevel(name);
         try {
             return Skills.getLevel(weapon ? Skill.ATTACK : Skill.DEFENCE) >= required;
@@ -5888,7 +7208,7 @@ public class ImpsHandler {
                 IInventoryItem item = Inventory.getFirst(name);
                 if (item != null && canUseMeleeTierItem(name, false)) {
                     String action = item.hasAction("Wear") ? "Wear" : (item.hasAction("Wield") ? "Wield" : "Wear");
-                    item.interact(action);
+                    InventoryActionHelper.interact(config, item, action);
                     chatLog("Melee armor aangedaan: " + name);
                     return true;
                 }
@@ -5905,8 +7225,17 @@ public class ImpsHandler {
     }
 
     private boolean hasAnyInventoryOrEquipped(String... names) {
+        String rsn = BankSnapshotPlanner.currentDisplayName();
         for (String n : names) {
-            if (Inventory.contains(n) || Equipment.contains(n)) return true;
+            if (n == null || n.isEmpty()) {
+                continue;
+            }
+            if (Inventory.contains(n) || Equipment.contains(n)) {
+                return true;
+            }
+            if (EquipmentSnapshotPlanner.hasEquippedItem(rsn, n)) {
+                return true;
+            }
         }
         return false;
     }
@@ -6132,6 +7461,12 @@ public class ImpsHandler {
     }
 
     private boolean canWearRangedArmorPiece(String name) {
+        if (StyleArmourBankHelper.canWear(CombatBotConfig.ImpsCombatStyle.RANGED, name)) {
+            return true;
+        }
+        if (name != null && StyleArmourBankHelper.requiresDragonSlayerToWear(name)) {
+            return false;
+        }
         try {
             int def = Skills.getLevel(Skill.DEFENCE);
             int rng = Skills.getLevel(Skill.RANGED);
@@ -6147,6 +7482,14 @@ public class ImpsHandler {
             String n = slotOrder[i];
             if ((Inventory.contains(n) || Equipment.contains(n)) && canWearRangedArmorPiece(n)) {
                 best = Math.min(best, i);
+            }
+        }
+        String rsn = BankSnapshotPlanner.currentDisplayName();
+        int snap = EquipmentStylePlanner.bestRangedRankFromSnapshot(rsn, slotOrder);
+        if (snap != Integer.MAX_VALUE) {
+            String snapName = slotOrder[snap];
+            if (snapName != null && canWearRangedArmorPiece(snapName)) {
+                best = Math.min(best, snap);
             }
         }
         return best;
@@ -6201,7 +7544,7 @@ public class ImpsHandler {
                 IInventoryItem item = Inventory.getFirst(pieceName);
                 if (item != null && canWearRangedArmorPiece(pieceName)) {
                     String action = item.hasAction("Wear") ? "Wear" : (item.hasAction("Wield") ? "Wield" : "Wear");
-                    item.interact(action);
+                    InventoryActionHelper.interact(config, item, action);
                     chatLog("Ranged armor aangedaan: " + pieceName);
                     return true;
                 }
@@ -6243,9 +7586,12 @@ public class ImpsHandler {
     }
 
     /**
-     * Pak ranged setup uit de bank: beste bruikbare boog (ranged level), arrows, daarna leather/d'hide (Def + Ranged checks).
+     * Ranged bank-withdraw: boog + arrows (geen equip — dat gebeurt in {@link #handleGearPrepEquipPhase}).
      */
-    private int withdrawRangedGear() {
+    private int withdrawRangedGearFromBankIfNeeded() {
+        if (!Bank.isOpen()) {
+            return 0;
+        }
         String better = firstUsableBetterRangedBowInBank();
         if (better != null) {
             Bank.withdraw(better, 1);
@@ -6261,25 +7607,141 @@ public class ImpsHandler {
                     return antiBan.varyDelay(randomDelay(600, 1000));
                 }
             }
-            chatLog("[!] Geen bruikbare boog in bank (of ranged level te laag)");
+        }
+
+        return withdrawBestArrowsFromBankIfNeeded();
+    }
+
+    /**
+     * Eén arrow-withdraw per aanroep; alleen als totaal &lt; {@link #GEAR_PREP_MIN_ARROWS}.
+     * @return delay &gt; 0 als withdraw geprobeerd
+     */
+    private int withdrawBestArrowsFromBankIfNeeded() {
+        if (!Bank.isOpen()) {
+            return 0;
+        }
+        if (getImpsEffectiveArrowCount() >= GEAR_PREP_MIN_ARROWS) {
+            gearPrepArrowWithdrawStreak = 0;
+            gearPrepLastArrowWithdrawName = "";
+            return 0;
+        }
+        for (String arrow : RangedAmmoPreference.withdrawOrder(config)) {
+            if (!Bank.contains(arrow)) {
+                continue;
+            }
+            if (arrow.equalsIgnoreCase(gearPrepLastArrowWithdrawName)) {
+                gearPrepArrowWithdrawStreak++;
+            } else {
+                gearPrepLastArrowWithdrawName = arrow;
+                gearPrepArrowWithdrawStreak = 1;
+            }
+            if (gearPrepArrowWithdrawStreak > GEAR_PREP_ARROW_WITHDRAW_MAX_STREAK) {
+                chatLog("[!] Gear prep: stop arrow withdraw na " + gearPrepArrowWithdrawStreak
+                        + "x (inv=" + getImpsEffectiveArrowCount() + "/" + GEAR_PREP_MIN_ARROWS
+                        + ", type=" + RangedAmmoPreference.preferredItemName(config) + ") — check ruimte/deposit");
+                return 0;
+            }
+            int before = getImpsEffectiveArrowCount();
+            ensureBankWithdrawUnnoted();
+            Bank.withdraw(arrow, Integer.MAX_VALUE);
+            sleep(550, 900);
+            int after = getImpsEffectiveArrowCount();
+            if (after > before) {
+                chatLog("Arrows opgehaald: " + arrow + " (+" + (after - before) + ", nu " + after + ")");
+                gearPrepArrowWithdrawStreak = 0;
+            } else {
+                chatLog("[!] Arrow withdraw geen effect: " + arrow + " (voor=" + before + ", na=" + after + ")");
+            }
+            return antiBan.varyDelay(randomDelay(600, 1000));
+        }
+        return 0;
+    }
+
+    /**
+     * Pak ranged setup uit de bank (withdraw only); equip via {@link #beginGearPrepEquipPhase}.
+     */
+    private int withdrawRangedGear() {
+        int rangedWithdraw = withdrawRangedGearFromBankIfNeeded();
+        if (rangedWithdraw > 0) {
+            return rangedWithdraw;
+        }
+
+        int armourTick = handleStyleArmourAtBank(CombatBotConfig.ImpsCombatStyle.RANGED);
+        if (armourTick > 0) {
+            return armourTick;
+        }
+
+        if (!bankHasRequiredItemsForStyle(CombatBotConfig.ImpsCombatStyle.RANGED)
+                && !hasAdequateGearForStyle(CombatBotConfig.ImpsCombatStyle.RANGED)) {
+            chatLog("[!] Geen ranged gear (boog/arrows) gevonden in bank");
             return antiBan.varyDelay(randomDelay(400, 800));
         }
 
-        String[] arrowTypes = {"Rune arrow", "Adamant arrow", "Mithril arrow", "Steel arrow", "Iron arrow", "Bronze arrow"};
-        for (String arrow : arrowTypes) {
-            if (Bank.contains(arrow)) {
-                Bank.withdraw(arrow, Integer.MAX_VALUE);
-                chatLog("Alle arrows opgehaald: " + arrow);
-                return antiBan.varyDelay(randomDelay(600, 1000));
+        return beginGearPrepEquipPhase(CombatBotConfig.ImpsCombatStyle.RANGED);
+    }
+
+    /**
+     * Bank: per armor-slot beste stuk voor style (level-check), ophalen of aantrekken.
+     * @return delay &gt; 0 als actie gedaan, anders 0
+     */
+    private int handleStyleArmourAtBank(CombatBotConfig.ImpsCombatStyle style) {
+        if (impsMeleeSkipsArmour(style)) {
+            gearPrepArmourBatchWithdrawDone = true;
+            return bankImpsMeleeArmourIfNeeded();
+        }
+        if (!Bank.isOpen()) {
+            gearPrepArmourBatchWithdrawDone = false;
+            return 0;
+        }
+        ensureBankWithdrawUnnoted();
+
+        if (!gearPrepArmourBatchWithdrawDone) {
+            StyleArmourBankHelper.withdrawAllForStyle(style, this::sleep);
+            gearPrepArmourBatchWithdrawDone = true;
+            chatLog("[Bank] " + style + " armor batch-withdraw (equip na bank-sluit)");
+            return antiBan.varyDelay(randomDelay(500, 900));
+        }
+
+        StyleArmourBankHelper.ArmourAction withdraw = StyleArmourBankHelper.tryWithdrawOneUpgrade(style);
+        if (withdraw != null) {
+            String key = withdraw.slot + "|" + withdraw.itemName;
+            if (key.equalsIgnoreCase(gearPrepLastArmourWithdrawKey)) {
+                gearPrepArmourWithdrawStreak++;
+            } else {
+                gearPrepLastArmourWithdrawKey = key;
+                gearPrepArmourWithdrawStreak = 1;
             }
+            if (gearPrepArmourWithdrawStreak > GEAR_PREP_ARMOUR_WITHDRAW_MAX_STREAK) {
+                chatLog("[!] Gear prep: stop armor withdraw na " + gearPrepArmourWithdrawStreak
+                        + "x " + withdraw.itemName + " (" + withdraw.slot + ")");
+                gearPrepArmourWithdrawStreak = 0;
+                gearPrepLastArmourWithdrawKey = "";
+                return 0;
+            }
+            chatLog("[Bank] " + style + " armor opgehaald: " + withdraw.itemName
+                    + " (slot " + withdraw.slot + ", Def/Rng/Mag lvl OK)");
+            sleep(300, 500);
+            return antiBan.varyDelay(randomDelay(400, 700));
         }
+        gearPrepArmourWithdrawStreak = 0;
+        gearPrepLastArmourWithdrawKey = "";
+        return 0;
+    }
 
-        if (withdrawBestRangedArmorPieceFromBank()) {
-            return antiBan.varyDelay(randomDelay(600, 1000));
+    private boolean tryEquipStyleArmour(CombatBotConfig.ImpsCombatStyle style) {
+        if (impsMeleeSkipsArmour(style)) {
+            return false;
         }
-
-        chatLog("[!] Geen arrows gevonden in bank");
-        return antiBan.varyDelay(randomDelay(400, 800));
+        StyleArmourBankHelper.ArmourAction equip = StyleArmourBankHelper.tryEquipOneFromInventory(config, style);
+        if (equip == null) {
+            return false;
+        }
+        if ("unequip".equals(equip.slot)) {
+            chatLog(style + ": melee armor uit voor ranged");
+            return true;
+        }
+        chatLog(style + " armor aangedaan: " + equip.itemName + " (" + equip.slot + ")");
+        return true;
     }
 
     /**
@@ -6465,6 +7927,14 @@ public class ImpsHandler {
             return antiBan.varyDelay(randomDelay(800, 1200));
         }
 
+        int mageArmourTick = handleStyleArmourAtBank(CombatBotConfig.ImpsCombatStyle.MAGE);
+        if (mageArmourTick > 0) {
+            return mageArmourTick;
+        }
+        if (tryEquipStyleArmour(CombatBotConfig.ImpsCombatStyle.MAGE)) {
+            return antiBan.varyDelay(randomDelay(650, 1050));
+        }
+
         if (spell.needsAirRune() && fireStrikeAirDepartureGateFails()) {
             int strictEnd = requiredInventoryAirForAccountAutoFireSetup();
             int dispEnd = strictEnd >= 0 ? strictEnd : requiredAirRunesForMageDeparture();
@@ -6476,13 +7946,15 @@ public class ImpsHandler {
             return antiBan.varyDelay(randomDelay(500, 900));
         }
 
-        // Alles opgehaald (incl. staff gedragen) - bank sluiten en gear prep afronden
-        Bank.close();
-        sleep(600, 1000);
-        gearPrepComplete = true;
-        preparingGear = false;
-        chatLog("[OK] Mage setup compleet voor " + spell.getSpellName());
-        return antiBan.varyDelay(randomDelay(1200, 1800));
+        int prepDone = tryCompleteGearPreparation(CombatBotConfig.ImpsCombatStyle.MAGE);
+        if (prepDone == -1) {
+            chatLog("[OK] Mage setup compleet voor " + spell.getSpellName());
+            return antiBan.varyDelay(randomDelay(1200, 1800));
+        }
+        if (prepDone > 0) {
+            return prepDone;
+        }
+        return antiBan.varyDelay(randomDelay(500, 900));
     }
 
     private String getNonPreferredStaffInInventory(String preferredStaffName) {
@@ -6804,7 +8276,12 @@ public class ImpsHandler {
                     paint.setCurrentStatus("[GE] GE: -> Bank (dichtstbij)");
                     return randomDelay(600, 1000);
                 }
-                if (!BankHelper.walkToNearestFullBank()) {
+                if (!BankHelper.walkToNearestFullBank("Coins")) {
+                    if (BankHelper.wasLastWalkSkippedDueToSnapshot()) {
+                        paint.setCurrentStatus("[GE] GE: snapshot geen coins in bank → GE");
+                        geSellStep = 2;
+                        return antiBan.varyDelay(randomDelay(800, 1200));
+                    }
                     paint.setCurrentStatus("[GE] GE: Geen bank gevonden");
                     return 3000;
                 }
@@ -6929,7 +8406,7 @@ public class ImpsHandler {
                 if (config.impsUseVarrockTeleport() && !varrockTeleportUsedThisGeTrip) {
                     SpellBook.Standard varrockTele = SpellBook.Standard.VARROCK_TELEPORT;
                     String rsnTp = impsLocalRsnOrNull();
-                    boolean canChronicle = VarrockTeleportHelper.tryExecuteChronicleTeleport(rsnTp);
+                    boolean canChronicle = VarrockTeleportHelper.tryExecuteChronicleTeleport(config, rsnTp);
                     if (canChronicle) {
                         chatLog("[TP] Chronicle (Diango) gebruikt i.p.v. Varrock-spell -> GE");
                         lastTeleportTime = now;
@@ -7419,13 +8896,38 @@ public class ImpsHandler {
         if (BankHelper.interactIfNearby()) {
             return antiBan.varyDelay(randomDelay(1500, 2500));
         }
-        // Loop naar dichtstbijzijnde volwaardige bank
-        if (!BankHelper.walkToNearestFullBank()) {
-            paint.setLastAntiBanAction("[!] Geen bank gevonden!");
+        String[] hoped = (hasDepositItems() || isRestocking) ? null : impsHopedBankWithdrawItems();
+        boolean walked = hoped == null || hoped.length == 0
+                ? BankHelper.walkToNearestFullBank()
+                : BankHelper.walkToNearestFullBank(hoped);
+        if (!walked) {
+            if (BankHelper.wasLastWalkSkippedDueToSnapshot()) {
+                paint.setLastAntiBanAction("Imps: snapshot bank leeg → GE");
+            } else {
+                paint.setLastAntiBanAction("[!] Geen bank gevonden!");
+            }
             return antiBan.varyDelay(randomDelay(2000, 3000));
         }
         paint.setCurrentStatus("Imps: -> Bank");
         return antiBan.varyDelay(randomDelay(1500, 2500));
+    }
+
+    /** Runes/staff/coins alleen meenemen in bank-walk als snapshot zegt dat ze er liggen. */
+    private String[] impsHopedBankWithdrawItems() {
+        String[] candidates = {
+                "Mind rune", "Air rune", "Water rune", "Earth rune", "Fire rune", "Body rune",
+                "Chaos rune", "Death rune",
+                "Staff of air", "Staff of fire", "Staff of water", "Staff of earth",
+                "Amulet of power", "Coins"
+        };
+        java.util.List<String> out = new java.util.ArrayList<>();
+        String rsn = BankSnapshotPlanner.currentDisplayName();
+        for (String c : candidates) {
+            if (BankSnapshotPlanner.shouldWalkToBankForWithdraw(rsn, c)) {
+                out.add(c);
+            }
+        }
+        return out.toArray(new String[0]);
     }
 
     /**

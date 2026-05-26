@@ -1,9 +1,9 @@
 package com.combatbot;
 
+import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 
 import java.util.HashSet;
 import java.util.List;
@@ -65,7 +65,8 @@ public final class StormAccountsBulkImport {
 
         JsonElement rootEl;
         try {
-            rootEl = JsonParser.parseString(json);
+            // Geen JsonParser.parseString: die methode bestaat pas vanaf Gson 2.8.6; RuneLite kan een oudere Gson laden.
+            rootEl = new Gson().fromJson(json, JsonElement.class);
         } catch (Exception e) {
             out.fatalError = "Ongeldige JSON: " + e.getMessage();
             return out;

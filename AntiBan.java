@@ -20,6 +20,10 @@ import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+import net.storm.api.domain.widgets.IWidget;
 
 /**
  * Anti-ban systeem met vloeiende camera bewegingen (pijltjes + middenmuisknop),
@@ -661,19 +665,27 @@ public class AntiBan {
             int glanceMs = randomRange(2000, 4001);
             Thread.sleep(glanceMs);
 
-            Keyboard.pressed(KeyEvent.VK_ESCAPE);
-            Thread.sleep(randomRange(55, 120));
-            Keyboard.released(KeyEvent.VK_ESCAPE);
-            Thread.sleep(randomRange(70, 180));
+            if (config.openInventoryViaMouseClick()) {
+                InventoryTabHelper.openInventoryTab(config);
+                Thread.sleep(randomRange(70, 180));
+            } else {
+                Keyboard.pressed(KeyEvent.VK_ESCAPE);
+                Thread.sleep(randomRange(55, 120));
+                Keyboard.released(KeyEvent.VK_ESCAPE);
+                Thread.sleep(randomRange(70, 180));
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             try {
                 Keyboard.released(key);
-                Keyboard.released(KeyEvent.VK_ESCAPE);
+                if (!config.openInventoryViaMouseClick()) {
+                    Keyboard.released(KeyEvent.VK_ESCAPE);
+                }
             } catch (Throwable ignored) {}
         }
 
-        reportAntiBanAction("TAB_GLANCE_KEYS", "Tab: F-toets → ESC (inv)");
+        reportAntiBanAction("TAB_GLANCE_KEYS",
+                config.openInventoryViaMouseClick() ? "Tab: F-toets → inv-klik" : "Tab: F-toets → ESC (inv)");
         return randomRange(250, 550);
     }
 
@@ -800,7 +812,7 @@ public class AntiBan {
         try {
             Tabs.open(glance);
             Thread.sleep(randomRange(2000, 4001));
-            Tabs.open(Tab.INVENTORY);
+            InventoryTabHelper.openInventoryTab(config);
             Thread.sleep(randomRange(80, 220));
             if (random.nextInt(100) < 35) {
                 Keyboard.pressed(KeyEvent.VK_ESCAPE);
@@ -1147,6 +1159,12 @@ public class AntiBan {
      * minimap of side panel. We honoreren dus de echte {@link
      * net.storm.api.domain.widgets.IWidget#isHidden()} state per widget.
      * <p>
+     * Daarnaast: chat-interface (162) heeft vaak <b>onzichtbare</b> kind-widgets (questtekst-
+     * balkjes, lege overlays) met wél bounds over de wereld — die blokkeren in-game geen klikken.
+     * Daarom: per interface-root recursief het <b>kleinste</b> widget onder de pixel zoeken en alleen
+     * blokkeren als dat widget <b>grafisch zichtbaar</b> is ({@code isVisible}, {@code isSelfHidden},
+     * {@code getOpacity} via reflectie waar de Storm-widget dat spiegelt van RuneLite).
+     * <p>
      * Layered approach:
      * <ol>
      *   <li>Probeer alle bekende UI-widgets te lezen. Als ten minste één leesbaar is, is dát
@@ -1204,9 +1222,9 @@ public class AntiBan {
     }
 
     /**
-     * Loopt door {@code groupChildPairs} en beoordeelt of (x,y) binnen een ZICHTBARE widget valt.
-     * Verborgen widgets ({@link net.storm.api.domain.widgets.IWidget#isHidden()} == true) tellen
-     * niet als blokkade — daar kun je doorheen klikken.
+     * Loopt door {@code groupChildPairs} (interface-roots) en beoordeelt of (x,y) onder een
+     * <b>echt zichtbaar</b> UI-widget valt. Alleen {@code isHidden()} is onvoldoende: kinderen van
+     * de chat (162) kunnen bounds over de 3D-view hebben terwijl ze transparant / niet getoond zijn.
      */
     private WidgetReachability pointInsideAnyVisibleWidget(int x, int y, int[][] groupChildPairs) {
         if (groupChildPairs == null) return new WidgetReachability(false, false);
@@ -1215,17 +1233,14 @@ public class AntiBan {
         for (int[] pair : groupChildPairs) {
             if (pair == null || pair.length < 2) continue;
             try {
-                net.storm.api.domain.widgets.IWidget w =
-                        net.storm.sdk.widgets.Widgets.get(pair[0], pair[1]);
-                if (w == null) continue;
+                IWidget root = net.storm.sdk.widgets.Widgets.get(pair[0], pair[1]);
+                if (root == null) continue;
                 readable = true;
-                if (w.isHidden()) continue; // verborgen UI = doorklikbaar, niet blokkerend
-                Rectangle b = w.getBounds();
-                if (b == null || b.width <= 0 || b.height <= 0) continue;
-                if (b.contains(x, y)) {
+                AtomicInteger bestArea = new AtomicInteger(Integer.MAX_VALUE);
+                AtomicReference<IWidget> best = new AtomicReference<>();
+                visitStormWidgetHitForUiBlock(root, x, y, bestArea, best);
+                if (best.get() != null) {
                     insideVisible = true;
-                    // niet break — we willen `readable` ook voor andere widgets bevestigen,
-                    // maar voor de blokkade hebben we al genoeg.
                     break;
                 }
             } catch (Throwable ignored) {
@@ -1233,6 +1248,106 @@ public class AntiBan {
             }
         }
         return new WidgetReachability(readable, insideVisible);
+    }
+
+    /** Zelfde volgorde als {@link CombatBotPlugin#getWidgetChildren}: dynamic → children → nested. */
+    private static IWidget[] stormWidgetChildren(IWidget parent) {
+        if (parent == null) {
+            return null;
+        }
+        IWidget[] ch = parent.getDynamicChildren();
+        if (ch != null && ch.length > 0) {
+            return ch;
+        }
+        ch = parent.getChildren();
+        if (ch != null && ch.length > 0) {
+            return ch;
+        }
+        ch = parent.getNestedChildren();
+        if (ch != null && ch.length > 0) {
+            return ch;
+        }
+        return null;
+    }
+
+    private static Boolean invokeWidgetBoolNoArgs(IWidget w, String method) {
+        try {
+            Object r = w.getClass().getMethod(method).invoke(w);
+            if (r instanceof Boolean) {
+                return (Boolean) r;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static Integer invokeWidgetIntNoArgs(IWidget w, String method) {
+        try {
+            Object r = w.getClass().getMethod(method).invoke(w);
+            if (r instanceof Integer) {
+                return (Integer) r;
+            }
+            if (r instanceof Number) {
+                return ((Number) r).intValue();
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /**
+     * Widget telt mee als klik-blokkerende UI: niet hidden, en (indien aanwezig op implementatie)
+     * zichtbaar, niet self-hidden, opacity &gt; 0.
+     */
+    private static boolean isStormWidgetGraphicallyOpaque(IWidget w) {
+        if (w == null || w.isHidden()) {
+            return false;
+        }
+        if (Boolean.FALSE.equals(invokeWidgetBoolNoArgs(w, "isVisible"))) {
+            return false;
+        }
+        if (Boolean.TRUE.equals(invokeWidgetBoolNoArgs(w, "isSelfHidden"))) {
+            return false;
+        }
+        Integer op = invokeWidgetIntNoArgs(w, "getOpacity");
+        if (op != null && op <= 0) {
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Zoekt het kleinste bounds-oppervlak onder (x,y) in de boom; alleen kandidaten die
+     * {@link #isStormWidgetGraphicallyOpaque(IWidget)} passeren (transparante overlays tellen niet).
+     */
+    private static void visitStormWidgetHitForUiBlock(IWidget w, int x, int y,
+            AtomicInteger bestArea, AtomicReference<IWidget> best) {
+        if (w == null) {
+            return;
+        }
+        try {
+            Rectangle b = w.getBounds();
+            if (b != null && b.width > 0 && b.height > 0
+                    && x >= b.x && x < b.x + b.width
+                    && y >= b.y && y < b.y + b.height) {
+                if (isStormWidgetGraphicallyOpaque(w)) {
+                    int area = b.width * b.height;
+                    if (area < bestArea.get()) {
+                        bestArea.set(area);
+                        best.set(w);
+                    }
+                }
+            }
+            IWidget[] ch = stormWidgetChildren(w);
+            if (ch != null) {
+                for (IWidget c : ch) {
+                    if (c != null) {
+                        visitStormWidgetHitForUiBlock(c, x, y, bestArea, best);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     /** Midden van player-model (convex hull) of fallback tile-poly center (iets omhoog). */

@@ -107,17 +107,55 @@ public class GiantsHandler {
             "Bronze arrow", "Iron arrow", "Steel arrow", "Mithril arrow", "Adamant arrow", "Rune arrow"
     };
 
-    /** Dynamische keep-list voor Giants (zoals Imps getFullKeepList): spell-runes + gear. */
+    /** Dynamische keep-list voor Giants (zoals Imps getFullKeepList): spell-runes + style-armor + wapens. */
     private List<String> getGiantsKeepList() {
         List<String> keep = new ArrayList<>(Arrays.asList(GIANTS_KEEP_BASE));
         CombatBotConfig.ImpsCombatStyle style = giantsCombatStyleBaselineForAccount();
-        if (style == CombatBotConfig.ImpsCombatStyle.MAGE) {
+        for (String armour : StyleArmourBankHelper.armourItemNamesForStyle(style)) {
+            addGiantsKeepName(keep, armour);
+        }
+        if (style == CombatBotConfig.ImpsCombatStyle.MELEE) {
+            for (String w : MELEE_TIER) {
+                addGiantsKeepName(keep, w);
+            }
+        } else if (style == CombatBotConfig.ImpsCombatStyle.RANGED) {
+            addGiantsKeepName(keep, "Shortbow");
+            addGiantsKeepName(keep, "Oak shortbow");
+            addGiantsKeepName(keep, "Willow shortbow");
+            addGiantsKeepName(keep, "Maple shortbow");
+            addGiantsKeepName(keep, "Yew shortbow");
+            addGiantsKeepName(keep, "Magic shortbow");
+            addGiantsKeepName(keep, "Longbow");
+            addGiantsKeepName(keep, "Oak longbow");
+            addGiantsKeepName(keep, "Willow longbow");
+            addGiantsKeepName(keep, "Maple longbow");
+            addGiantsKeepName(keep, "Yew longbow");
+            addGiantsKeepName(keep, "Magic longbow");
+        } else if (style == CombatBotConfig.ImpsCombatStyle.MAGE) {
             CombatBotConfig.ImpsMageSpell spell = config.giantsMageSpell();
             if (!keep.contains(spell.getElementalRune())) keep.add(spell.getElementalRune());
             if (!keep.contains(spell.getCatalystRune())) keep.add(spell.getCatalystRune());
             if (spell.needsAirRune() && !keep.contains("Air rune")) keep.add("Air rune");
+            addGiantsKeepName(keep, spell.getPreferredStaff());
+            addGiantsKeepName(keep, "Staff of air");
+            addGiantsKeepName(keep, "Staff of fire");
+            addGiantsKeepName(keep, "Staff of water");
+            addGiantsKeepName(keep, "Staff of earth");
+            addGiantsKeepName(keep, "Staff");
         }
         return keep;
+    }
+
+    private static void addGiantsKeepName(List<String> keep, String name) {
+        if (name == null || name.isEmpty()) {
+            return;
+        }
+        for (String k : keep) {
+            if (k.equalsIgnoreCase(name)) {
+                return;
+            }
+        }
+        keep.add(name);
     }
 
     /** Strikte bank keep-list voor Giants banking/gear prep. */
@@ -138,15 +176,18 @@ public class GiantsHandler {
         // Bewaar huidige food stacks; de rest mag naar bank.
         for (IInventoryItem item : Inventory.getAll()) {
             if (item != null && item.getName() != null && (item.hasAction("Eat") || item.hasAction("Drink"))) {
-                boolean exists = false;
-                for (String k : keep) {
-                    if (k.equalsIgnoreCase(item.getName())) {
-                        exists = true;
-                        break;
-                    }
-                }
-                if (!exists) keep.add(item.getName());
+                addGiantsKeepName(keep, item.getName());
             }
+        }
+        // Uitrusting mag niet per ongeluk gedeponeerd worden tijdens deposit-fase.
+        try {
+            var equipped = Equipment.getAll(item -> item != null && item.getName() != null);
+            if (equipped != null) {
+                for (var eq : equipped) {
+                    addGiantsKeepName(keep, eq.getName());
+                }
+            }
+        } catch (Exception ignored) {
         }
         return keep;
     }
@@ -176,6 +217,9 @@ public class GiantsHandler {
             if (keep.equalsIgnoreCase(name)) return true;
         }
         if (item.hasAction("Eat") || item.hasAction("Drink")) return true;
+        CombatBotConfig.ImpsCombatStyle style = giantsCombatStyleBaselineForAccount();
+        if (StyleArmourBankHelper.canWear(style, name)) return true;
+        if (StyleArmourBankHelper.isCosmeticOrNonCombatFootwear(name)) return false;
         String lower = name.toLowerCase();
         if (lower.contains("scimitar") || lower.contains("sword") || lower.contains("dagger") || lower.contains("mace")
                 || lower.contains("bow") || lower.contains("staff") || lower.contains("halberd")
@@ -703,13 +747,13 @@ public class GiantsHandler {
         IInventoryItem food = Inventory.getFirst(item ->
                 item != null && item.getName() != null && item.hasAction("Eat"));
         if (food != null) {
-            food.interact("Eat");
+            InventoryActionHelper.interact(config, food, "Eat");
             return 1200 + random.nextInt(600);
         }
         IInventoryItem drink = Inventory.getFirst(item ->
                 item != null && item.getName() != null && item.hasAction("Drink"));
         if (drink != null) {
-            drink.interact("Drink");
+            InventoryActionHelper.interact(config, drink, "Drink");
             return 1200 + random.nextInt(600);
         }
         return 600;
@@ -873,9 +917,10 @@ public class GiantsHandler {
                 if (staffInInv && !staffEquipped) {
                     IInventoryItem staff = Inventory.getFirst(item -> item != null && item.getName() != null && item.getName().toLowerCase().contains("staff"));
                     if (staff != null) {
-                        staff.interact(staff.hasAction("Wield") ? "Wield" : "Wear");
-                        sleep(800, 1200);
-                        return 1000;
+                        if (InventoryEquipHelper.tryWieldOrWear(config, staff)) {
+                            sleep(800, 1200);
+                            return 1000;
+                        }
                     }
                 }
                 SpellBook.Standard stdSpell = spell.getStandardSpell();
@@ -997,7 +1042,7 @@ public class GiantsHandler {
                     }
 
                     // 4. Teleport runes
-                    VarrockTeleportHelper.prepareVarrockTeleport();
+                    VarrockTeleportHelper.prepareVarrockTeleport(config);
 
                     // 5. Sluit bank
                     Bank.close();
@@ -1450,28 +1495,10 @@ public class GiantsHandler {
         // Stap 1: Inv-check + deposit alles behalve keep-list (zoals Imps handleBankRestock)
         doInventoryCheckAndLog();
         List<String> keepNames = getGiantsStrictBankKeepNames();
-        Bank.depositAllExcept(keepNames.toArray(new String[0]));
-        sleep(500, 800);
-        if (hasGiantsStrictDepositItems()) {
-            var remaining = Inventory.getAll(item -> {
-                if (item == null || item.getName() == null) return false;
-                for (String k : keepNames) {
-                    if (k.equalsIgnoreCase(item.getName())) return false;
-                }
-                return true;
-            });
-            if (remaining != null) {
-                for (var rem : remaining) {
-                    if (shouldAbortActions()) {
-                        break;
-                    }
-                    if (rem != null && rem.getName() != null) {
-                        Bank.depositAll(rem.getName());
-                        sleep(100, 250);
-                    }
-                }
-            }
-            sleep(300, 500);
+        for (int depPass = 0; depPass < 4 && hasGiantsStrictDepositItems(); depPass++) {
+            depositForeignGiantsInventoryItems();
+            BankDepositHelper.depositAllExceptKeep(keepNames.toArray(new String[0]));
+            sleep(450, 750);
         }
         // Bank-interface laten stabiliseren vóór withdraw (anders faalt contains/quickWithdraw soms).
         sleep(600, 1000);
@@ -1636,13 +1663,13 @@ public class GiantsHandler {
             boolean shouldEquipFromInv = bestInvItem != null
                     && (equippedIdx < 0 || bestInvIdx < equippedIdx);
             if (shouldEquipFromInv) {
-                String action = bestInvItem.hasAction("Wield") ? "Wield"
-                        : (bestInvItem.hasAction("Wear") ? "Wear" : null);
-                if (action != null) {
-                    bestInvItem.interact(action);
-                    debug("[Bank] " + action + " " + bestInvMelee
+                if (InventoryEquipHelper.tryWieldOrWear(config, bestInvItem)) {
+                    debug("[Bank] Wield " + bestInvMelee
                             + (equippedMelee != null ? " (swap " + equippedMelee + " → " + bestInvMelee + ")" : " (auto-equip)"));
                     sleep(500, 800);
+                } else {
+                    debug("[Bank] skip melee wield " + bestInvMelee + " — need "
+                            + InventoryEquipHelper.minFreeSlotsToWield(bestInvMelee) + " free slots");
                 }
             }
         }
@@ -1657,8 +1684,9 @@ public class GiantsHandler {
             if (staffInInv && !staffEquipped) {
                 IInventoryItem staff = Inventory.getFirst(item -> item != null && item.getName() != null && item.getName().toLowerCase().contains("staff"));
                 if (staff != null) {
-                    staff.interact(staff.hasAction("Wield") ? "Wield" : "Wear");
-                    sleep(600, 1000);
+                    if (InventoryEquipHelper.tryWieldOrWear(config, staff)) {
+                        sleep(600, 1000);
+                    }
                 }
             }
         }
@@ -1671,19 +1699,25 @@ public class GiantsHandler {
             IInventoryItem amulet = Inventory.getFirst(item -> item != null && item.getName() != null
                     && item.getName().toLowerCase().contains("amulet"));
             if (amulet != null) {
-                amulet.interact(amulet.hasAction("Wear") ? "Wear" : "Wield");
+                InventoryActionHelper.interact(config, amulet, amulet.hasAction("Wear") ? "Wear" : "Wield");
                 sleep(500, 800);
             }
         }
 
-        // Stap 8: Sluit bank alleen als essentials echt compleet zijn.
+        // Stap 8: Sluit bank alleen als essentials echt compleet zijn (geen vreemde inv-items).
         int foodNow = countFoodInInv();
         boolean readyFood = foodNow >= foodNeed;
         boolean readyGear = hasWeaponForStyle(style);
         boolean readyKey = Inventory.contains(BRASS_KEY);
-        if (!readyFood || !readyGear || !readyKey) {
+        boolean readyInv = !hasForeignItemsForGiants() && !hasGiantsStrictDepositItems();
+        if (!readyFood || !readyGear || !readyKey || !readyInv) {
             debug("[Bank] Nog niet klaar: food=" + foodNow + "/" + foodNeed
-                    + ", gear=" + readyGear + ", key=" + readyKey + " → bank open laten");
+                    + ", gear=" + readyGear + ", key=" + readyKey + ", invClean=" + readyInv
+                    + " → bank open laten");
+            if (!readyInv && Bank.isOpen()) {
+                depositForeignGiantsInventoryItems();
+                BankDepositHelper.depositAllExceptKeep(getGiantsStrictBankKeepNames().toArray(new String[0]));
+            }
             return 900 + random.nextInt(400);
         }
 
@@ -1924,6 +1958,9 @@ public class GiantsHandler {
             String r = checkGiantsRuneSupply();
             if (r != null) debug("[Inv] → moet banken: " + r);
         }
+        if (hasForeignItemsForGiants()) {
+            debug("[Inv] → moet banken: vreemde items in inv (niet passend bij " + style + ")");
+        }
         if (needsBankingFromInvCheck()) debug("[Inv] → conclusie: naar bank");
         else if (haveKey) debug("[Inv] → conclusie: alles aanwezig, naar dungeon");
     }
@@ -1946,23 +1983,53 @@ public class GiantsHandler {
         return false;
     }
 
-    /** Vreemde items voor Giants: niet in keep-list, geen food, geen Giants-loot. */
+    /** Vreemde items voor Giants: niet in keep-list, geen food, geen Giants-loot, geen style-armor/wapen. */
     private boolean hasForeignItemsForGiants() {
         final String[] giantsLoot = getLootItems();
         return Inventory.getFirst(item -> {
             if (item == null || item.getName() == null) return false;
             String name = item.getName();
-            // Keep-list + food zijn toegestaan
-            for (String k : getGiantsStrictBankKeepNames()) {
+            if (item.hasAction("Eat") || item.hasAction("Drink")) return false;
+            if (shouldKeepItemGiants(item)) return false;
+            for (String k : getGiantsKeepList()) {
                 if (k.equalsIgnoreCase(name)) return false;
             }
-            if (item.hasAction("Eat") || item.hasAction("Drink")) return false;
-            // Giants loot is ook toegestaan (wordt door normale loot-bank flow afgehandeld)
             for (String l : giantsLoot) {
                 if (l != null && l.equalsIgnoreCase(name)) return false;
             }
             return true;
         }) != null;
+    }
+
+    /** Deponeer expliciet items die niet bij Giants-style horen (bv. mage-chaps bij melee). */
+    private void depositForeignGiantsInventoryItems() {
+        if (!Bank.isOpen()) {
+            return;
+        }
+        for (IInventoryItem item : Inventory.getAll()) {
+            if (item == null || item.getName() == null) {
+                continue;
+            }
+            if (item.hasAction("Eat") || item.hasAction("Drink")) {
+                continue;
+            }
+            if (shouldKeepItemGiants(item)) {
+                continue;
+            }
+            boolean inKeep = false;
+            for (String k : getGiantsKeepList()) {
+                if (k.equalsIgnoreCase(item.getName())) {
+                    inKeep = true;
+                    break;
+                }
+            }
+            if (inKeep) {
+                continue;
+            }
+            Bank.depositAll(item.getName());
+            debug("[Bank] vreemd item weg: " + item.getName());
+            sleep(300, 550);
+        }
     }
 
     /** Inv-check: log wat we hebben en wat we nodig hebben (instellingen). Roep aan met bank open. */
@@ -2241,58 +2308,12 @@ public class GiantsHandler {
 
     /** Pak per slot het beste draagbare armorstuk uit de bank. Ontbrekende armor blokkeert Giants niet. */
     private void withdrawBestArmourForStyleInOneGo(CombatBotConfig.ImpsCombatStyle style) {
-        GearPiece[] list = armourTierForStyle(style);
-        for (String slot : gearSlots(list)) {
-            GearPiece owned = bestOwnedGearForSlot(list, slot);
-            GearPiece bankBest = bestBankGearForSlot(list, slot);
-            if (bankBest == null) {
-                continue;
-            }
-            int ownedIdx = owned != null ? gearTierIndex(list, owned.name) : Integer.MAX_VALUE;
-            int bankIdx = gearTierIndex(list, bankBest.name);
-            if (bankIdx >= ownedIdx) {
-                continue;
-            }
-            if (owned != null && Inventory.contains(owned.name)) {
-                Bank.depositAll(owned.name);
-                sleep(250, 500);
-            }
-            Bank.withdraw(bankBest.name, 1);
-            sleep(350, 650);
-            debug("[Bank] armor " + bankBest.name + " (" + style + ", slot=" + slot
-                    + ", def=" + safeDefenseLevel() + ", range=" + safeRangedLevel()
-                    + ", magic=" + safeMagicLevel() + ")");
-        }
+        StyleArmourBankHelper.withdrawAllForStyle(style, this::sleep);
     }
 
-    /** Equip alle beste style-armor uit inventory. Als het dragen faalt, verdwijnt het volgende bankpass vanzelf terug naar bank. */
+    /** Equip alle beste style-armor uit inventory. */
     private void equipBestArmourFromInventory(CombatBotConfig.ImpsCombatStyle style) {
-        GearPiece[] list = armourTierForStyle(style);
-        for (String slot : gearSlots(list)) {
-            GearPiece best = null;
-            IInventoryItem item = null;
-            for (GearPiece g : list) {
-                if (!g.slot.equals(slot)) continue;
-                if (!canWearGear(g)) continue;
-                IInventoryItem hit = Inventory.getFirst(inv -> inv != null && inv.getName() != null
-                        && g.name.equalsIgnoreCase(inv.getName()));
-                if (hit != null) {
-                    best = g;
-                    item = hit;
-                    break;
-                }
-            }
-            if (item == null || best == null) {
-                continue;
-            }
-            String action = item.hasAction("Wear") ? "Wear" : (item.hasAction("Wield") ? "Wield" : null);
-            if (action == null) {
-                continue;
-            }
-            item.interact(action);
-            debug("[Bank] " + action + " " + best.name + " (auto-equip armor, " + style + ")");
-            sleep(350, 650);
-        }
+        StyleArmourBankHelper.equipAllFromInventory(config, style, this::sleep);
     }
 
     /** Haal alle gear voor deze style in één keer (één bank sessie, zoals Imps). */
@@ -2348,8 +2369,7 @@ public class GiantsHandler {
                     Bank.withdraw("Longbow", 1);
                     sleep(500, 800);
                 }
-                String[] arrowTypes = {"Rune arrow", "Adamant arrow", "Mithril arrow", "Steel arrow", "Iron arrow", "Bronze arrow"};
-                for (String arrow : arrowTypes) {
+                for (String arrow : RangedAmmoPreference.withdrawOrder(config)) {
                     if (Bank.contains(arrow)) {
                         Bank.withdraw(arrow, Integer.MAX_VALUE);
                         sleep(500, 800);
@@ -2711,7 +2731,7 @@ public class GiantsHandler {
         });
         if (bone == null || !bone.hasAction("Bury")) return 0;
 
-        bone.interact("Bury");
+        InventoryActionHelper.interact(config, bone, "Bury");
         lastBuryActionMs = now;
         return 600 + random.nextInt(350);
     }

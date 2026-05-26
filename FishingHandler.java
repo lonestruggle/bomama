@@ -145,6 +145,16 @@ public class FishingHandler {
     private static final int FISHING_RESTOCK_STACK_TARGET = 1000;
     private static final int GE_PRICE_FISHING_ROD = 1000;
     private static final int GE_PRICE_FLY_ROD = 1000;
+    private static final int GE_PRICE_SMALL_NET = 500;
+    private static final int GE_PRICE_HARPOON = 1500;
+    private static final int GE_PRICE_LOBSTER_POT = 1500;
+    private static final int GE_PRICE_DEFAULT_TOOL = 1000;
+    private static final int MAX_GE_RESTOCK_FAILS = 3;
+    private static final long GE_RESTOCK_FAIL_COOLDOWN_MS = 4000L;
+    private int geRestockFailStreak = 0;
+    private String geRestockFailItem = "";
+    /** &gt;0: eerst dit bedrag aan coins uit bank halen, daarna GE-restock. */
+    private int pendingGeCoinsWithdrawTarget = 0;
     private static final String[] DEFAULT_IMPS_GE_SELL_ITEMS = {
             "Black bead", "Red bead", "Yellow bead", "White bead", "Mind talisman", "Fiendish ashes"
     };
@@ -173,12 +183,15 @@ public class FishingHandler {
         bankSessionCompletedTime = 0;
         restockNeedsCoinRaise = false;
         pendingImpsCashFarmRequest = null;
+        geRestockFailStreak = 0;
+        geRestockFailItem = "";
+        pendingGeCoinsWithdrawTarget = 0;
         fatalBankRouteGraceUntilMs = System.currentTimeMillis() + FATAL_BANK_ROUTE_GRACE_MS;
         consecutiveBankRoutePathFails = 0;
         lastBankRoutePathFailMs = 0L;
     }
 
-    /** Build requirements voor UBM: tool (1,1) en optionele bait (min, target). */
+    /** Build requirements voor UBM: tool (1,1) en optionele bait (min, alles uit bank). */
     private List<UniversalBankingManager.Requirement> buildFishingRequirements() {
         String[] method = getTargetMethod();
         String toolName = method[2];
@@ -191,17 +204,78 @@ public class FishingHandler {
         list.add(new UniversalBankingManager.Requirement(toolName, 1, 1));
         if (baitName != null && !baitName.isEmpty()) {
             int baitMin = Math.max(0, config.fishingBaitMin());
-            int baitTarget = Math.max(baitMin, config.fishingBaitTarget());
-            int baitNow = getItemQuantity(baitName);
-            // Gewenst gedrag:
-            // - Start/onder min: aanvullen naar target.
-            // - Boven/equal min: NIET elke banktrip opnieuw naar target aanvullen.
-            int effectiveTarget = baitNow < baitMin ? baitTarget : baitNow;
+            int baitNow = getInventoryStackCount(baitName);
+            int effectiveTarget = computeBaitWithdrawTargetAll(baitName, baitNow);
             debug("buildFishingRequirements: bait=" + baitName + " now=" + baitNow
-                    + " min=" + baitMin + " target=" + baitTarget + " effectiveTarget=" + effectiveTarget);
+                    + " bankTriggerMin=" + baitMin + " withdrawTarget=" + effectiveTarget
+                    + " (bank=" + getBankStackCount(baitName) + ")");
             list.add(new UniversalBankingManager.Requirement(baitName, baitMin, effectiveTarget));
         }
         return list;
+    }
+
+    /**
+     * Hele bankstack bait/feathers (stackable = 1 slot). {@code fishingBaitMin} is alleen
+     * drempel wanneer te banken — geen withdraw-limiet (niet meer vast 50).
+     * Slots na deposit meegerekend (vis weg vóór withdraw in UBM).
+     */
+    private int computeBaitWithdrawTargetAll(String baitName, int baitNow) {
+        int bankQty = getBankStackCount(baitName);
+        if (bankQty <= 0) {
+            return baitNow;
+        }
+        int slotsAfterDeposit = Inventory.getFreeSlots() + countInventorySlotsFreedByFishingDeposit();
+        if (baitNow > 0 || slotsAfterDeposit >= 1) {
+            return baitNow + bankQty;
+        }
+        return baitNow;
+    }
+
+    /** Slots die vrijkomen als UBM alles behalve tool+bait stort. */
+    private int countInventorySlotsFreedByFishingDeposit() {
+        String[] method = getTargetMethod();
+        if (method == null) {
+            return 0;
+        }
+        String toolName = method.length > 2 && method[2] != null ? method[2].trim() : "";
+        String baitName = method.length > 3 && method[3] != null ? method[3].trim() : "";
+        List<IInventoryItem> all = Inventory.getAll();
+        if (all == null) {
+            return 0;
+        }
+        int freed = 0;
+        for (IInventoryItem item : all) {
+            if (item == null || item.getName() == null) {
+                continue;
+            }
+            String name = item.getName();
+            if (!toolName.isEmpty() && name.equalsIgnoreCase(toolName)) {
+                continue;
+            }
+            if (!baitName.isEmpty() && name.equalsIgnoreCase(baitName)) {
+                continue;
+            }
+            freed++;
+        }
+        return freed;
+    }
+
+    private int getInventoryStackCount(String itemName) {
+        if (itemName == null || itemName.isEmpty()) return 0;
+        try {
+            return Math.max(0, Inventory.getCount(true, itemName));
+        } catch (Exception ignored) {
+            return getItemQuantity(itemName);
+        }
+    }
+
+    private int getBankStackCount(String itemName) {
+        if (itemName == null || itemName.isEmpty() || !Bank.isOpen()) return 0;
+        try {
+            return Math.max(0, Bank.getCount(true, itemName));
+        } catch (Exception ignored) {
+            return Bank.contains(itemName) ? 10_000 : 0;
+        }
     }
 
     public void setActiveCenter(WorldPoint center, int radius) {
@@ -216,6 +290,20 @@ public class FishingHandler {
     }
 
     public WorldPoint getFishingSpot() { return fishingSpot; }
+
+    private AccountCenterBehaviorStore.CenterBehavior fishingCenterBehavior() {
+        return AccountCenterBehaviorStore.forCenter(
+                AccountCenterBehaviorStore.SkillKind.FISHING, fishingSpot, config);
+    }
+
+    private boolean effectiveFishingDropFish() {
+        return fishingCenterBehavior().drop;
+    }
+
+    private boolean effectiveFishingCookEnabled() {
+        return fishingCenterBehavior().extra;
+    }
+
     public FishingState getCurrentState() { return currentState; }
 
     public ImpsCashFarmRequest pollImpsCashFarmRequest() {
@@ -241,9 +329,33 @@ public class FishingHandler {
                 return handleRestocking();
             }
 
-            // 2. Alles-of-Niets check: tool + bait
+            // 1b. Eerst coins uit bank (GE kan niet withdrawen; snapshot JSON mist Coins soms)
+            if (pendingGeCoinsWithdrawTarget > 0) {
+                int coinTarget = pendingGeCoinsWithdrawTarget;
+                if (Bank.isOpen()) {
+                    debug("loop: bank open → withdraw " + coinTarget + " gp voor GE");
+                    withdrawCoinsForGeIfNeeded(coinTarget);
+                    pendingGeCoinsWithdrawTarget = 0;
+                    bankSessionCompleted = false;
+                    sleep(300, 500);
+                    Bank.close();
+                    sleep(300, 500);
+                    currentState = FishingState.RESTOCK_WALKING_TO_GE;
+                    paint.setCurrentStatus("🛒 → Grand Exchange");
+                    return handleRestockWalkToGE();
+                }
+                currentState = FishingState.WALKING_TO_BANK;
+                paint.setCurrentStatus("→ Bank (coins voor GE)");
+                return handleWalkToBank();
+            }
+
+            // 2. Alles-of-Niets check: tool + bait (baitMin = wanneer banken, niet hoeveel ophalen)
             boolean needsTool = !hasTool(requiredTool);
-            boolean needsBait = !requiredBait.isEmpty() && !Inventory.contains(requiredBait);
+            int baitMinCheck = Math.max(0, config.fishingBaitMin());
+            boolean needsBait = !requiredBait.isEmpty()
+                    && (baitMinCheck <= 0
+                    ? !Inventory.contains(requiredBait)
+                    : getInventoryStackCount(requiredBait) < baitMinCheck);
 
             if (needsTool || needsBait) {
                 if (bankRetries >= MAX_BANK_RETRIES) {
@@ -262,6 +374,44 @@ public class FishingHandler {
                     return handleUnifiedBanking();
                 }
 
+                String rsn = BankSnapshotPlanner.currentDisplayName();
+                boolean walkBank = false;
+                if (needsTool && BankSnapshotPlanner.shouldWalkToBankForWithdraw(rsn, requiredTool)) {
+                    walkBank = true;
+                }
+                if (needsBait && !requiredBait.isEmpty()
+                        && BankSnapshotPlanner.shouldWalkToBankForWithdraw(rsn, requiredBait)) {
+                    walkBank = true;
+                }
+                if (!BankSnapshotPlanner.hasPersistedSnapshot(rsn)) {
+                    walkBank = true;
+                }
+                if (!walkBank) {
+                    if (!config.fishingRestockEnabled()) {
+                        saveBankPosition();
+                        currentState = FishingState.WALKING_TO_BANK;
+                        paint.setCurrentStatus("→ Bank (" + missing + " ophalen)");
+                        return handleWalkToBank();
+                    }
+                    int coinsNeeded = estimateRequiredCoinsForRestockPlan(
+                            buildFishingRestockPlan(requiredTool, requiredBait));
+                    if (getInventoryCoinCount() < coinsNeeded
+                            && BankSnapshotPlanner.shouldWithdrawBankCoinsBeforeGe(rsn, coinsNeeded)) {
+                        debug("loop: inv gp=" + getInventoryCoinCount() + " nodig=" + coinsNeeded
+                                + " bankSnap=" + BankSnapshotPlanner.knownBankCoinsQty(rsn) + " → bank");
+                        pendingGeCoinsWithdrawTarget = coinsNeeded;
+                        saveBankPosition();
+                        currentState = FishingState.WALKING_TO_BANK;
+                        paint.setCurrentStatus("→ Bank (coins voor GE)");
+                        return handleWalkToBank();
+                    }
+                    debug("loop: snapshot bank leeg voor supplies → GE");
+                    bankSessionCompleted = false;
+                    currentState = FishingState.RESTOCK_WALKING_TO_GE;
+                    paint.setCurrentStatus("🛒 → Grand Exchange (" + missing + ")");
+                    return handleRestockWalkToGE();
+                }
+
                 saveBankPosition();
                 currentState = FishingState.WALKING_TO_BANK;
                 paint.setCurrentStatus("→ Bank (" + missing + " ophalen)");
@@ -270,7 +420,7 @@ public class FishingHandler {
             bankRetries = 0;
 
             // 3. Cooking check
-            if (needsCooking && config.fishingCookEnabled()) {
+            if (needsCooking && effectiveFishingCookEnabled()) {
                 debug("loop: needsCooking → fire/cooking");
                 if (cookingFireLocation != null && !isAtLocationWithRange(cookingFireLocation, 3)) {
                     currentState = FishingState.WALKING_TO_FIRE;
@@ -329,9 +479,23 @@ public class FishingHandler {
             return Bank.isOpen() ? FishingState.BANKING : FishingState.WALKING_TO_BANK;
         }
 
+        String[] methodForBait = getTargetMethod();
+        if (methodForBait != null && methodForBait.length > 3) {
+            String baitCheck = methodForBait[3] != null ? methodForBait[3].trim() : "";
+            int baitMinState = Math.max(0, config.fishingBaitMin());
+            if (!baitCheck.isEmpty() && baitMinState > 0
+                    && getInventoryStackCount(baitCheck) < baitMinState) {
+                bankSessionCompleted = false;
+                saveBankPosition();
+                debug("determineState: bait onder min (" + getInventoryStackCount(baitCheck)
+                        + "/" + baitMinState + ") → bank");
+                return Bank.isOpen() ? FishingState.BANKING : FishingState.WALKING_TO_BANK;
+            }
+        }
+
         if (Inventory.isFull()) {
             debug("determineState: inv vol");
-            if (config.fishingCookEnabled() && hasRawFishToCook()) {
+            if (effectiveFishingCookEnabled() && hasRawFishToCook()) {
                 needsCooking = true;
                 cookingFireLocation = findNearestFire();
                 if (cookingFireLocation != null) {
@@ -340,7 +504,7 @@ public class FishingHandler {
                 }
                 debug("determineState: cooking aan maar geen cook-locatie gevonden");
             }
-            if (config.fishingDropFish()) {
+            if (effectiveFishingDropFish()) {
                 debug("determineState: → DROPPING");
                 return FishingState.DROPPING;
             }
@@ -398,8 +562,7 @@ public class FishingHandler {
             WorldPoint nearestSpotTile = findNearestFishingSpotPositionInArea(method, local);
             if (nearestSpotTile != null) {
                 int d = myWp.distanceTo(nearestSpotTile);
-                int interactRange = getFishingInteractRange();
-                if (d > interactRange - 2) {
+                if (d > 2) {
                     walkTargetSpot = nearestSpotTile;
                     idleStartTime = 0;
                     debug("determineState: spot te ver voor klik (" + d + " tiles) → WALKING_TO_SPOT");
@@ -411,6 +574,11 @@ public class FishingHandler {
                 walkTargetSpot = randomInnerFishingAreaTarget();
                 idleStartTime = 0;
                 debug("determineState: geen spot-NPC gevonden, loop naar random area target → WALKING_TO_SPOT");
+                return FishingState.WALKING_TO_SPOT;
+            } else {
+                walkTargetSpot = pickWalkTargetWhenInsideAreaWithoutSpot();
+                idleStartTime = 0;
+                debug("determineState: in area-box zonder spot-NPC → WALKING_TO_SPOT");
                 return FishingState.WALKING_TO_SPOT;
             }
         }
@@ -620,10 +788,11 @@ public class FishingHandler {
         if (local == null) return 1000;
         WorldPoint myPos = local.getWorldLocation();
         if (myPos.distanceTo(GE_LOCATION) <= 10) {
-            debug("handleRestockWalkToGE: aangekomen bij GE");
+            debug("handleRestockWalkToGE: aangekomen bij GE → direct kopen");
             varrockTeleportUsedThisRestockTrip = false;
             currentState = FishingState.RESTOCKING;
-            return 600;
+            paint.setCurrentStatus("🛒 GE: supplies kopen");
+            return handleRestocking();
         }
         // Tijdens travel blijven reclicken, ook als we al bewegen.
         // Varrock teleport
@@ -665,7 +834,9 @@ public class FishingHandler {
         String toolName = method != null && method.length > 2 ? method[2] : "";
         String baitName = method != null && method.length > 3 ? method[3] : "";
 
-        if (hasEmergencySellLootInInventory()) {
+        List<RestockBuy> buysPreview = buildFishingRestockPlan(toolName, baitName);
+        int coinsNeededPreview = estimateRequiredCoinsForRestockPlan(buysPreview);
+        if (hasEmergencySellLootInInventory() && getInventoryCoinCount() < coinsNeededPreview) {
             boolean sold = sellInventoryFishForCoins();
             if (sold) {
                 paint.setLastAntiBanAction("✓ Eerst loot verkocht, daarna kopen");
@@ -683,15 +854,40 @@ public class FishingHandler {
         }
 
         List<RestockBuy> buys = buildFishingRestockPlan(toolName, baitName);
+        if (buys.isEmpty() && stillNeedsFishingSupplies(toolName, baitName)) {
+            debug("handleRestocking: leeg koopplan maar tool/bait ontbreekt nog → bank");
+            closeGeIfOpen();
+            saveBankPosition();
+            currentState = FishingState.WALKING_TO_BANK;
+            paint.setCurrentStatus("→ Bank (" + toolName + " ophalen)");
+            return antiBan.varyDelay(randomDelay(1000, 1800));
+        }
         if (buys.isEmpty()) {
+            debug("handleRestocking: niets te kopen, supplies OK");
+            bankRetries = 0;
             currentState = FishingState.IDLE;
             return 600;
         }
 
         int totalRequiredCoins = estimateRequiredCoinsForRestockPlan(buys);
+        String rsnCoins = BankSnapshotPlanner.currentDisplayName();
         int invCoins = getInventoryCoinCount();
         if (invCoins < totalRequiredCoins) {
-            paint.setLastAntiBanAction("⚠ Coins laag voor fishing restock: " + invCoins + "/" + totalRequiredCoins);
+            if (Bank.isOpen()) {
+                withdrawCoinsForGeIfNeeded(totalRequiredCoins);
+                invCoins = getInventoryCoinCount();
+            } else if (BankSnapshotPlanner.shouldWithdrawBankCoinsBeforeGe(rsnCoins, totalRequiredCoins)) {
+                debug("handleRestocking: inv gp=" + invCoins + "/" + totalRequiredCoins
+                        + " bankSnap=" + BankSnapshotPlanner.knownBankCoinsQty(rsnCoins) + " → bank");
+                pendingGeCoinsWithdrawTarget = totalRequiredCoins;
+                closeGeIfOpen();
+                saveBankPosition();
+                currentState = FishingState.WALKING_TO_BANK;
+                paint.setCurrentStatus("→ Bank (coins ophalen voor GE)");
+                return antiBan.varyDelay(randomDelay(1000, 1800));
+            }
+            paint.setLastAntiBanAction("⚠ Coins laag voor fishing restock: " + invCoins + "/" + totalRequiredCoins
+                    + " (bankSnap=" + BankSnapshotPlanner.knownBankCoinsQty(rsnCoins) + ")");
         }
 
         for (RestockBuy buy : buys) {
@@ -702,16 +898,35 @@ public class FishingHandler {
             int coinsNow = getInventoryCoinCount();
             int needCoinsForThisBuy = Math.max(1, buy.targetQty) * Math.max(1, buy.pricePerItem);
             if (coinsNow < needCoinsForThisBuy) {
-                // Geen geld: probeer eerst noodverkoop van imp-loot (beads/talisman) uit inventory.
                 boolean sold = sellInventoryFishForCoins();
                 if (sold) {
+                    paint.setCurrentStatus("🛒 GE: loot verkopen voor gp");
                     return antiBan.varyDelay(randomDelay(800, 1300));
                 }
-                paint.setLastAntiBanAction("⚠ Te weinig coins voor " + buy.itemName + ": " + coinsNow + "/" + needCoinsForThisBuy);
-                debug("handleRestocking: coin-gate blokkeert buy " + buy.itemName
-                        + " coins=" + coinsNow + " nodig=" + needCoinsForThisBuy);
-                currentState = FishingState.IDLE;
-                return antiBan.varyDelay(randomDelay(1000, 1800));
+                withdrawCoinsForGeIfNeeded(needCoinsForThisBuy);
+                coinsNow = getInventoryCoinCount();
+                if (coinsNow < needCoinsForThisBuy) {
+                    String rsn = BankSnapshotPlanner.currentDisplayName();
+                    if (BankSnapshotPlanner.shouldWithdrawBankCoinsBeforeGe(rsn, needCoinsForThisBuy)) {
+                        debug("handleRestocking: gp in bank-snapshot → bank voor " + buy.itemName);
+                        pendingGeCoinsWithdrawTarget = needCoinsForThisBuy;
+                        closeGeIfOpen();
+                        saveBankPosition();
+                        currentState = FishingState.WALKING_TO_BANK;
+                        paint.setCurrentStatus("→ Bank (coins voor " + buy.itemName + ")");
+                        return antiBan.varyDelay(randomDelay(1000, 1800));
+                    }
+                    paint.setLastAntiBanAction("⚠ Te weinig coins voor " + buy.itemName + ": "
+                            + coinsNow + "/" + needCoinsForThisBuy);
+                    debug("handleRestocking: coin-gate blokkeert buy " + buy.itemName
+                            + " coins=" + coinsNow + " nodig=" + needCoinsForThisBuy);
+                    closeGeIfOpen();
+                    pendingImpsCashFarmRequest = new ImpsCashFarmRequest(
+                            1, buy.itemName, coinsNow, needCoinsForThisBuy);
+                    paint.setCurrentStatus("⚠ Te weinig gp voor " + buy.itemName + " → Imps");
+                    currentState = FishingState.IDLE;
+                    return antiBan.varyDelay(randomDelay(1000, 1800));
+                }
             }
             paint.setCurrentStatus("🛒 Kopen: " + buy.targetQty + "x " + buy.itemName);
             GeRestockHelper.RestockResult result = GeRestockHelper.buyWithEscalation(
@@ -723,15 +938,24 @@ public class FishingHandler {
             if (result == GeRestockHelper.RestockResult.SUCCESS) {
                 continue;
             }
+            if (result == GeRestockHelper.RestockResult.BLOCKED_BY_ACCOUNT_POLICY) {
+                paint.setCurrentStatus("⏹ GE-shop uit: " + buy.itemName);
+                paint.setLastAntiBanAction("⏹ Account policy blokkeert " + buy.itemName);
+                bankRetries = MAX_BANK_RETRIES;
+                currentState = FishingState.IDLE;
+                return antiBan.varyDelay(randomDelay(2000, 3000));
+            }
             if (result == GeRestockHelper.RestockResult.GE_NOT_AVAILABLE) {
                 paint.setLastAntiBanAction("⚠ Geen GE Clerk gevonden");
                 debug("handleRestocking: GE niet beschikbaar");
                 currentState = FishingState.RESTOCK_WALKING_TO_GE;
+                paint.setCurrentStatus("🛒 → Grand Exchange (clerk)");
                 return antiBan.varyDelay(randomDelay(1000, 2000));
             }
             paint.setLastAntiBanAction("⚠ GE koop gefaald: " + buy.itemName + " — retry GE");
             debug("handleRestocking: buy FAILED item=" + buy.itemName + " -> RESTOCK_WALKING_TO_GE");
             currentState = FishingState.RESTOCK_WALKING_TO_GE;
+            paint.setCurrentStatus("🛒 GE retry: " + buy.itemName);
             return antiBan.varyDelay(randomDelay(1200, 2200));
         }
 
@@ -759,24 +983,73 @@ public class FishingHandler {
         String tool = toolName == null ? "" : toolName.trim();
         String bait = baitName == null ? "" : baitName.trim();
 
-        if ("Fishing rod".equalsIgnoreCase(tool) && !hasTool("Fishing rod")) {
-            out.add(new RestockBuy("Fishing rod", 1, GE_PRICE_FISHING_ROD));
-        } else if ("Fly fishing rod".equalsIgnoreCase(tool) && !hasTool("Fly fishing rod")) {
-            out.add(new RestockBuy("Fly fishing rod", 1, GE_PRICE_FLY_ROD));
+        addToolRestockIfNeeded(out, tool);
+
+        // Eerst tool kopen; pas daarna bait (voorkomt open/sluit-loop op 1000x bait zonder rod/gp).
+        if (!tool.isEmpty() && !hasTool(tool)) {
+            return out;
         }
 
+        int baitRestockQty = Math.max(config.fishingBaitMin(), config.fishingRestockAmount());
+        baitRestockQty = Math.min(baitRestockQty, FISHING_RESTOCK_STACK_TARGET);
+
         if ("Fishing bait".equalsIgnoreCase(bait)) {
-            int target = Math.max(FISHING_RESTOCK_STACK_TARGET, config.fishingRestockAmount());
-            if (Inventory.getCount(true, "Fishing bait") < target) {
-                out.add(new RestockBuy("Fishing bait", target, Math.max(1, config.fishingBaitPrice())));
+            if (Inventory.getCount(true, "Fishing bait") < baitRestockQty) {
+                out.add(new RestockBuy("Fishing bait", baitRestockQty, Math.max(1, config.fishingBaitPrice())));
             }
         } else if ("Feather".equalsIgnoreCase(bait)) {
-            int target = Math.max(FISHING_RESTOCK_STACK_TARGET, config.fishingRestockAmount());
-            if (Inventory.getCount(true, "Feather") < target) {
-                out.add(new RestockBuy("Feather", target, Math.max(1, config.fishingFeatherPrice())));
+            if (Inventory.getCount(true, "Feather") < baitRestockQty) {
+                out.add(new RestockBuy("Feather", baitRestockQty, Math.max(1, config.fishingFeatherPrice())));
             }
         }
         return out;
+    }
+
+    private boolean stillNeedsFishingSupplies(String toolName, String baitName) {
+        String tool = toolName == null ? "" : toolName.trim();
+        String bait = baitName == null ? "" : baitName.trim();
+        return (!tool.isEmpty() && !hasTool(tool)) || (!bait.isEmpty() && !Inventory.contains(bait));
+    }
+
+    private void addToolRestockIfNeeded(List<RestockBuy> out, String tool) {
+        String t = tool == null ? "" : tool.trim();
+        if (t.isEmpty() || hasTool(t)) {
+            return;
+        }
+        out.add(new RestockBuy(t, 1, gePriceForTool(t)));
+    }
+
+    private int gePriceForTool(String tool) {
+        if (tool == null) {
+            return GE_PRICE_DEFAULT_TOOL;
+        }
+        switch (tool.toLowerCase(Locale.ROOT)) {
+            case "fishing rod":
+                return GE_PRICE_FISHING_ROD;
+            case "fly fishing rod":
+                return GE_PRICE_FLY_ROD;
+            case "barbarian rod":
+                return GE_PRICE_FISHING_ROD;
+            case "small fishing net":
+                return GE_PRICE_SMALL_NET;
+            case "harpoon":
+                return GE_PRICE_HARPOON;
+            case "lobster pot":
+                return GE_PRICE_LOBSTER_POT;
+            default:
+                return GE_PRICE_DEFAULT_TOOL;
+        }
+    }
+
+    private void closeGeIfOpen() {
+        try {
+            if (GrandExchange.isOpen()) {
+                net.storm.sdk.input.Keyboard.type(
+                        String.valueOf((char) java.awt.event.KeyEvent.VK_ESCAPE), false);
+                sleep(300, 500);
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     private int estimateRequiredCoinsForRestockPlan(List<RestockBuy> buys) {
@@ -1064,7 +1337,7 @@ public class FishingHandler {
         needsCooking = false;
         cookingFireClickTime = 0L;
         cookingFireLocation = null;
-        currentState = config.fishingDropFish() ? FishingState.DROPPING : FishingState.WALKING_TO_BANK;
+        currentState = effectiveFishingDropFish() ? FishingState.DROPPING : FishingState.WALKING_TO_BANK;
         String attempted = lastCookingAttemptItemName != null ? lastCookingAttemptItemName : "?";
         paint.setLastAntiBanAction("Fishing: cook skip (" + attempted + ")");
         debug("onGameMessage: can't cook that for item='" + attempted + "' rawInv=" + getRawFishInventorySnapshot()
@@ -1128,7 +1401,7 @@ public class FishingHandler {
             needsCooking = false;
             cookingFireLocation = null;
             cookingFireClickTime = 0;
-            if (config.fishingDropFish()) {
+            if (effectiveFishingDropFish()) {
                 currentState = FishingState.DROPPING;
                 return 600;
             } else {
@@ -1159,7 +1432,7 @@ public class FishingHandler {
                 paint.setLastAntiBanAction("🔥 Koken: " + rawFishForProd.getName());
             } else {
                 needsCooking = false;
-                currentState = config.fishingDropFish() ? FishingState.DROPPING : FishingState.WALKING_TO_BANK;
+                currentState = effectiveFishingDropFish() ? FishingState.DROPPING : FishingState.WALKING_TO_BANK;
                 return antiBan.varyDelay(randomDelay(500, 900));
             }
             cookingFireClickTime = System.currentTimeMillis();
@@ -1272,6 +1545,13 @@ public class FishingHandler {
         }
 
         if (!walkToFishingBank()) {
+            if (BankHelper.wasLastWalkSkippedDueToSnapshot()) {
+                debug("handleWalkToBank: snapshot → GE");
+                bankSessionCompleted = false;
+                currentState = FishingState.RESTOCK_WALKING_TO_GE;
+                paint.setCurrentStatus("🛒 → Grand Exchange");
+                return handleRestockWalkToGE();
+            }
             if (config.botEnabled()) {
                 paint.setLastAntiBanAction("⚠ Geen bank gevonden!");
             }
@@ -1388,7 +1668,25 @@ public class FishingHandler {
             return walkBarbarianBankRouteWithFallbacks();
         }
         debug("walkToFishingBank: walkToNearestFullBank");
-        return BankHelper.walkToNearestFullBank();
+        return walkToFishingBankWithSnapshot();
+    }
+
+    private boolean walkToFishingBankWithSnapshot() {
+        String[] hoped = fishingHopedWithdrawItemNames();
+        if (hoped.length == 0) {
+            return BankHelper.walkToNearestFullBank();
+        }
+        return BankHelper.walkToNearestFullBank(hoped);
+    }
+
+    private String[] fishingHopedWithdrawItemNames() {
+        String[] method = getTargetMethod();
+        String tool = method[2];
+        String bait = method[3] != null ? method[3].trim() : "";
+        if (bait.isEmpty()) {
+            return new String[] { tool };
+        }
+        return new String[] { tool, bait };
     }
 
     // ===================== UNIFIED BANKING (ÉÉN methode voor ALLES) =====================
@@ -1638,21 +1936,14 @@ public class FishingHandler {
     private int[] estimateRequiredAndAvailableCoinsForFishingPlan(String toolName, String baitName) {
         List<RestockBuy> buys = buildFishingRestockPlan(toolName, baitName);
         int required = estimateRequiredCoinsForRestockPlan(buys);
-        withdrawCoinsForGeIfNeeded(required);
+        if (Bank.isOpen()) {
+            withdrawCoinsForGeIfNeeded(required);
+        }
         int available = getInventoryCoinCount();
-        if (available < required) {
-            try {
-                IPlayer local = Players.getLocal();
-                String rsn = local != null ? local.getName() : null;
-                if (rsn != null && !rsn.trim().isEmpty()) {
-                    AccountStateJsonStore.AccountEntry e = AccountStateJsonStore.getEntry(rsn.trim());
-                    if (e != null) {
-                        long snapCoins = AccountStateJsonStore.knownCoinsApprox(e);
-                        available = Math.max(available, (int) Math.min(Integer.MAX_VALUE, snapCoins));
-                    }
-                }
-            } catch (Exception ignored) {
-            }
+        String rsn = BankSnapshotPlanner.currentDisplayName();
+        if (available < required && rsn != null) {
+            long bankCoins = BankSnapshotPlanner.knownBankCoinsQty(rsn);
+            available = (int) Math.min(Integer.MAX_VALUE, available + bankCoins);
         }
         return new int[]{required, available};
     }
@@ -1798,7 +2089,7 @@ public class FishingHandler {
         if (staffName == null) return false;
         var staff = Inventory.getFirst(staffName);
         if (staff == null) return false;
-        staff.interact("Wield");
+        InventoryActionHelper.interact(config, staff, "Wield");
         sleep(300, 550);
         return staffCoversAir();
     }
@@ -1873,7 +2164,7 @@ public class FishingHandler {
         if (toDrop != null && !toDrop.isEmpty()) {
             debug("handleDropping: drop " + toDrop.size() + " items");
             for (var f : toDrop) {
-                f.interact("Drop");
+                InventoryActionHelper.interact(config, f, "Drop");
                 sleep(100, 300);
             }
             paint.addFishDropped(toDrop.size());
@@ -1942,10 +2233,22 @@ public class FishingHandler {
         targetIsCenterFallback = walkTargetSpot != null && fishingSpot != null && walkTargetSpot.equals(fishingSpot);
         distToTarget = walkTargetSpot != null ? myPos.distanceTo(walkTargetSpot) : Integer.MAX_VALUE;
 
-        if (!targetIsCenterFallback && distToTarget <= 8) {
-            debug("handleWalkingToSpot: aangekomen (dist=" + distToTarget + ")");
-            walkTargetSpot = null;
-            return antiBan.varyDelay(randomDelay(400, 800));
+        if (!targetIsCenterFallback) {
+            String[] methodArrived = getTargetMethod();
+            if (findFishingSpot(methodArrived, local) != null) {
+                debug("handleWalkingToSpot: spot klikbaar (dist=" + distToTarget + ")");
+                walkTargetSpot = null;
+                return antiBan.varyDelay(randomDelay(400, 800));
+            }
+            if (distToTarget <= 2) {
+                walkTargetSpot = findNearestFishingSpotPositionInArea(methodArrived, local);
+                if (walkTargetSpot == null) {
+                    walkTargetSpot = pickWalkTargetWhenInsideAreaWithoutSpot();
+                }
+                walkTargetSetTime = now;
+                debug("handleWalkingToSpot: dichtbij doel maar geen spot — nieuw doel "
+                        + (walkTargetSpot != null ? walkTargetSpot.getX() + "," + walkTargetSpot.getY() : "null"));
+            }
         }
 
         long travelNow = System.currentTimeMillis();
@@ -2030,10 +2333,20 @@ public class FishingHandler {
 
     private WorldPoint randomInnerFishingAreaTarget() {
         if (fishingSpot == null) return null;
+        if (FishingConfig.isBarbarianFishingLocation(fishingSpot.getX(), fishingSpot.getY())) {
+            return FishingConfig.getBarbarianRiverAnchor();
+        }
         int radius = getEffectiveAreaRadius();
         int inner = radius <= 2 ? Math.max(1, radius)
                 : Math.max(1, Math.min(radius - 2, (int) Math.floor(radius * 0.70)));
         return MovementHelper.getRandomPointInRadius(fishingSpot, inner);
+    }
+
+    private WorldPoint pickWalkTargetWhenInsideAreaWithoutSpot() {
+        if (fishingSpot != null && FishingConfig.isBarbarianFishingLocation(fishingSpot.getX(), fishingSpot.getY())) {
+            return FishingConfig.getBarbarianRiverAnchor();
+        }
+        return randomInnerFishingAreaTarget();
     }
 
     private int handleIdleAtSpot() {
@@ -2047,17 +2360,24 @@ public class FishingHandler {
         if (myPos == null) return antiBan.varyDelay(randomDelay(1000, 2000));
 
         boolean atBarbarian = FishingConfig.isBarbarianFishingLocation(fishingSpot.getX(), fishingSpot.getY());
-        if (atBarbarian && idleMs > 2500 && !local.isMoving()) {
+        if (atBarbarian && idleMs > 1200 && !local.isMoving()) {
             String[] method = getTargetMethod();
+            if (findFishingSpot(method, local) != null) {
+                idleStartTime = 0;
+                currentState = FishingState.FISHING;
+                return handleFishing();
+            }
             WorldPoint nearest = findNearestFishingSpotPositionInArea(method, local);
-            if (nearest != null) {
-                int d0 = myPos.distanceTo(nearest);
-                if (d0 > 4) {
-                    walkTowardTarget(nearest, Math.min(16, Math.max(5, d0 - 2)));
-                    idleStartTime = 0;
-                    paint.setLastAntiBanAction("→ Stap naar rivier-spot");
-                    return antiBan.varyDelay(randomDelay(600, 1200));
-                }
+            WorldPoint stepTarget = nearest != null ? nearest : FishingConfig.getBarbarianRiverAnchor();
+            int d0 = myPos.distanceTo(stepTarget);
+            if (d0 > 1) {
+                walkTowardTarget(stepTarget, Math.min(18, Math.max(6, d0 - 1)));
+                idleStartTime = 0;
+                currentState = FishingState.WALKING_TO_SPOT;
+                walkTargetSpot = stepTarget;
+                walkTargetSetTime = System.currentTimeMillis();
+                paint.setLastAntiBanAction("→ Stap naar rivier-spot");
+                return antiBan.varyDelay(randomDelay(600, 1200));
             }
         }
         if (!atBarbarian && idleMs > 2000 && !local.isMoving()) {

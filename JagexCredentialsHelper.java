@@ -572,6 +572,86 @@ public final class JagexCredentialsHelper {
                 .collect(Collectors.toSet());
     }
 
+    /**
+     * Lijst enabled geplakte Jagex-accounts (volgorde uit pasted blob).
+     */
+    public static List<ParsedJagexAccount> listEnabledPastedJagexAccounts(CombatBotConfig config) {
+        Set<String> enabledNames = parseEnabledDisplayNames(config.enabledDisplayNames());
+        List<ParsedJagexAccount> out = new ArrayList<>();
+        for (ParsedJagexAccount acc : parsePastedCredentials(config.pastedCredentials())) {
+            if (enabledNames.contains(acc.getDisplayName())) {
+                out.add(acc);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Kies één enabled Jagex-account voor Re-log als {@code reLogoutAccount} leeg is.
+     * Bij meerdere: launcher-RSN op login-scherm, of precies één rotatie-vink in Accounts-tab.
+     */
+    public static ParsedJagexAccount resolveEnabledJagexAccountForAutoLogin(CombatBotConfig config) {
+        List<ParsedJagexAccount> active = listEnabledPastedJagexAccounts(config);
+        if (active.isEmpty()) {
+            return null;
+        }
+        if (active.size() == 1) {
+            return active.get(0);
+        }
+        String hint = loginScreenDisplayNameHint();
+        if (hint != null && !hint.isEmpty()) {
+            for (ParsedJagexAccount acc : active) {
+                if (acc.getDisplayName().equalsIgnoreCase(hint)) {
+                    return acc;
+                }
+            }
+        }
+        int rotationVinks = 0;
+        ManagedJagexAccountsStore.ManagedJagexAccountRow rotationRow = null;
+        for (ManagedJagexAccountsStore.ManagedJagexAccountRow r
+                : ManagedJagexAccountsStore.parseRows(config.managedJagexAccountsBlob())) {
+            if (r != null && r.rotationEnabled && r.displayName != null && !r.displayName.trim().isEmpty()) {
+                rotationVinks++;
+                rotationRow = r;
+            }
+        }
+        if (rotationVinks == 1 && rotationRow != null) {
+            String dn = rotationRow.displayName.trim();
+            for (ParsedJagexAccount acc : active) {
+                if (acc.getDisplayName().equalsIgnoreCase(dn)) {
+                    return acc;
+                }
+            }
+        }
+        return null;
+    }
+
+    /** RSN/launcher op login-scherm — hint welk enabled account te kiezen. */
+    public static String loginScreenDisplayNameHint() {
+        try {
+            CombatBotPlugin plugin = CombatBotRuntime.getActivePlugin();
+            if (plugin != null && plugin.getRuneliteClient() != null) {
+                String launcher = plugin.getRuneliteClient().getLauncherDisplayName();
+                if (launcher != null && !launcher.trim().isEmpty()) {
+                    return launcher.trim();
+                }
+                String user = plugin.getRuneliteClient().getUsername();
+                if (user != null && !user.trim().isEmpty()) {
+                    return user.trim();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            String storm = net.storm.sdk.game.Client.getDisplayName();
+            if (storm != null && !storm.trim().isEmpty()) {
+                return storm.trim();
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
     /** Serialiseer enabled display names naar comma-separated. */
     public static String serializeEnabledDisplayNames(Set<String> names) {
         if (names == null || names.isEmpty()) return "";

@@ -970,6 +970,9 @@ public class LootHandler {
         if (pendingHopTargetWorld <= 0 || pendingHopRequestedAtMs <= 0L) {
             return 0;
         }
+        if (AccountSwitchWorldHop.tryAcceptWorldHopConfirmation()) {
+            return antiBan.varyDelay(rDelay(400, 800));
+        }
         try {
             Object wrapped = net.storm.sdk.game.Client.getClient().getWrapped();
             if (!(wrapped instanceof net.runelite.api.Client)) {

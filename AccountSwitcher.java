@@ -17,6 +17,8 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import java.util.function.IntSupplier;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.function.ToIntFunction;
 
 /**
@@ -118,7 +120,11 @@ public class AccountSwitcher {
 
     // Retry tracking
     private int loginRetries = 0;
-    private static final int MAX_LOGIN_RETRIES = 3;
+    /** Play-klikpogingen in {@link SwitchState#LOGGING_IN} (niet elke wacht-tick). */
+    private int loginPlayAttempts = 0;
+    private long loginBackoffUntilMs = 0L;
+    private static final int MAX_LOGIN_PLAY_ATTEMPTS = 8;
+    private static final long LOGIN_FAIL_BACKOFF_MS = 5_000L;
 
     /** Cold start op login-scherm: SETTING_ACCOUNT zonder naar het volgende account te springen. */
     private boolean settingAccountWithoutAdvance;
@@ -162,21 +168,21 @@ public class AccountSwitcher {
 
     /** Telt herhaalde logout-pogingen in {@link SwitchState#WAITING_LOGOUT} zolang {@link Game#isLoggedIn()} true blijft. */
     private int logoutRetryWhileLoggedIn;
+    /** Snapshot na afloop {@link #invokeGameLogout()} op de client-thread. */
+    private volatile long lastLogoutSequenceEndMs;
+    private volatile boolean lastLogoutSequenceLoggedIn = true;
+    private volatile boolean lastLogoutSequenceOnLoginScreen;
+    private long loginScreenStableSinceMs;
+    private long lastLogoutWaitDebugLogMs;
     private static final int MAX_LOGOUT_RETRY_WHILE_LOGGED_IN = 10;
     /** Na deze tijd nog ingelogd tijdens wachten → geen eindeloze loop, wissel afbreken. */
     private static final long ABORT_LOGOUT_STUCK_AFTER_MS = 90_000L;
-    /**
-     * Uitgelogd maar {@link Game#isOnLoginScreen()} nog false (LOADING/tussenscherm): hoelang wachten voordat we toch
-     * naar credentials/wereld gaan. Was 45s (voelde als “altijd 45s”); lager = sneller door, iets hoger risico te vroeg.
-     */
-    private static final long FORCE_CREDENTIALS_WHEN_NO_LOGIN_UI_MS = 15_000L;
-    /**
-     * Bij precies 1x Rotatie-vink schrijven we geen credentials: sneller naar Play — korter wachten op
-     * {@link Game#isOnLoginScreen()} tijdens LOADING (lager risico dan bij profiel-sync).
-     */
-    private static final long FORCE_NO_LOGIN_UI_SINGLE_VINK_MS = 6_000L;
-    private static final int POLL_NO_LOGIN_UI_SINGLE_VINK_MS = 280;
-    private static final int POLL_NO_LOGIN_UI_SINGLE_VINK_JITTER_MS = 140;
+    /** Login-scherm moet zo lang stabiel zijn vóór hop/credentials (geen 150ms-rush). */
+    private static final long LOGIN_SCREEN_STABLE_MS = 2_500L;
+    /** Min. wachttijd na client-thread logout-sequentie vóór volgende stap. */
+    private static final long MIN_MS_AFTER_LOGOUT_SEQUENCE = 3_500L;
+    private static final int POLL_NO_LOGIN_UI_SINGLE_VINK_MS = 400;
+    private static final int POLL_NO_LOGIN_UI_SINGLE_VINK_JITTER_MS = 200;
     /** Tweede waarschuwing over geen login-UI (reset interne teller voor bericht-spam). */
     private static final long LOGIN_UI_STUCK_WARN_RESET_MS = 60_000L;
     /**
@@ -246,6 +252,74 @@ public class AccountSwitcher {
         return Game.isOnLoginScreen() && !Game.isLoggedIn();
     }
 
+    private void snapshotLogoutSequenceEnd() {
+        lastLogoutSequenceEndMs = System.currentTimeMillis();
+        lastLogoutSequenceLoggedIn = Game.isLoggedIn();
+        lastLogoutSequenceOnLoginScreen = Game.isOnLoginScreen();
+        loginScreenStableSinceMs = 0L;
+    }
+
+    private void tickLoginScreenStability() {
+        if (isLoginScreenReadyForAccountSwitch()) {
+            if (loginScreenStableSinceMs == 0L) {
+                loginScreenStableSinceMs = System.currentTimeMillis();
+            }
+        } else {
+            loginScreenStableSinceMs = 0L;
+        }
+    }
+
+    private boolean isLoginScreenStableForSwitch() {
+        tickLoginScreenStability();
+        if (loginScreenStableSinceMs <= 0L) {
+            return false;
+        }
+        return System.currentTimeMillis() - loginScreenStableSinceMs >= LOGIN_SCREEN_STABLE_MS;
+    }
+
+    /**
+     * Wereld-hop en credentials alleen als logout-sequentie op de client klaar is, niet meer ingelogd,
+     * en login-scherm minstens {@link #LOGIN_SCREEN_STABLE_MS} stabiel.
+     */
+    private boolean canAdvancePastLogoutWait() {
+        if (lastLogoutSequenceEndMs <= 0L) {
+            return false;
+        }
+        if (System.currentTimeMillis() - lastLogoutSequenceEndMs < MIN_MS_AFTER_LOGOUT_SEQUENCE) {
+            return false;
+        }
+        if (lastLogoutSequenceLoggedIn || Game.isLoggedIn()) {
+            return false;
+        }
+        if (WelcomeScreenPlayHelper.isWelcomeLobbyPendingPlay()) {
+            return false;
+        }
+        try {
+            if (net.storm.sdk.entities.Players.getLocal() != null) {
+                return false;
+            }
+        } catch (Throwable ignored) {
+        }
+        if (!lastLogoutSequenceOnLoginScreen && !Game.isOnLoginScreen()) {
+            return false;
+        }
+        return isLoginScreenStableForSwitch();
+    }
+
+    private void maybeLogLogoutWaitState() {
+        long now = System.currentTimeMillis();
+        if (now - lastLogoutWaitDebugLogMs < 6_000L) {
+            return;
+        }
+        lastLogoutWaitDebugLogMs = now;
+        long stableMs = loginScreenStableSinceMs > 0L ? now - loginScreenStableSinceMs : 0L;
+        DebugLog.log("Accounts", "Wacht op login-scherm: seqLoggedIn=" + lastLogoutSequenceLoggedIn
+                + " nowLoggedIn=" + Game.isLoggedIn()
+                + " onLoginScreen=" + Game.isOnLoginScreen()
+                + " seqOnLogin=" + lastLogoutSequenceOnLoginScreen
+                + " stableMs=" + stableMs + "/" + LOGIN_SCREEN_STABLE_MS);
+    }
+
     /** Aantal niet-lege Accounts-tab rijen met {@link ManagedJagexAccountsStore.ManagedJagexAccountRow#rotationEnabled}. */
     private int countManagedAccountsRotationChecked() {
         int n = 0;
@@ -271,37 +345,22 @@ public class AccountSwitcher {
         return countManagedAccountsRotationChecked() == 0 && accounts.size() == 1;
     }
 
-    private long forceNoLoginUiThresholdMs() {
-        return exactlyOneManagedRotationVink()
-                ? FORCE_NO_LOGIN_UI_SINGLE_VINK_MS
-                : FORCE_CREDENTIALS_WHEN_NO_LOGIN_UI_MS;
-    }
-
     private int msPollWhileWaitingForLoginUiAfterLogout() {
-        if (exactlyOneManagedRotationVink()) {
-            return POLL_NO_LOGIN_UI_SINGLE_VINK_MS + random.nextInt(POLL_NO_LOGIN_UI_SINGLE_VINK_JITTER_MS);
-        }
-        return 700 + random.nextInt(250);
+        return POLL_NO_LOGIN_UI_SINGLE_VINK_MS + random.nextInt(POLL_NO_LOGIN_UI_SINGLE_VINK_JITTER_MS);
     }
 
     private int msBetweenPlayRetriesOnLoginScreen() {
         return exactlyOneManagedRotationVink()
-                ? (100 + random.nextInt(100))
-                : (200 + random.nextInt(120));
+                ? (1400 + random.nextInt(600))
+                : (1800 + random.nextInt(800));
     }
 
     /** Na {@link #transitionToSettingAccountOrHop()} uit {@link #handleWaitLogout()}: 1-vink = kortere loop-tick. */
     private int msAfterWaitLogoutTransition() {
-        if (exactlyOneManagedRotationVink()) {
-            if (state == SwitchState.HOP_WORLD) {
-                return 150;
-            }
-            return 180 + random.nextInt(100);
-        }
         if (state == SwitchState.HOP_WORLD) {
-            return 250;
+            return 2_000 + random.nextInt(500);
         }
-        return 350 + random.nextInt(200);
+        return 800 + random.nextInt(400);
     }
 
     private void maybeShowLogoutWaitMessage() {
@@ -349,28 +408,12 @@ public class AccountSwitcher {
         return -1;
     }
 
+    /** Wereld-hop tijdens account-rotatie uit — hopToWorld op login-scherm had geen effect. */
     private boolean shouldHopWorldBeforeNextAccount() {
-        if (worldHopInvoker == null || currentWorldSupplier == null) {
-            return false;
-        }
-        int target = resolveTargetWorldForNextAccount();
-        if (target <= 0) {
-            return false;
-        }
-        try {
-            return currentWorldSupplier.getAsInt() != target;
-        } catch (Throwable ignored) {
-            return false;
-        }
+        return false;
     }
 
     private void transitionToSettingAccountOrHop() {
-        if (shouldHopWorldBeforeNextAccount()) {
-            state = SwitchState.HOP_WORLD;
-            hopScheduledForThisSwitch = false;
-            hopWorldStartMs = System.currentTimeMillis();
-            return;
-        }
         state = SwitchState.SETTING_ACCOUNT;
     }
 
@@ -391,6 +434,8 @@ public class AccountSwitcher {
      * {@code Thread.sleep} draait op de client thread (kan kort bevriezen); alleen in deze sequentie.
      */
     private void invokeGameLogout() {
+        lastLogoutSequenceEndMs = 0L;
+        CountDownLatch done = new CountDownLatch(1);
         Runnable r = () -> {
             try {
                 DebugLog.log("Accounts", "Logout poging #" + (logoutRetryWhileLoggedIn + 1)
@@ -427,6 +472,9 @@ public class AccountSwitcher {
                         + " | isOnLoginScreen=" + Game.isOnLoginScreen());
             } catch (Throwable t) {
                 DebugLog.log("Accounts", "invokeGameLogout exception: " + t.getMessage());
+            } finally {
+                snapshotLogoutSequenceEnd();
+                done.countDown();
             }
         };
         if (clientLogoutInvoker != null) {
@@ -435,6 +483,11 @@ public class AccountSwitcher {
             clientSyncExecutor.accept(r);
         } else {
             r.run();
+        }
+        try {
+            done.await(20, TimeUnit.SECONDS);
+        } catch (InterruptedException ignored) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -575,10 +628,8 @@ public class AccountSwitcher {
         if (Game.isOnLoginScreen() && !Game.isLoggedIn()) {
             settingAccountWithoutAdvance = true;
             transitionToSettingAccountOrHop();
-            paint.setLastAntiBanAction(state == SwitchState.HOP_WORLD
-                    ? "🌍 Account-wissel: wereld kiezen vóór inloggen…"
-                    : "🔐 Account-wissel: inloggen (start)…");
-            return state == SwitchState.HOP_WORLD ? 50 : (25 + random.nextInt(35));
+            paint.setLastAntiBanAction("🔐 Account-wissel: inloggen (start)…");
+            return 25 + random.nextInt(35);
         }
 
         long elapsedSec = Duration.between(accountStartTime, Instant.now()).getSeconds();
@@ -609,7 +660,8 @@ public class AccountSwitcher {
     }
 
     private int handleWaitLogout() {
-        if (Game.isLoggedIn()) {
+        if (Game.isLoggedIn() || lastLogoutSequenceLoggedIn) {
+            loginScreenStableSinceMs = 0L;
             if (accountRotationLogoutGate != null && !accountRotationLogoutGate.getAsBoolean()) {
                 paint.setLastAntiBanAction("Account-wissel: wacht (combat/loot) voor opnieuw uitloggen...");
                 return 550 + random.nextInt(200);
@@ -635,26 +687,33 @@ public class AccountSwitcher {
                     ? (500 + random.nextInt(200))
                     : (900 + random.nextInt(350));
         }
-        if (!isLoginScreenReadyForAccountSwitch()) {
+        if (!canAdvancePastLogoutWait()) {
             maybeShowLogoutWaitMessage();
+            maybeLogLogoutWaitState();
             long waitMs = System.currentTimeMillis() - waitLogoutSinceMs;
             if (waitMs > LOGIN_UI_STUCK_WARN_RESET_MS) {
-                paint.setLastAntiBanAction("⚠ Nog geen login-scherm — sta je in een cutscene? Wacht of log handmatig uit.");
+                paint.setLastAntiBanAction("⚠ Nog geen stabiel login-scherm — wacht of log handmatig uit.");
                 waitLogoutSinceMs = System.currentTimeMillis();
-            }
-            // Lang LOADING / tussenscherm: blijf anders eeuwig in WAITING_LOGOUT (vooral 2e wissel)
-            if (waitMs > forceNoLoginUiThresholdMs()) {
-                paint.setLastAntiBanAction("⏳ Account-wissel: geen login-UI — ga door naar account/wereld-stap…");
-                transitionToSettingAccountOrHop();
-                return msAfterWaitLogoutTransition();
             }
             return msPollWhileWaitingForLoginUiAfterLogout();
         }
+        DebugLog.log("Accounts", "WAITING_LOGOUT: uitgelogd + login-scherm stabiel → account + Play");
         transitionToSettingAccountOrHop();
         return msAfterWaitLogoutTransition();
     }
 
     private int handleHopWorld() {
+        if (!canAdvancePastLogoutWait() && !settingAccountWithoutAdvance) {
+            DebugLog.log("Accounts", "HOP_WORLD: geen stabiel login-scherm — WAITING_LOGOUT");
+            state = SwitchState.WAITING_LOGOUT;
+            waitLogoutSinceMs = System.currentTimeMillis();
+            return MS_LOOP_PAUSE_AFTER_SWITCH_LOGOUT;
+        }
+        if (!isLoginScreenReadyForAccountSwitch()) {
+            paint.setLastAntiBanAction("🌍 Account-wissel: wacht op login-scherm vóór wereld-hop…");
+            state = SwitchState.WAITING_LOGOUT;
+            return 600 + random.nextInt(300);
+        }
         int target = resolveTargetWorldForNextAccount();
         if (target <= 0 || worldHopInvoker == null || currentWorldSupplier == null) {
             state = SwitchState.SETTING_ACCOUNT;
@@ -716,6 +775,18 @@ public class AccountSwitcher {
     }
 
     private int handleSetAccount() {
+        loginPlayAttempts = 0;
+        loginBackoffUntilMs = 0L;
+        if (!settingAccountWithoutAdvance && !canAdvancePastLogoutWait()) {
+            DebugLog.log("Accounts", "SETTING_ACCOUNT: login-scherm niet klaar — WAITING_LOGOUT");
+            state = SwitchState.WAITING_LOGOUT;
+            waitLogoutSinceMs = System.currentTimeMillis();
+            return MS_LOOP_PAUSE_AFTER_SWITCH_LOGOUT;
+        }
+        if (!isLoginScreenReadyForAccountSwitch() && !settingAccountWithoutAdvance) {
+            state = SwitchState.WAITING_LOGOUT;
+            return 500 + random.nextInt(250);
+        }
         if (settingAccountWithoutAdvance) {
             settingAccountWithoutAdvance = false;
         } else {
@@ -727,24 +798,14 @@ public class AccountSwitcher {
             DebugLog.log("Accounts", "1x Rotatie-vink: geen credentials — alleen Play");
             paint.setLastAntiBanAction("→ Alleen Play (geen credential-sync; 1 account aangevinkt)");
             state = SwitchState.LOGGING_IN;
-            loginRetries = 0;
-            if (Game.isOnLoginScreen()) {
-                JagexLauncherPlayButton.clickPlayButton();
-                loginRetries = 1;
-            }
-            return 70 + random.nextInt(60);
+            return beginLoggingInWithPlayNow(entry.label);
         }
 
         if (singleAccountCredentialsPrimed && stormAccountListSingleWithoutManagedVink()) {
             DebugLog.log("Accounts", "1 Storm-entry zonder managed-vink: credentials overslaan (geprime)");
             paint.setLastAntiBanAction("→ Zelfde account — alleen Play (credentials niet opnieuw gezet)");
             state = SwitchState.LOGGING_IN;
-            loginRetries = 0;
-            if (Game.isOnLoginScreen()) {
-                JagexLauncherPlayButton.clickPlayButton();
-                loginRetries = 1;
-            }
-            return 70 + random.nextInt(60);
+            return beginLoggingInWithPlayNow(entry.label);
         }
 
         // Eerst managed-tab pad (zelfde als dubbelklik): voorkomt dat loadSavedCredentials
@@ -802,17 +863,32 @@ public class AccountSwitcher {
         }
 
         state = SwitchState.LOGGING_IN;
-        // Direct eerste Play na credentials (was vóór aparte tick → sneller cold start).
+        return beginLoggingInWithPlayNow(entry.label);
+    }
+
+    private int beginLoggingInWithPlayNow(String accountLabel) {
         loginRetries = 0;
-        if (Game.isOnLoginScreen()) {
-            JagexLauncherPlayButton.clickPlayButton();
-            loginRetries = 1;
+        loginPlayAttempts = 0;
+        loginBackoffUntilMs = 0L;
+        if (Game.isOnLoginScreen() && !Game.isLoggedIn()) {
+            boolean clicked = JagexLauncherPlayButton.clickPlayButton();
+            DebugLog.log("Accounts", "Play Now na account " + accountLabel + ": clicked=" + clicked);
+            if (clicked) {
+                loginRetries = 1;
+                loginPlayAttempts = 1;
+            }
         }
-        return 70 + random.nextInt(60);
+        return 400 + random.nextInt(200);
     }
 
     private int handleLogin() {
-        if (Game.isLoggedIn()) {
+        long now = System.currentTimeMillis();
+        if (now < loginBackoffUntilMs) {
+            return (int) (loginBackoffUntilMs - now) + 300;
+        }
+
+        if (WelcomeScreenPlayHelper.isInGameWorld()) {
+            loginPlayAttempts = 0;
             if (stormAccountListSingleWithoutManagedVink()) {
                 singleAccountCredentialsPrimed = true;
             }
@@ -824,19 +900,46 @@ public class AccountSwitcher {
             return 600;
         }
 
-        if (Game.isOnLoginScreen()) {
-            JagexLauncherPlayButton.clickPlayButton();
-            loginRetries++;
-            if (loginRetries > MAX_LOGIN_RETRIES) {
-                paint.setLastAntiBanAction("⚠ Login mislukt, skip " + getCurrentAccountName());
-                state = SwitchState.SETTING_ACCOUNT;
-                loginRetries = 0;
-                return 2000;
+        if (WelcomeScreenPlayHelper.isWelcomeLobbyPendingPlay()) {
+            int playDelay = WelcomeScreenPlayHelper.advanceWelcomeLobbyClick();
+            paint.setLastAntiBanAction("→ Welkomst-lobby: CLICK HERE TO PLAY");
+            if (playDelay > 0) {
+                loginPlayAttempts++;
+            }
+            return playDelay > 0 ? playDelay : 900 + random.nextInt(400);
+        }
+
+        if (WelcomeScreenPlayHelper.isPostJagexLoginScreenPlaySettling()) {
+            paint.setLastAntiBanAction("⏳ Login: welkomstscherm laden na Play Now…");
+            return 400 + random.nextInt(200);
+        }
+
+        WelcomeScreenPlayHelper.LoginPhase phase = WelcomeScreenPlayHelper.resolveLoginPhase();
+        if (phase == WelcomeScreenPlayHelper.LoginPhase.LOGIN_SCREEN
+                || Game.isOnLoginScreen()
+                || WelcomeScreenPlayHelper.isPlayButtonVisible()) {
+            boolean clicked = JagexLauncherPlayButton.clickPlayButton();
+            if (clicked) {
+                loginPlayAttempts++;
+            }
+            if (loginPlayAttempts > MAX_LOGIN_PLAY_ATTEMPTS) {
+                loginPlayAttempts = 0;
+                loginBackoffUntilMs = now + LOGIN_FAIL_BACKOFF_MS;
+                WelcomeScreenPlayHelper.debugLogLoginState();
+                DebugLog.log("Accounts", "LOGGING_IN: Play-pogingen uitgeput — korte pauze "
+                        + LOGIN_FAIL_BACKOFF_MS + "ms, zelfde account (" + getCurrentAccountName() + ")");
+                paint.setLastAntiBanAction("⚠ Login: opnieuw Play over " + (LOGIN_FAIL_BACKOFF_MS / 1000) + "s…");
+                return (int) LOGIN_FAIL_BACKOFF_MS + random.nextInt(800);
             }
             return msBetweenPlayRetriesOnLoginScreen();
         }
 
-        return exactlyOneManagedRotationVink() ? (80 + random.nextInt(70)) : (120 + random.nextInt(100));
+        if (phase == WelcomeScreenPlayHelper.LoginPhase.LOADING) {
+            return 700 + random.nextInt(350);
+        }
+
+        loginPlayAttempts = 0;
+        return exactlyOneManagedRotationVink() ? (200 + random.nextInt(120)) : (350 + random.nextInt(200));
     }
 
     private int handleCooldown() {
@@ -892,6 +995,10 @@ public class AccountSwitcher {
         loginRetries = 0;
         logoutRetryWhileLoggedIn = 0;
         waitLogoutSinceMs = 0L;
+        lastLogoutSequenceEndMs = 0L;
+        loginScreenStableSinceMs = 0L;
+        loginPlayAttempts = 0;
+        loginBackoffUntilMs = 0L;
         paint.setLastAntiBanAction(reason != null && !reason.trim().isEmpty()
                 ? reason
                 : "🔄 Account wissel aangevraagd");
@@ -962,6 +1069,10 @@ public class AccountSwitcher {
         waitLogoutSinceMs = 0;
         lastLogoutAttemptMs = 0;
         logoutRetryWhileLoggedIn = 0;
+        lastLogoutSequenceEndMs = 0L;
+        loginScreenStableSinceMs = 0L;
+        loginPlayAttempts = 0;
+        loginBackoffUntilMs = 0L;
         resetSwitchTimer();
     }
 }

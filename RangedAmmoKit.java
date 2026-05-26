@@ -1,10 +1,8 @@
 package com.combatbot;
 
 import net.storm.api.domain.items.IInventoryItem;
-import net.storm.api.widgets.Tab;
 import net.storm.sdk.items.Equipment;
 import net.storm.sdk.items.Inventory;
-import net.storm.sdk.widgets.Tabs;
 
 import java.util.List;
 import java.util.Locale;
@@ -143,6 +141,11 @@ public final class RangedAmmoKit {
         }
     }
 
+    /** Quiver + alle bruikbare ammo-stacks in inventory (voor gear/restock checks). */
+    public static int getTotalUsableRangedAmmoCount(int rangedSkillLevel) {
+        return getEquippedRangedAmmoQuantity() + getInventoryRangedAmmoQuantity(rangedSkillLevel);
+    }
+
     public static int getInventoryRangedAmmoQuantity(int rangedSkillLevel) {
         try {
             List<IInventoryItem> all = Inventory.getAll();
@@ -235,29 +238,29 @@ public final class RangedAmmoKit {
         return best;
     }
 
-    public static void interactToEquipRangedAmmo(IInventoryItem item) {
+    public static void interactToEquipRangedAmmo(CombatBotConfig config, IInventoryItem item) {
         if (item == null) {
             return;
         }
         if (item.hasAction("Wield")) {
-            item.interact("Wield");
+            InventoryActionHelper.interact(config, item, "Wield");
             return;
         }
         if (item.hasAction("Wear")) {
-            item.interact("Wear");
+            InventoryActionHelper.interact(config, item, "Wear");
             return;
         }
         if (item.hasAction("Equip")) {
-            item.interact("Equip");
+            InventoryActionHelper.interact(config, item, "Equip");
             return;
         }
         try {
-            item.interact(0);
+            InventoryActionHelper.interact(config, item, 0);
         } catch (Throwable ignored) {
-            try {
-                item.interact("Wield");
-            } catch (Throwable ignored2) {
-                item.interact("Equip");
+            if (item.hasAction("Wield")) {
+                InventoryActionHelper.interact(config, item, "Wield");
+            } else if (item.hasAction("Equip")) {
+                InventoryActionHelper.interact(config, item, "Equip");
             }
         }
     }
@@ -269,6 +272,7 @@ public final class RangedAmmoKit {
      *         anders display naam van equipped stack
      */
     public static String tryEquipRangedAmmoFromInventoryReturningDisplayName(
+            CombatBotConfig config,
             int rangedSkillLevel,
             long emptyQuiverGameMessageMs,
             BiConsumer<Integer, Integer> sleepMs,
@@ -277,26 +281,26 @@ public final class RangedAmmoKit {
         if (toxicBlowpipeEquipped) {
             return "";
         }
-        boolean recentEmpty = System.currentTimeMillis() - emptyQuiverGameMessageMs < 6000L;
-        if (getEquippedRangedAmmoQuantity() > 0 && !recentEmpty) {
+        if (!quiverNeedsRefillFromInventory(emptyQuiverGameMessageMs)) {
             return "";
-        }
-        try {
-            Tabs.open(Tab.INVENTORY);
-            sleepMs.accept(120, 280);
-        } catch (Throwable ignored) {
         }
         IInventoryItem best = findBestRangedAmmoInInventory(rangedSkillLevel);
         if (best == null) {
             return null;
         }
-        interactToEquipRangedAmmo(best);
+        interactToEquipRangedAmmo(config, best);
         sleepMs.accept(850, 1400);
         if (getEquippedRangedAmmoQuantity() > 0) {
             String nm = best.getName();
             return nm != null ? nm : "";
         }
         return null;
+    }
+
+    /** Quiver leeg of game zegt net dat die leeg is (Equipment-telling kan achterlopen). */
+    public static boolean quiverNeedsRefillFromInventory(long emptyQuiverGameMessageMs) {
+        boolean recentEmpty = System.currentTimeMillis() - emptyQuiverGameMessageMs < 6000L;
+        return getEquippedRangedAmmoQuantity() <= 0 || recentEmpty;
     }
 
     /** Game messages die duiden op een lege quiver (Equipment API kan achterlopen). */

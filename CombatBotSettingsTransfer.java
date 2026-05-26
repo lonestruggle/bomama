@@ -1,22 +1,27 @@
 package com.combatbot;
 
+import net.storm.api.plugins.config.ConfigItem;
 import net.storm.api.plugins.config.ConfigManager;
 
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 
 /**
  * Exporteert en importeert Combat Bot-instellingen als JSON-bestand
  * (zelfde {@code combatbot}-groep als Storm-config), voor gebruik op een andere PC.
+ * Export omvat alle {@link ConfigItem}-keys op {@link CombatBotConfig}, behalve de keys in {@code NEVER_TRANSFER_KEYS}.
  * Accountlijsten, geplakte Jagex-credentials en re-log accounttekst worden bewust niet meegenomen.
  */
 public final class CombatBotSettingsTransfer {
 
     public static final String EXPORT_VERSION_KEY = "_combatbotSettingsExport";
-    public static final int EXPORT_VERSION = 1;
+    public static final int EXPORT_VERSION = 2;
 
     private static final String GROUP = "combatbot";
 
@@ -50,388 +55,55 @@ public final class CombatBotSettingsTransfer {
     }
 
     public static String exportToJson(CombatBotConfig config) {
+        TreeMap<String, Object> values = new TreeMap<>();
+        for (Method m : CombatBotConfig.class.getDeclaredMethods()) {
+            if (Modifier.isStatic(m.getModifiers()) || m.isBridge()) {
+                continue;
+            }
+            ConfigItem ci = m.getAnnotation(ConfigItem.class);
+            if (ci == null || m.getParameterCount() != 0 || m.getReturnType() == void.class) {
+                continue;
+            }
+            String key = ci.keyName();
+            if (NEVER_TRANSFER_KEYS.contains(key) || EXPORT_VERSION_KEY.equals(key)) {
+                continue;
+            }
+            Object val;
+            try {
+                val = m.invoke(config);
+            } catch (ReflectiveOperationException e) {
+                continue;
+            }
+            values.putIfAbsent(key, val);
+        }
+
         StringBuilder sb = new StringBuilder(16384);
         sb.append('{');
         appendInt(sb, EXPORT_VERSION_KEY, EXPORT_VERSION);
-        sb.append(',');
-
-        appendBool(sb, "botEnabled", config.botEnabled());
-        sb.append(',');
-        appendStr(sb, "monsterName", config.monsterName());
-        sb.append(',');
-        appendStr(sb, "foodChoice", config.foodChoice().name());
-        sb.append(',');
-        appendInt(sb, "eatPercent", config.eatPercent());
-        sb.append(',');
-        appendBool(sb, "disableCombatNoFood", config.disableCombatNoFood());
-        sb.append(',');
-        appendInt(sb, "attackRange", config.attackRange());
-        sb.append(',');
-        appendInt(sb, "attackDelayMin", config.attackDelayMin());
-        sb.append(',');
-        appendInt(sb, "attackDelayMax", config.attackDelayMax());
-        sb.append(',');
-        appendBool(sb, "buryBones", config.buryBones());
-        sb.append(',');
-        appendInt(sb, "buryBonesMinBatch", config.buryBonesMinBatch());
-        sb.append(',');
-        appendStr(sb, "combatCenters", config.combatCenters());
-        sb.append(',');
-        appendStr(sb, "combatStyle", config.combatStyle().name());
-        sb.append(',');
-        appendBool(sb, "showCombatOverlay", config.showCombatOverlay());
-        sb.append(',');
-        appendBool(sb, "safespotEnabled", config.safespotEnabled());
-        sb.append(',');
-        appendBool(sb, "pickupArrows", config.pickupArrows());
-        sb.append(',');
-        appendInt(sb, "pickupArrowsMinKills", config.pickupArrowsMinKills());
-        sb.append(',');
-        appendInt(sb, "pickupArrowsMaxKills", config.pickupArrowsMaxKills());
-        sb.append(',');
-        appendInt(sb, "combatArrowMin", config.combatArrowMin());
-        sb.append(',');
-        appendInt(sb, "combatArrowTarget", config.combatArrowTarget());
-        sb.append(',');
-        appendInt(sb, "combatRuneMin", config.combatRuneMin());
-        sb.append(',');
-        appendInt(sb, "combatRuneTarget", config.combatRuneTarget());
-        sb.append(',');
-        appendStr(sb, "genieLampSkill", config.genieLampSkill().name());
-        sb.append(',');
-
-        appendStr(sb, "impsCenters", config.impsCenters());
-        sb.append(',');
-        appendBool(sb, "impsMode", config.impsMode());
-        sb.append(',');
-        appendStr(sb, "impsCombatStyle", config.impsCombatStyle().name());
-        sb.append(',');
-        appendStr(sb, "impsMageSpell", config.impsMageSpell().name());
-        sb.append(',');
-        appendStr(sb, "impsLootItems", config.impsLootItems());
-        sb.append(',');
-        appendBool(sb, "impsScatterAshes", config.impsScatterAshes());
-        sb.append(',');
-        appendInt(sb, "impsBankThreshold", config.impsBankThreshold());
-        sb.append(',');
-        appendInt(sb, "impsMinCoins", config.impsMinCoins());
-        sb.append(',');
-        appendInt(sb, "impsHuntingX", config.impsHuntingX());
-        sb.append(',');
-        appendInt(sb, "impsHuntingY", config.impsHuntingY());
-        sb.append(',');
-        appendInt(sb, "impsHuntingRadius", config.impsHuntingRadius());
-        sb.append(',');
-        appendBool(sb, "impsAvoidScorpions", config.impsAvoidScorpions());
-        sb.append(',');
-        appendInt(sb, "impsScorpionLevel", config.impsScorpionLevel());
-        sb.append(',');
-        appendBool(sb, "showImpsOverlay", config.showImpsOverlay());
-        sb.append(',');
-        appendInt(sb, "impsIdleRoamSeconds", config.impsIdleRoamSeconds());
-        sb.append(',');
-        appendBool(sb, "impsAttackScorpions", config.impsAttackScorpions());
-        sb.append(',');
-        appendInt(sb, "impsScorpionZoneRadius", config.impsScorpionZoneRadius());
-        sb.append(',');
-        appendBool(sb, "impsGeSellEnabled", config.impsGeSellEnabled());
-        sb.append(',');
-        appendInt(sb, "impsGeSellAfterBanks", config.impsGeSellAfterBanks());
-        sb.append(',');
-        appendInt(sb, "impsGeSellPrice", config.impsGeSellPrice());
-        sb.append(',');
-        appendInt(sb, "impsLawRuneBuyPrice", config.impsLawRuneBuyPrice());
-        sb.append(',');
-        appendBool(sb, "impsTeleportBuyRunes", config.impsTeleportBuyRunes());
-        sb.append(',');
-        appendBool(sb, "impsUseVarrockTeleport", config.impsUseVarrockTeleport());
-        sb.append(',');
-        appendBool(sb, "impsUseFaladorTeleport", config.impsUseFaladorTeleport());
-        sb.append(',');
-        appendBool(sb, "impsUseLumbridgeTeleport", config.impsUseLumbridgeTeleport());
-        sb.append(',');
-        appendInt(sb, "impsStepMinDistance", config.impsStepMinDistance());
-        sb.append(',');
-        appendInt(sb, "impsStepMaxDistance", config.impsStepMaxDistance());
-        sb.append(',');
-        appendInt(sb, "impsRallyPointRadius", config.impsRallyPointRadius());
-        sb.append(',');
-        appendBool(sb, "impsShowRallyRadius", config.impsShowRallyRadius());
-        sb.append(',');
-        appendBool(sb, "impsSellNow", config.impsSellNow());
-        sb.append(',');
-        appendStr(sb, "impsFallbackStyle", config.impsFallbackStyle().name());
-        sb.append(',');
-        appendInt(sb, "impsAmmoRestockPrice", config.impsAmmoRestockPrice());
-        sb.append(',');
-        appendBool(sb, "impsMeleeOpeningAirStrike", config.impsMeleeOpeningAirStrike());
-        sb.append(',');
-        appendInt(sb, "impsMeleeOpeningAirStrikeMinDistance", config.impsMeleeOpeningAirStrikeMinDistance());
-        sb.append(',');
-        appendBool(sb, "impsMeleeOpeningAirStrikeDebug", config.impsMeleeOpeningAirStrikeDebug());
-        sb.append(',');
-        appendBool(sb, "impsStayInsideRadius", config.impsStayInsideRadius());
-        sb.append(',');
-
-        appendStr(sb, "combatTiles", config.combatTiles());
-        sb.append(',');
-        appendStr(sb, "wcTiles", config.wcTiles());
-        sb.append(',');
-        appendStr(sb, "miningTiles", config.miningTiles());
-        sb.append(',');
-        appendStr(sb, "fishingTiles", config.fishingTiles());
-        sb.append(',');
-        appendStr(sb, "tilePresetName", config.tilePresetName());
-        sb.append(',');
-        appendBool(sb, "saveTilePreset", config.saveTilePreset());
-        sb.append(',');
-        appendStr(sb, "tilePresets", config.tilePresets());
-        sb.append(',');
-        appendStr(sb, "loadTilePreset", config.loadTilePreset());
-        sb.append(',');
-        appendBool(sb, "doLoadTilePreset", config.doLoadTilePreset());
-        sb.append(',');
-        appendBool(sb, "clearTileMarkers", config.clearTileMarkers());
-        sb.append(',');
-
-        appendStr(sb, "lootItems", config.lootItems());
-        sb.append(',');
-        appendInt(sb, "lootMinValue", config.lootMinValue());
-        sb.append(',');
-        appendBool(sb, "lootByMinValue", config.lootByMinValue());
-        sb.append(',');
-        appendBool(sb, "lootOnlyOwn", config.lootOnlyOwn());
-        sb.append(',');
-        appendStr(sb, "specialLootItems", config.specialLootItems());
-        sb.append(',');
-        appendBool(sb, "lootBonesAndAshes", config.lootBonesAndAshes());
-        sb.append(',');
-        appendBool(sb, "lootDelayEnabled", config.lootDelayEnabled());
-        sb.append(',');
-        appendInt(sb, "lootDelayKills", config.lootDelayKills());
-        sb.append(',');
-        appendInt(sb, "lootDelayMinSeconds", config.lootDelayMinSeconds());
-        sb.append(',');
-        appendInt(sb, "lootDelayMaxSeconds", config.lootDelayMaxSeconds());
-        sb.append(',');
-
-        appendBool(sb, "bankWhenNoFood", config.bankWhenNoFood());
-        sb.append(',');
-        appendBool(sb, "bankLootedItems", config.bankLootedItems());
-        sb.append(',');
-        appendInt(sb, "foodAmount", config.foodAmount());
-        sb.append(',');
-        appendBool(sb, "combatGeFoodEnabled", config.combatGeFoodEnabled());
-        sb.append(',');
-        appendStr(sb, "combatGeFoodType", config.combatGeFoodType().name());
-        sb.append(',');
-        appendInt(sb, "combatGeFoodBasePrice", config.combatGeFoodBasePrice());
-        sb.append(',');
-
-        appendBool(sb, "wcEnabled", config.wcEnabled());
-        sb.append(',');
-        appendBool(sb, "wcUseSpecificTree", config.wcUseSpecificTree());
-        sb.append(',');
-        appendStr(sb, "wcTreeName", config.wcTreeName());
-        sb.append(',');
-        appendBool(sb, "wcDropLogs", config.wcDropLogs());
-        sb.append(',');
-        appendBool(sb, "wcFiremaking", config.wcFiremaking());
-        sb.append(',');
-        appendStr(sb, "wcCenters", config.wcCenters());
-        sb.append(',');
-        appendBool(sb, "showWcOverlay", config.showWcOverlay());
-        sb.append(',');
-        appendInt(sb, "wcInteractDelayMin", config.wcInteractDelayMin());
-        sb.append(',');
-        appendInt(sb, "wcInteractDelayMax", config.wcInteractDelayMax());
-        sb.append(',');
-
-        appendBool(sb, "miningEnabled", config.miningEnabled());
-        sb.append(',');
-        appendBool(sb, "miningUseSpecificOre", config.miningUseSpecificOre());
-        sb.append(',');
-        appendStr(sb, "miningOreName", config.miningOreName());
-        sb.append(',');
-        appendBool(sb, "miningDropOre", config.miningDropOre());
-        sb.append(',');
-        appendStr(sb, "miningCenters", config.miningCenters());
-        sb.append(',');
-        appendBool(sb, "showMiningOverlay", config.showMiningOverlay());
-        sb.append(',');
-        appendInt(sb, "miningInteractDelayMin", config.miningInteractDelayMin());
-        sb.append(',');
-        appendInt(sb, "miningInteractDelayMax", config.miningInteractDelayMax());
-        sb.append(',');
-
-        appendBool(sb, "fishingEnabled", config.fishingEnabled());
-        sb.append(',');
-        appendBool(sb, "fishingUseSpecificMethod", config.fishingUseSpecificMethod());
-        sb.append(',');
-        appendStr(sb, "fishingSpotName", config.fishingSpotName());
-        sb.append(',');
-        appendStr(sb, "fishingAction", config.fishingAction());
-        sb.append(',');
-        appendBool(sb, "fishingDropFish", config.fishingDropFish());
-        sb.append(',');
-        appendBool(sb, "fishingCookEnabled", config.fishingCookEnabled());
-        sb.append(',');
-        appendBool(sb, "fishingRestockEnabled", config.fishingRestockEnabled());
-        sb.append(',');
-        appendInt(sb, "fishingRestockAmount", config.fishingRestockAmount());
-        sb.append(',');
-        appendStr(sb, "fishingBaitName", config.fishingBaitName());
-        sb.append(',');
-        appendInt(sb, "fishingBaitMin", config.fishingBaitMin());
-        sb.append(',');
-        appendInt(sb, "fishingBaitTarget", config.fishingBaitTarget());
-        sb.append(',');
-        appendInt(sb, "fishingBaitPrice", config.fishingBaitPrice());
-        sb.append(',');
-        appendInt(sb, "fishingFeatherPrice", config.fishingFeatherPrice());
-        sb.append(',');
-        appendStr(sb, "fishingCenters", config.fishingCenters());
-        sb.append(',');
-        appendBool(sb, "fishingUseVarrockTeleport", config.fishingUseVarrockTeleport());
-        sb.append(',');
-        appendBool(sb, "showFishingOverlay", config.showFishingOverlay());
-        sb.append(',');
-        appendInt(sb, "fishingInteractDelayMin", config.fishingInteractDelayMin());
-        sb.append(',');
-        appendInt(sb, "fishingInteractDelayMax", config.fishingInteractDelayMax());
-        sb.append(',');
-
-        appendBool(sb, "geSellEnabled", config.geSellEnabled());
-        sb.append(',');
-        appendStr(sb, "geSellPriceMode", config.geSellPriceMode().name());
-        sb.append(',');
-        appendInt(sb, "geSellFixedPrice", config.geSellFixedPrice());
-        sb.append(',');
-        appendInt(sb, "geSellPercentBelow", config.geSellPercentBelow());
-        sb.append(',');
-        appendStr(sb, "geSellLootItems", config.geSellLootItems());
-        sb.append(',');
-        appendInt(sb, "geSellAfterBanks", config.geSellAfterBanks());
-        sb.append(',');
-
-        appendStr(sb, "startSkill", config.startSkill().name());
-        sb.append(',');
-        appendStr(sb, "starterTrainRegion", config.starterTrainRegion().name());
-        sb.append(',');
-        appendBool(sb, "combatInRotation", config.combatInRotation());
-        sb.append(',');
-        appendInt(sb, "rotationMinMinutes", config.rotationMinMinutes());
-        sb.append(',');
-        appendInt(sb, "rotationMaxMinutes", config.rotationMaxMinutes());
-        sb.append(',');
-        appendBool(sb, "switchNow", config.switchNow());
-        sb.append(',');
-        appendBool(sb, "barbLootEnabled", config.barbLootEnabled());
-        sb.append(',');
-        appendBool(sb, "barbLootBonfireWait", config.barbLootBonfireWait());
-        sb.append(',');
-        appendInt(sb, "barbLootGeAfterBanks", config.barbLootGeAfterBanks());
-        sb.append(',');
-        appendInt(sb, "barbLootGePercentBelow", config.barbLootGePercentBelow());
-        sb.append(',');
-        appendInt(sb, "barbLootGeMinCash", config.barbLootGeMinCash());
-        sb.append(',');
-        appendInt(sb, "barbLootGeMindRunes", config.barbLootGeMindRunes());
-        sb.append(',');
-        appendBool(sb, "barbLootGeBuyAirStaff", config.barbLootGeBuyAirStaff());
-        sb.append(',');
-
-        appendBool(sb, "accountSwitchEnabled", config.accountSwitchEnabled());
-        sb.append(',');
-        appendInt(sb, "accountMinMinutes", config.accountMinMinutes());
-        sb.append(',');
-        appendInt(sb, "accountMaxMinutes", config.accountMaxMinutes());
-        sb.append(',');
-
-        appendBool(sb, "reLogoutEnabled", config.reLogoutEnabled());
-        sb.append(',');
-        appendInt(sb, "reLogoutMinMinutes", config.reLogoutMinMinutes());
-        sb.append(',');
-        appendInt(sb, "reLogoutMaxMinutes", config.reLogoutMaxMinutes());
-        sb.append(',');
-        appendInt(sb, "reLogoutPauseMinMinutes", config.reLogoutPauseMinMinutes());
-        sb.append(',');
-        appendInt(sb, "reLogoutPauseMaxMinutes", config.reLogoutPauseMaxMinutes());
-        sb.append(',');
-
-        appendInt(sb, "travelReclickIntervalMs", config.travelReclickIntervalMs());
-        sb.append(',');
-        appendInt(sb, "travelPostClickDelayMin", config.travelPostClickDelayMin());
-        sb.append(',');
-        appendInt(sb, "travelPostClickDelayMax", config.travelPostClickDelayMax());
-        sb.append(',');
-        appendBool(sb, "travelUsePathfinderWalk", config.travelUsePathfinderWalk());
-        sb.append(',');
-
-        appendBool(sb, "antiBanEnabled", config.antiBanEnabled());
-        sb.append(',');
-        appendInt(sb, "antiBanFrequency", config.antiBanFrequency());
-        sb.append(',');
-        appendBool(sb, "cameraMovement", config.cameraMovement());
-        sb.append(',');
-        appendInt(sb, "cameraDurationMin", config.cameraDurationMin());
-        sb.append(',');
-        appendInt(sb, "cameraDurationMax", config.cameraDurationMax());
-        sb.append(',');
-        appendInt(sb, "mmbDragSpeedMin", config.mmbDragSpeedMin());
-        sb.append(',');
-        appendInt(sb, "mmbDragSpeedMax", config.mmbDragSpeedMax());
-        sb.append(',');
-        appendInt(sb, "mmbDragDistanceMin", config.mmbDragDistanceMin());
-        sb.append(',');
-        appendInt(sb, "mmbDragDistanceMax", config.mmbDragDistanceMax());
-        sb.append(',');
-        appendBool(sb, "idleChecks", config.idleChecks());
-        sb.append(',');
-        appendBool(sb, "randomMouseMovement", config.randomMouseMovement());
-        sb.append(',');
-        appendBool(sb, "tabGlanceEnabled", config.tabGlanceEnabled());
-        sb.append(',');
-        appendBool(sb, "misClickEnabled", config.misClickEnabled());
-        sb.append(',');
-        appendInt(sb, "misClickPercent", config.misClickPercent());
-        sb.append(',');
-
-        appendStr(sb, "discordWebhookUrl", config.discordWebhookUrl());
-        sb.append(',');
-        appendBool(sb, "discordScreenshotsEnabled", config.discordScreenshotsEnabled());
-        sb.append(',');
-        appendInt(sb, "discordScreenshotIntervalSeconds", config.discordScreenshotIntervalSeconds());
-        sb.append(',');
-        appendBool(sb, "discordDetailedWebhookText", config.discordDetailedWebhookText());
-        sb.append(',');
-        appendBool(sb, "discordRelogPausePingsEnabled", config.discordRelogPausePingsEnabled());
-        sb.append(',');
-
-        appendBool(sb, "giantsMode", config.giantsMode());
-        sb.append(',');
-        appendStr(sb, "giantsMonsterName", config.giantsMonsterName());
-        sb.append(',');
-        appendStr(sb, "giantsCombatStyle", config.giantsCombatStyle().name());
-        sb.append(',');
-        appendStr(sb, "giantsMageSpell", config.giantsMageSpell().name());
-        sb.append(',');
-        appendInt(sb, "giantsBrassKeyPriceMin", config.giantsBrassKeyPriceMin());
-        sb.append(',');
-        appendInt(sb, "giantsBrassKeyPriceMax", config.giantsBrassKeyPriceMax());
-        sb.append(',');
-        appendStr(sb, "giantsLootItems", config.giantsLootItems());
-        sb.append(',');
-        appendInt(sb, "giantsBankWhenLoot", config.giantsBankWhenLoot());
-        sb.append(',');
-        appendBool(sb, "showGiantsOverlay", config.showGiantsOverlay());
-        sb.append(',');
-        appendBool(sb, "giantsPreferVarrock", config.giantsPreferVarrock());
-        sb.append(',');
-        appendStr(sb, "webGuiUrl", config.webGuiUrl());
-
+        for (Map.Entry<String, Object> e : values.entrySet()) {
+            sb.append(',');
+            appendConfigValue(sb, e.getKey(), e.getValue());
+        }
         sb.append('}');
         return sb.toString();
+    }
+
+    private static void appendConfigValue(StringBuilder sb, String key, Object val) {
+        if (val == null) {
+            appendStr(sb, key, "");
+            return;
+        }
+        if (val instanceof Boolean) {
+            appendBool(sb, key, (Boolean) val);
+        } else if (val instanceof Integer) {
+            appendInt(sb, key, (Integer) val);
+        } else if (val instanceof String) {
+            appendStr(sb, key, (String) val);
+        } else if (val instanceof Enum) {
+            appendStr(sb, key, ((Enum<?>) val).name());
+        } else {
+            appendStr(sb, key, String.valueOf(val));
+        }
     }
 
     /**

@@ -19,7 +19,6 @@ import java.util.*;
  * Geen haast: elke bank-interactie wacht 1 game tick (~600ms) voor menselijk tempo.
  */
 public class UniversalBankingManager {
-    private static final int GENIE_LAMP_ITEM_ID = 2528;
 
     private static void debug(String msg) {
         DebugLog.log("UBM", msg);
@@ -33,6 +32,12 @@ public class UniversalBankingManager {
     private static final int WITHDRAW_TIMEOUT_MS = 2500;
 
     private final Random random = new Random();
+
+    /** Anti-loop: zelfde item herhaald withdraw zonder inv-stijging. */
+    private String withdrawLoopGuardItem = "";
+    private int withdrawLoopGuardStreak = 0;
+    private int withdrawLoopGuardLastInvCount = -1;
+    private static final int WITHDRAW_LOOP_GUARD_MAX_STREAK = 5;
 
     // ===================== REQUIREMENT =====================
 
@@ -92,13 +97,33 @@ public class UniversalBankingManager {
      * een inventory count onder zijn minAmount.
      */
     public boolean shouldBank(List<Requirement> requirements) {
-        if (requirements == null || requirements.isEmpty()) return false;
-        for (Requirement r : requirements) {
-            if (r.getMinAmount() <= 0) continue;
-            int have = getInvCount(r.getItemName());
-            if (have < r.getMinAmount()) return true;
+        return shouldBank(requirements, BankSnapshotPlanner.currentDisplayName());
+    }
+
+    /**
+     * Moet er gebankt worden? Als snapshot bevestigt dat alle tekort-items niet in de bank liggen,
+     * {@code false} — handler kan direct naar GE (geen nutteloze bankloop).
+     */
+    public boolean shouldBank(List<Requirement> requirements, String displayName) {
+        if (requirements == null || requirements.isEmpty()) {
+            return false;
         }
-        return false;
+        boolean anyShort = false;
+        for (Requirement r : requirements) {
+            if (r.getMinAmount() <= 0) {
+                continue;
+            }
+            int have = getInvCount(r.getItemName());
+            if (have < r.getMinAmount()) {
+                anyShort = true;
+                break;
+            }
+        }
+        if (!anyShort) {
+            return false;
+        }
+        return BankSnapshotPlanner.shouldWalkToBankForRequirements(
+                displayName, requirements, this::getInvCount);
     }
 
     /**
@@ -114,6 +139,10 @@ public class UniversalBankingManager {
      * @return OK, NEEDS_GE_RESTOCK (met item naam + tekort), of FAIL
      */
     public BankSessionStatus runBankSession(List<Requirement> requirements) {
+        return runBankSession(requirements, BankSnapshotPlanner.currentDisplayName());
+    }
+
+    public BankSessionStatus runBankSession(List<Requirement> requirements, String displayName) {
         if (!Bank.isOpen()) return BankSessionStatus.fail();
         if (requirements == null) requirements = Collections.emptyList();
 
@@ -128,6 +157,10 @@ public class UniversalBankingManager {
             if (k != null) keepNamesLower.add(k.toLowerCase());
         }
 
+        withdrawLoopGuardItem = "";
+        withdrawLoopGuardStreak = 0;
+        withdrawLoopGuardLastInvCount = -1;
+
         debug("=== BANK SESSIE START ===");
         debug("scan: requirements:");
         for (Requirement r : requirements) {
@@ -138,42 +171,15 @@ public class UniversalBankingManager {
         }
 
         // Scan junk items (alles dat niet in keep-list zit)
-        boolean hasJunk = Inventory.contains(item ->
-                item.getName() != null && !keepNamesLower.contains(item.getName().toLowerCase()));
+        boolean hasJunk = BankDepositHelper.hasDepositableJunk(keepNamesLower);
         debug("scan: junk items in inventory=" + hasJunk);
 
-        // ---- STAP 2: DEPOSIT — Weg met wat we niet nodig hebben ----
+        // ---- STAP 2: DEPOSIT — Bank all-except (keep + lamp) ----
         boolean depositRan = false;
         if (hasJunk) {
             depositRan = true;
             debug("deposit: start — keep=" + Arrays.toString(keepNames));
-            if (keepNames.length > 0) {
-                Bank.depositAllExcept(keepNames);
-            } else {
-                // Geen keep-items: dump alles item-voor-item (menselijk)
-                java.util.List<IInventoryItem> allItems = Inventory.getAll();
-                if (allItems != null && !allItems.isEmpty()) {
-                    java.util.Collections.shuffle(allItems, random);
-                    for (IInventoryItem item : allItems) {
-                        if (item != null && item.getName() != null) {
-                            Bank.depositAll(item.getName());
-                            waitGameTick(); // 1 game tick wachten na elke deposit
-                        }
-                    }
-                }
-            }
-
-            // Wacht 1 game tick na deposit commando
-            waitGameTick();
-
-            // Conditional wait: wacht tot alleen keep-items overblijven
-            waitUntilDepositComplete(keepNamesLower);
-            // Forceer strikte cleanup: als er toch nog junk is, deponeer 1-voor-1.
-            if (hasResidualJunk(keepNamesLower)) {
-                debug("deposit: residual junk gevonden -> 1-voor-1 cleanup");
-                forceDepositResidualJunk(keepNamesLower);
-                waitUntilDepositComplete(keepNamesLower);
-            }
+            depositInventoryExceptKeep(keepNames, keepNamesLower);
             debug("deposit: afgerond");
         } else {
             debug("deposit: overgeslagen — geen junk items");
@@ -194,6 +200,46 @@ public class UniversalBankingManager {
         } catch (Exception ignored) {
         }
 
+        // ---- STAP 2b: Ruimte voor withdraw (na deposit) ----
+        int slotsNeeded = 0;
+        for (Requirement r : requirements) {
+            String name = r.getItemName();
+            if (name.isEmpty()) {
+                continue;
+            }
+            int target = r.getWithdrawAmount();
+            if (target <= 0) {
+                continue;
+            }
+            if (EquipmentSnapshotPlanner.hasEquippedItem(displayName, name)) {
+                continue;
+            }
+            int have = getInvCount(name);
+            slotsNeeded += BankInventoryHelper.slotsNeededForWithdrawDelta(name, have, target);
+        }
+        int wieldSlots = InventoryEquipHelper.maxWieldSlotsForRequirements(requirements);
+        int freeSlots = BankInventoryHelper.freeSlots();
+        if (slotsNeeded + wieldSlots > freeSlots) {
+            debug("withdraw: ruimte tekort (withdraw~" + slotsNeeded + " wield~" + wieldSlots
+                    + " vrij=" + freeSlots + ") -> extra deposit");
+            depositInventoryExceptKeep(keepNames, keepNamesLower);
+            waitGameTick();
+            waitGameTick();
+            freeSlots = BankInventoryHelper.freeSlots();
+        }
+        if (wieldSlots > freeSlots) {
+            debug("withdraw: wield-ruimte tekort (need " + wieldSlots + " free voor equip-swap, vrij="
+                    + freeSlots + ") -> volledige deposit vóór withdraw");
+            BankDepositHelper.depositEntireInventoryExceptGenieLamp();
+            waitGameTick();
+            waitGameTick();
+            freeSlots = BankInventoryHelper.freeSlots();
+        }
+        if (slotsNeeded + wieldSlots > freeSlots) {
+            debug("withdraw: WAARSCHUWING — nog " + freeSlots + " vrije slots voor ~" + slotsNeeded
+                    + " nodig; niet-stackable withdraw kan deels falen");
+        }
+
         // ---- STAP 3: WITHDRAW — Haal wat we nodig hebben ----
         for (Requirement r : requirements) {
             String name = r.getItemName();
@@ -207,7 +253,62 @@ public class UniversalBankingManager {
                 continue;
             }
 
+            if (EquipmentSnapshotPlanner.hasEquippedItem(displayName, name)) {
+                debug("withdraw: " + name + " al equipped (snapshot/live) — skip");
+                continue;
+            }
+            if (name.toLowerCase(java.util.Locale.ROOT).contains("amulet")
+                    && EquipmentSnapshotPlanner.hasItemInSlot(displayName, "AMULET", name)) {
+                debug("withdraw: " + name + " al in AMULET-slot — skip");
+                continue;
+            }
+            if (name.toLowerCase(java.util.Locale.ROOT).contains("bow")
+                    && EquipmentSnapshotPlanner.slotContainsNamePart(displayName, "WEAPON", "bow")) {
+                debug("withdraw: bow al in WEAPON-slot — skip");
+                continue;
+            }
+
             int need = target - have;
+
+            if (!BankInventoryHelper.hasSpaceForWithdraw(name, need, have)) {
+                debug("withdraw: geen slot voor " + name + " (+" + need + ", vrij="
+                        + BankInventoryHelper.freeSlots() + ") -> deposit + retry");
+                depositInventoryExceptKeep(keepNames, keepNamesLower);
+                waitGameTick();
+                if (!BankInventoryHelper.hasSpaceForWithdraw(name, need, have)) {
+                    if (BankInventoryHelper.isLikelyStackable(name) && BankInventoryHelper.freeSlots() >= 1) {
+                        debug("withdraw: stackable " + name + " — probeer toch");
+                    } else if (!BankInventoryHelper.isLikelyStackable(name) && BankInventoryHelper.freeSlots() < 1) {
+                        debug("withdraw: skip " + name + " — inv vol (niet-stackable)");
+                        if (have >= r.getMinAmount()) {
+                            continue;
+                        }
+                        return BankSessionStatus.needsGeRestock(name, Math.max(1, r.getMinAmount() - have));
+                    }
+                }
+            }
+
+            if (name.equalsIgnoreCase(withdrawLoopGuardItem)) {
+                withdrawLoopGuardStreak++;
+            } else {
+                withdrawLoopGuardItem = name;
+                withdrawLoopGuardStreak = 1;
+                withdrawLoopGuardLastInvCount = have;
+            }
+            if (withdrawLoopGuardStreak > WITHDRAW_LOOP_GUARD_MAX_STREAK
+                    && getInvCount(name) <= withdrawLoopGuardLastInvCount) {
+                if (have >= r.getMinAmount()) {
+                    debug("withdraw: anti-loop — min al OK voor " + name + " (" + have + "/" + r.getMinAmount() + ")");
+                    continue;
+                }
+                debug("withdraw: anti-loop — geen vooruitgang bij " + name + " → NEEDS_GE_RESTOCK");
+                return BankSessionStatus.needsGeRestock(name, Math.max(need, r.getMinAmount() - have));
+            }
+
+            if (BankSnapshotPlanner.snapshotConfirmsAbsent(displayName, name)) {
+                debug("withdraw: " + name + " snapshot=0 in bank → NEEDS_GE_RESTOCK (need=" + need + ")");
+                return BankSessionStatus.needsGeRestock(name, need);
+            }
 
             // Check of item in bank zit (poll: API kan 1–2 ticks achterlopen op stort/open)
             if (!waitForBankContains(name, "withdraw")) {
@@ -235,6 +336,10 @@ public class UniversalBankingManager {
             // Verify na elke withdraw
             int nowHave = getInvCount(name);
             debug("withdraw: " + name + " verify → hebben=" + nowHave + " nodig=" + target);
+            if (nowHave > startCount) {
+                withdrawLoopGuardStreak = 0;
+                withdrawLoopGuardItem = "";
+            }
             if (nowHave < target) {
                 // Basis request: poging om precies `target` te pakken.
                 // Als dit niet lukt (bijv. bank heeft minder stacks), dan pakken we alles wat we kunnen.
@@ -298,7 +403,7 @@ public class UniversalBankingManager {
         boolean stillHasJunk = hasResidualJunk(keepNamesLower);
         if (stillHasJunk) {
             debug("verify: residual junk na withdraw -> extra cleanup");
-            forceDepositResidualJunk(keepNamesLower);
+            depositInventoryExceptKeep(keepNames, keepNamesLower);
             stillHasJunk = hasResidualJunk(keepNamesLower);
             if (stillHasJunk) {
                 debug("verify: WAARSCHUWING — nog junk items in inventory (niet-kritiek)");
@@ -328,26 +433,26 @@ public class UniversalBankingManager {
     // ===================== INTERNAL HELPERS =====================
 
     private String[] buildKeepArray(List<Requirement> reqs) {
-        List<String> names = new ArrayList<>();
+        List<String> base = new ArrayList<>();
         for (Requirement r : reqs) {
             if (!r.getItemName().isEmpty()) {
-                names.add(r.getItemName());
+                base.add(r.getItemName());
             }
         }
-        // Lamp (ID 2528) nooit proberen te banken/depositeren; dit kan loop/spam veroorzaken.
-        // We voegen de actuele itemnaam toe zodat depositAllExcept dit item ongemoeid laat.
-        IInventoryItem lamp = Inventory.getFirst(item -> item != null && item.getId() == GENIE_LAMP_ITEM_ID);
-        if (lamp != null && lamp.getName() != null && !lamp.getName().isEmpty()) {
-            boolean exists = false;
-            for (String n : names) {
-                if (n.equalsIgnoreCase(lamp.getName())) {
-                    exists = true;
-                    break;
-                }
-            }
-            if (!exists) names.add(lamp.getName());
+        return BankDepositHelper.mergeKeepWithGenieLamp(base.toArray(new String[0]));
+    }
+
+    /** Bank all-except; lamp nooit storten; bij residue max. 1 extra depositAllExcept. */
+    private void depositInventoryExceptKeep(String[] keepNames, Set<String> keepNamesLower) {
+        BankDepositHelper.depositAllExceptKeep(keepNames);
+        waitGameTick();
+        waitUntilDepositComplete(keepNamesLower);
+        if (hasResidualJunk(keepNamesLower)) {
+            debug("deposit: residual -> tweede depositAllExcept");
+            BankDepositHelper.depositAllExceptKeep(keepNames);
+            waitGameTick();
+            waitUntilDepositComplete(keepNamesLower);
         }
-        return names.toArray(new String[0]);
     }
 
     /**
@@ -425,23 +530,7 @@ public class UniversalBankingManager {
     }
 
     private boolean hasResidualJunk(Set<String> keepNamesLower) {
-        return Inventory.contains(item ->
-                item != null && item.getName() != null
-                        && !keepNamesLower.contains(item.getName().toLowerCase()));
-    }
-
-    /** Fallback cleanup: deponeer alle non-keep items individueel met game-tick pacing. */
-    private void forceDepositResidualJunk(Set<String> keepNamesLower) {
-        java.util.List<IInventoryItem> junkItems = Inventory.getAll(item ->
-                item != null && item.getName() != null
-                        && !keepNamesLower.contains(item.getName().toLowerCase()));
-        if (junkItems == null || junkItems.isEmpty()) return;
-        java.util.Collections.shuffle(junkItems, random);
-        for (IInventoryItem item : junkItems) {
-            if (item == null || item.getName() == null) continue;
-            Bank.depositAll(item.getName());
-            waitGameTick();
-        }
+        return BankDepositHelper.hasDepositableJunk(keepNamesLower);
     }
 
     /**

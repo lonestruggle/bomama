@@ -2,7 +2,6 @@ package com.combatbot;
 
 import net.runelite.api.Quest;
 import net.storm.api.plugins.config.ConfigManager;
-import net.storm.sdk.quests.Quests;
 
 import java.util.LinkedHashMap;
 import java.util.Locale;
@@ -13,6 +12,7 @@ import java.util.Map;
  * Tussenstappen staan niet meer in JSON (voorkomt vastlopers door verouderde stap).
  * <p>Primair: {@link AccountStateJsonStore} ({@code ~/.runelite/combatbot-account-state.json}).
  * Het config-blob veld blijft geschreven voor compatibiliteit / migratie.</p>
+ * Voltooiing in-game: {@link StormQuestHelper} ({@code IQuests} / {@code Static.getQuests()}).
  */
 public final class AccountQuestProgressStore {
 
@@ -141,14 +141,32 @@ public final class AccountQuestProgressStore {
     }
 
     public static boolean isVampireSlayerComplete(CombatBotConfig cfg, String displayName) {
-        try {
-            if (Quests.isFinished(Quest.VAMPYRE_SLAYER)) {
-                return true;
-            }
-        } catch (Throwable ignored) {
+        if (StormQuestHelper.isQuestFinished(Quest.VAMPYRE_SLAYER)) {
+            return true;
         }
         QuestEntry e = get(cfg, displayName);
         return e != null && e.vampireSlayerStep >= VAMPIRE_SLAYER_STEP_DONE;
+    }
+
+    /**
+     * Als {@link Quest#VAMPYRE_SLAYER} in de client als afgerond staat, sla dat op voor dit account
+     * (zodat rotatie / start skill niet opnieuw naar de quest-handler gaan zonder bank-calibratie).
+     */
+    public static void syncVampireSlayerFromGameIfFinished(ConfigManager cm, CombatBotConfig cfg, String displayName) {
+        if (displayName == null || displayName.trim().isEmpty()) {
+            return;
+        }
+        if (!StormQuestHelper.isQuestFinished(Quest.VAMPYRE_SLAYER)) {
+            return;
+        }
+        QuestEntry cur = get(cfg, displayName.trim());
+        if (cur != null && cur.vampireSlayerStep >= VAMPIRE_SLAYER_STEP_DONE) {
+            return;
+        }
+        QuestEntry q = cur != null ? cur : new QuestEntry();
+        q.vampireSlayerStep = VAMPIRE_SLAYER_STEP_DONE;
+        put(cm, cfg, displayName.trim(), q);
+        DebugLog.log("QUEST", "IQuests: Vampyre Slayer afgerond → opgeslagen voor " + displayName.trim());
     }
 
     public static void setHammerFromImp(ConfigManager cm, CombatBotConfig cfg, String displayName) {

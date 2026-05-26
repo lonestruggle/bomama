@@ -3,7 +3,10 @@ package com.combatbot;
 import net.runelite.api.coords.WorldPoint;
 
 import java.util.ArrayList;
+import java.util.EnumMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.stream.Collectors;
 
@@ -91,6 +94,29 @@ public class CenterManager {
     public static String serialize(List<Center> centers) {
         if (centers == null || centers.isEmpty()) return "";
         return centers.stream().map(Center::serialize).collect(Collectors.joining("|"));
+    }
+
+    /**
+     * Mining: ontdubbelt opgeslagen centers (één per {@link MiningSiteRules.MiningSiteKind}, zelfde X:Y:vlak voor unknown)
+     * en geeft de config-string terug. Gebruik bij opslaan zodat panel en config overeenkomen met wat de bot gebruikt.
+     */
+    public static String dedupeMiningCentersBlob(String data) {
+        List<Center> list = parse(data == null ? "" : data);
+        if (list.isEmpty()) {
+            return "";
+        }
+        if (list.size() == 1) {
+            return serialize(list);
+        }
+        return serialize(dedupeMiningCentersBySiteKind(new ArrayList<>(list)));
+    }
+
+    /** Mining: serialiseer na ontdubbelen (panel / handmatige edits). */
+    public static String serializeMiningCentersDeduped(List<Center> centers) {
+        if (centers == null || centers.isEmpty()) {
+            return "";
+        }
+        return serialize(dedupeMiningCentersBySiteKind(new ArrayList<>(centers)));
     }
 
     /** Kies een willekeurige ACTIEVE center uit de lijst. */
@@ -309,6 +335,130 @@ public class CenterManager {
             if (!c.active) sb.append(" [UIT]");
         }
         return sb.toString();
+    }
+
+    /**
+     * Mining: uit actieve centers alleen locaties die bij het huidige mining-level passen
+     * (Draynor coal/mithril pas ≥30, Al Kharid iron pas ≥15, enz.).
+     */
+    public static Center pickMiningCenterForTraining(String data, int miningLevel) {
+        List<Center> pool = miningTrainingPool(data, miningLevel);
+        if (pool == null || pool.isEmpty()) {
+            return null;
+        }
+        return pool.get(random.nextInt(pool.size()));
+    }
+
+    public static boolean miningTrainingCenterStillValid(String data, WorldPoint activeCenter, int miningLevel) {
+        if (activeCenter == null) {
+            return false;
+        }
+        List<Center> pool = miningTrainingPool(data, miningLevel);
+        if (pool == null || pool.isEmpty()) {
+            return false;
+        }
+        return pool.stream().anyMatch(c ->
+                c.point.equals(activeCenter) || c.point.distanceTo(activeCenter) <= 2);
+    }
+
+    private static List<Center> miningTrainingPool(String data, int miningLevel) {
+        List<Center> activeCenters = parse(data).stream().filter(c -> c.active).collect(Collectors.toList());
+        if (activeCenters.isEmpty()) {
+            return null;
+        }
+        List<Center> eligible = new ArrayList<>();
+        for (Center c : activeCenters) {
+            MiningSiteRules.MiningSiteKind k = MiningSiteRules.classify(c.name, c.point);
+            if (MiningSiteRules.centerAllowedForMiningLevel(k, miningLevel)) {
+                eligible.add(c);
+            }
+        }
+        if (eligible.isEmpty()) {
+            // Kritiek: géén fallback naar "alle actieve centers". Anders gaat een lvl-2 account alsnog
+            // naar Al Kharid / Draynor-coal wanneer alleen die vinken aan staan.
+            return null;
+        }
+        eligible = dedupeMiningCentersBySiteKind(eligible);
+        if (eligible.isEmpty()) {
+            return null;
+        }
+        if (miningLevel >= 15) {
+            List<Center> ironSites = new ArrayList<>();
+            for (Center c : eligible) {
+                if (MiningSiteRules.siteTrainsIronOre(MiningSiteRules.classify(c.name, c.point))) {
+                    ironSites.add(c);
+                }
+            }
+            if (!ironSites.isEmpty()) {
+                return ironSites;
+            }
+        }
+        return eligible;
+    }
+
+    /**
+     * Voorkomt verwarring en heen-en-weer lopen: maximaal één actief center per herkende {@link MiningSiteRules.MiningSiteKind},
+     * dichtst bij het soort-anker; {@link MiningSiteRules.MiningSiteKind#UNKNOWN} ontdubbelt op X:Y:vlak (grootste radius).
+     */
+    private static List<Center> dedupeMiningCentersBySiteKind(List<Center> centers) {
+        if (centers == null || centers.size() <= 1) {
+            return centers;
+        }
+        Map<MiningSiteRules.MiningSiteKind, Center> bestKind = new EnumMap<>(MiningSiteRules.MiningSiteKind.class);
+        List<MiningSiteRules.MiningSiteKind> kindEncounterOrder = new ArrayList<>();
+        List<Center> unknowns = new ArrayList<>();
+        for (Center c : centers) {
+            MiningSiteRules.MiningSiteKind k = MiningSiteRules.classify(c.name, c.point);
+            if (k == MiningSiteRules.MiningSiteKind.UNKNOWN) {
+                unknowns.add(c);
+                continue;
+            }
+            WorldPoint anchor = MiningSiteRules.trainingAnchorForSiteKind(k);
+            if (!bestKind.containsKey(k)) {
+                bestKind.put(k, c);
+                kindEncounterOrder.add(k);
+            } else {
+                bestKind.put(k, preferMiningCenterForSameKind(bestKind.get(k), c, anchor));
+            }
+        }
+        List<Center> out = new ArrayList<>();
+        for (MiningSiteRules.MiningSiteKind k : kindEncounterOrder) {
+            out.add(bestKind.get(k));
+        }
+        out.addAll(dedupeUnknownMiningCentersByTile(unknowns));
+        return out;
+    }
+
+    private static Center preferMiningCenterForSameKind(Center a, Center b, WorldPoint anchor) {
+        if (a.active != b.active) {
+            return a.active ? a : b;
+        }
+        if (anchor == null) {
+            return a.radius >= b.radius ? a : b;
+        }
+        int da = a.point.distanceTo(anchor);
+        int db = b.point.distanceTo(anchor);
+        if (da != db) {
+            return da < db ? a : b;
+        }
+        return a.radius >= b.radius ? a : b;
+    }
+
+    private static List<Center> dedupeUnknownMiningCentersByTile(List<Center> unknowns) {
+        if (unknowns.isEmpty()) {
+            return unknowns;
+        }
+        Map<String, Center> byTile = new LinkedHashMap<>();
+        for (Center c : unknowns) {
+            String key = c.point.getX() + ":" + c.point.getY() + ":" + c.point.getPlane();
+            Center ex = byTile.get(key);
+            if (ex == null) {
+                byTile.put(key, c);
+            } else {
+                byTile.put(key, preferMiningCenterForSameKind(ex, c, null));
+            }
+        }
+        return new ArrayList<>(byTile.values());
     }
 
     // ===================== PRIVATE HELPERS =====================

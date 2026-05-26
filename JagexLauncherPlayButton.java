@@ -1,6 +1,7 @@
 package com.combatbot;
 
 import net.storm.sdk.game.Client;
+import net.storm.sdk.game.Game;
 import net.storm.sdk.input.Mouse;
 
 import java.awt.*;
@@ -356,18 +357,59 @@ public final class JagexLauncherPlayButton {
 
     /**
      * Zoekt de Play-knop op het game-canvas en klikt.
-     * <p>Eerst Storm/SDK: {@link WelcomeScreenPlayHelper} (welkomst-widget), daarna visueel:
+     * <p>Eerst {@link WelcomeScreenPlayHelper} (iface 378,77 CLICK HERE TO PLAY + SDK), daarna visueel:
      * template → witte tekst → groen → vaste coördinaten. Pixel-klik kan tweede logout/inlog-cyclus onstabieler maken
      * dan een echte widget-{@code interact}.
      *
      * @return true als er een klik is uitgevoerd
      */
+    private static long lastCanvasFocusAttemptMs;
+    private static final long CANVAS_FOCUS_INTERVAL_MS = 12_000L;
+
     public static boolean clickPlayButton() {
-        try {
-            if (WelcomeScreenPlayHelper.tryClickPlay()) {
-                return true;
+        WelcomeScreenPlayHelper.LoginPhase phase = WelcomeScreenPlayHelper.resolveLoginPhase();
+        if (phase == WelcomeScreenPlayHelper.LoginPhase.WELCOME_LOBBY) {
+            int delay = WelcomeScreenPlayHelper.advanceWelcomeLobbyClick();
+            return delay > 0;
+        }
+        if (phase != WelcomeScreenPlayHelper.LoginPhase.LOGIN_SCREEN
+                && !(Game.isOnLoginScreen() && !Game.isLoggedIn())) {
+            return false;
+        }
+        if (!WelcomeScreenPlayHelper.shouldAttemptPlayClick()) {
+            return false;
+        }
+
+        // Jagex login-scherm: alleen canvas Play Now (widgets/blind CC_OP doen niets).
+        if (Game.isOnLoginScreen() && !Game.isLoggedIn()) {
+            if (WelcomeScreenPlayHelper.isPostJagexLoginScreenPlaySettling()) {
+                return false;
             }
-        } catch (Throwable ignored) {
+            boolean clicked = clickPlayNowOnCanvas("login-scherm Play Now");
+            if (clicked) {
+                WelcomeScreenPlayHelper.notifyJagexLoginScreenPlayClicked();
+            }
+            return clicked;
+        }
+
+        if (WelcomeScreenPlayHelper.tryClickPlay()) {
+            return true;
+        }
+
+        if (!WelcomeScreenPlayHelper.mayUseCanvasPlayFallback()) {
+            return false;
+        }
+        return clickPlayNowOnCanvas("welkomst-lobby canvas");
+    }
+
+    /**
+     * Klik op grijze/groene Play-knop via canvas-detectie (template, witte tekst, kleur, vaste coords).
+     */
+    public static boolean clickPlayNowOnCanvas(String reason) {
+        long now = System.currentTimeMillis();
+        if (now - lastCanvasFocusAttemptMs >= CANVAS_FOCUS_INTERVAL_MS) {
+            lastCanvasFocusAttemptMs = now;
+            WelcomeScreenPlayHelper.tryFocusGameWindow();
         }
 
         Canvas canvas = Client.getCanvas();
@@ -384,10 +426,10 @@ public final class JagexLauncherPlayButton {
                     int x = p.x + RANDOM.nextInt(11) - 5;
                     int y = p.y + RANDOM.nextInt(11) - 5;
                     Mouse.click(Math.max(0, x), Math.max(0, y), true);
+                    DebugLog.log("Login", "Play Now (" + reason + ") template @ " + x + "," + y);
                     return true;
                 }
             }
-            // Eerst in-game "Welcome" / grijze Play Now — groen eerst gaf soms valse treffers (vlammen/UI).
             Point p = findPlayButtonByWhiteText(capture);
             if (p == null) {
                 p = findPlayButtonByColor(capture);
@@ -396,18 +438,22 @@ public final class JagexLauncherPlayButton {
                 int x = p.x + RANDOM.nextInt(11) - 5;
                 int y = p.y + RANDOM.nextInt(11) - 5;
                 Mouse.click(Math.max(0, x), Math.max(0, y), true);
+                DebugLog.log("Login", "Play Now (" + reason + ") detectie @ " + x + "," + y);
                 return true;
             }
         }
 
-        // Fallback: vaste coördinaten
         int canvasWidth = canvas.getWidth();
         int canvasHeight = canvas.getHeight();
         int halfWidth = BUTTON_WIDTH / 2;
         int buttonX = (canvasWidth / 2) - halfWidth;
         int buttonY = BUTTON_Y;
-        if (buttonX < 0) buttonX = 0;
-        if (buttonY < 0) buttonY = 0;
+        if (buttonX < 0) {
+            buttonX = 0;
+        }
+        if (buttonY < 0) {
+            buttonY = 0;
+        }
         int maxX = Math.min(buttonX + BUTTON_WIDTH, canvasWidth);
         int maxY = Math.min(buttonY + BUTTON_HEIGHT, canvasHeight);
         int w = maxX - buttonX;
@@ -418,6 +464,7 @@ public final class JagexLauncherPlayButton {
         int x = buttonX + RANDOM.nextInt(w);
         int y = buttonY + RANDOM.nextInt(h);
         Mouse.click(x, y, true);
+        DebugLog.log("Login", "Play Now (" + reason + ") vaste coords @ " + x + "," + y);
         return true;
     }
 }

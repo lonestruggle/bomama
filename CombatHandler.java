@@ -81,6 +81,7 @@ public class CombatHandler {
     private long noRunesDetectedTime = 0;
     /** Laatste OSRS-gamebericht "geen ammo in quiver" — Equipment API kan daar kort naast lopen. */
     private long lastRangedEmptyQuiverGameMessageMs;
+    private long lastRangedEmptyQuiverChatLogMs;
 
     // Arrow pickup tracking
     private int killsSinceArrowPickup = 0;
@@ -170,6 +171,7 @@ public class CombatHandler {
         noAmmoDetected = false;
         noRunesDetectedTime = 0;
         lastRangedEmptyQuiverGameMessageMs = 0L;
+        lastRangedEmptyQuiverChatLogMs = 0L;
         killsSinceArrowPickup = 0;
         nextArrowPickupKills = 0;
         effectiveBuryThreshold = -1;
@@ -221,11 +223,14 @@ public class CombatHandler {
             noRunesDetectedTime = System.currentTimeMillis();
             chatLog("⚠ Geen runes meer gedetecteerd! Combat gestopt.");
         }
-        // Detecteer ranged ammo problemen — inventory/bank/GE lossen dit op (geen harde stop)
+        // Lege quiver: timestamp voor combat-loop (niet meteen bank — eerst inv-equip proberen)
         if (RangedAmmoKit.isRangedEmptyQuiverGameMessage(message)) {
-            noAmmoDetected = true;
             lastRangedEmptyQuiverGameMessageMs = System.currentTimeMillis();
-            chatLog("⚠ Geen ammo in quiver — eerst inventory/bank, anders GE.");
+            long now = System.currentTimeMillis();
+            if (now - lastRangedEmptyQuiverChatLogMs > 8000L) {
+                lastRangedEmptyQuiverChatLogMs = now;
+                chatLog("⚠ Quiver leeg — vul vanuit inventory; anders bank/GE.");
+            }
         }
     }
 
@@ -529,14 +534,14 @@ public class CombatHandler {
         for (String bone : BONE_NAMES) {
             IInventoryItem item = Inventory.getFirst(bone);
             if (item != null) {
-                item.interact("Bury");
+                InventoryActionHelper.interact(config, item, "Bury");
                 return antiBan.varyDelay(randomDelay(BURY_DELAY_MIN_MS, BURY_DELAY_MAX_MS));
             }
         }
         for (String ash : ASH_NAMES) {
             IInventoryItem item = Inventory.getFirst(ash);
             if (item != null) {
-                item.interact("Scatter");
+                InventoryActionHelper.interact(config, item, "Scatter");
                 return antiBan.varyDelay(randomDelay(BURY_DELAY_MIN_MS, BURY_DELAY_MAX_MS));
             }
         }
@@ -638,13 +643,13 @@ public class CombatHandler {
     private int handleEating() {
         IInventoryItem food = isAnyFood() ? findAnyFood() : Inventory.getFirst(config.foodName());
         if (food != null) {
-            food.interact("Eat");
+            InventoryActionHelper.interact(config, food, "Eat");
             // Soms 2x eten op lage HP als we waarschijnlijk niet full overhealen.
             if (shouldAttemptDoubleEatNow()) {
                 sleep(260, 520);
                 IInventoryItem second = isAnyFood() ? findAnyFood() : Inventory.getFirst(config.foodName());
                 if (second != null) {
-                    second.interact("Eat");
+                    InventoryActionHelper.interact(config, second, "Eat");
                     return antiBan.varyDelay(randomDelay(1450, 2200));
                 }
             }
@@ -676,13 +681,26 @@ public class CombatHandler {
                 || Equipment.contains("Toxic blowpipe")) {
             return 0;
         }
+        IPlayer local = Players.getLocal();
         int need = effectiveRangedAmmoBankMinimum();
         int total = getTotalRangedAmmoCount();
+        int equipped = getEquippedRangedAmmoQuantity();
+
+        if (equipped > 0 && !recentRangedEmptyQuiverGameMessage()) {
+            noAmmoDetected = false;
+        }
+
         if (shouldTryInventoryRangedAmmoEquip()) {
+            if (local != null && local.isInteracting() && inventoryHasUsableRangedAmmo()) {
+                MovementHelper.walkTo(local.getWorldLocation());
+                paint.setLastAntiBanAction("🏹 Combat pauzeren — quiver vullen");
+                return antiBan.varyDelay(randomDelay(400, 750));
+            }
             if (tryEquipRangedAmmoFromInventory()) {
                 return antiBan.varyDelay(randomDelay(450, 850));
             }
             if (inventoryHasUsableRangedAmmo()) {
+                paint.setLastAntiBanAction("🏹 Quiver vullen (inventory)");
                 return antiBan.varyDelay(randomDelay(450, 850));
             }
             noAmmoDetected = true;
@@ -694,6 +712,7 @@ public class CombatHandler {
             paint.setLastAntiBanAction("🏹 Te weinig pijlen (totaal) — bank/GE");
             return antiBan.varyDelay(randomDelay(400, 800));
         }
+        noAmmoDetected = false;
         return 0;
     }
 
@@ -706,8 +725,12 @@ public class CombatHandler {
             return ammoDelay;
         }
 
-        // Al in combat — gewoon wachten
+        // In combat: elke tick quiver checken (lege quiver + pijlen in inv → eerst vullen)
         if (local.isInteracting()) {
+            int inCombatAmmo = enforceRangedAmmoOrDelay();
+            if (inCombatAmmo > 0) {
+                return inCombatAmmo;
+            }
             targetWasAlive = true;
             lootWindowEnd = 0;
             return antiBan.varyDelay(randomDelay(600, 1200));
@@ -998,12 +1021,73 @@ public class CombatHandler {
             return antiBan.varyDelay(randomDelay(1500, 2500));
         }
 
-        if (!BankHelper.walkToNearestFullBank()) {
+        String[] hoped = combatHopedWithdrawItemNames();
+        if (!BankHelper.walkToNearestFullBank(hoped)) {
+            if (BankHelper.wasLastWalkSkippedDueToSnapshot()) {
+                int geDelay = tryCombatGeRestockFromSnapshot();
+                if (geDelay > 0) {
+                    return geDelay;
+                }
+            }
             paint.setLastAntiBanAction("⚠ Geen bank gevonden!");
             return 5000;
         }
         paint.setLastAntiBanAction("→ Lopen naar bank");
         return antiBan.varyDelay(randomDelay(2000, 3000));
+    }
+
+    private String[] combatHopedWithdrawItemNames() {
+        java.util.List<UniversalBankingManager.Requirement> reqs = buildCombatRequirements();
+        java.util.List<String> names = new java.util.ArrayList<>();
+        for (UniversalBankingManager.Requirement r : reqs) {
+            if (r != null && r.getItemName() != null && !r.getItemName().isEmpty()) {
+                names.add(r.getItemName());
+            }
+        }
+        return names.toArray(new String[0]);
+    }
+
+    /** Snapshot zegt bank leeg → GE zonder bankloop (zelfde pad als UBM NEEDS_GE). */
+    private int tryCombatGeRestockFromSnapshot() {
+        java.util.List<UniversalBankingManager.Requirement> reqs = buildCombatRequirements();
+        String missing = BankSnapshotPlanner.firstSnapshotAbsentShortage(
+                BankSnapshotPlanner.currentDisplayName(),
+                reqs,
+                name -> net.storm.sdk.items.Inventory.getCount(true, name));
+        if (missing == null || missing.isEmpty()) {
+            return 0;
+        }
+        debug("snapshot: direct GE voor " + missing);
+        String foodReqName = !reqs.isEmpty() ? reqs.get(0).getItemName() : null;
+        int shortage = 5;
+        for (UniversalBankingManager.Requirement r : reqs) {
+            if (r.getItemName() != null && r.getItemName().equalsIgnoreCase(missing)) {
+                shortage = Math.max(1, r.getWithdrawAmount()
+                        - net.storm.sdk.items.Inventory.getCount(true, r.getItemName()));
+                break;
+            }
+        }
+        boolean geOk = false;
+        if (config.combatGeFoodEnabled() && combatGeFoodAppliesToMissing(missing, foodReqName)) {
+            if (config.combatGeFoodType() == CombatGeFoodType.ANY) {
+                geOk = tryGeRestockFoodAnyMode(shortage, missing);
+            } else {
+                geOk = tryGeRestockFood(shortage, missing);
+            }
+        }
+        if (!geOk && config.combatGeRangedAmmoEnabled()
+                && config.combatStyle() == CombatBotConfig.ImpsCombatStyle.RANGED
+                && !Equipment.contains("Toxic blowpipe")
+                && isRangedAmmoItemName(missing)) {
+            String buyName = RangedAmmoPreference.geBuyItemName(config);
+            int buyQty = Math.max(shortage, Math.max(config.combatArrowTarget(), 100));
+            geOk = tryGeRestockRangedAmmo(buyName, buyQty);
+        }
+        if (geOk) {
+            paint.setLastAntiBanAction("🛒 GE (snapshot): " + missing);
+            return antiBan.varyDelay(randomDelay(2000, 3500));
+        }
+        return 0;
     }
 
     /** Build UBM requirements voor combat: food + ammo/runes. */
@@ -1033,10 +1117,7 @@ public class CombatHandler {
                 if (!Equipment.contains("Toxic blowpipe")) {
                     String ammo = findBestAmmoInBank();
                     if (ammo == null || ammo.isEmpty()) {
-                        String fallback = config.combatGeRangedAmmoItem();
-                        ammo = (fallback != null && !fallback.trim().isEmpty())
-                                ? fallback.trim()
-                                : "Bronze arrow";
+                        ammo = RangedAmmoPreference.geBuyItemName(config);
                     }
                     int target = Math.max(config.combatArrowTarget(), 100);
                     int minPull = effectiveRangedAmmoBankMinimum();
@@ -1066,26 +1147,31 @@ public class CombatHandler {
                 }
                 break;
         }
-        // Amulet of power (gear prep voor elke combat style als de speler het heeft)
-        if (Bank.contains("Amulet of power")) {
-            reqs.add(new UniversalBankingManager.Requirement("Amulet of power", 1, 1));
+        // Amulet of power — niet ophalen als al in AMULET-slot (live of snapshot)
+        String rsn = BankSnapshotPlanner.currentDisplayName();
+        if (!EquipmentSnapshotPlanner.hasItemInSlot(rsn, "AMULET", "Amulet of power")
+                && !EquipmentSnapshotPlanner.hasEquippedItem(rsn, "Amulet of power")) {
+            boolean inBank = false;
+            try {
+                inBank = Bank.isOpen() && Bank.contains("Amulet of power");
+            } catch (Exception ignored) {
+            }
+            if (inBank || BankSnapshotPlanner.shouldWalkToBankForWithdraw(rsn, "Amulet of power")) {
+                reqs.add(new UniversalBankingManager.Requirement("Amulet of power", 1, 1));
+            }
         }
         return reqs;
     }
 
-    /** Zoek beste ammo in bank die de speler qua level kan gebruiken. */
+    /** Zoek ammo in bank volgens per-account pijlvoorkeur. */
     private String findBestAmmoInBank() {
-        if (!Bank.isOpen()) return null;
-        int rangedLevel = getSkillLevel(Skill.RANGED);
-        for (Object[] entry : RangedAmmoKit.LEVELED_AMMO) {
-            String name = (String) entry[0];
-            int reqLevel = (int) entry[1];
-            if (rangedLevel >= reqLevel && Bank.contains(name)) {
-                debug("findBestAmmo: " + name + " (level " + rangedLevel + " >= " + reqLevel + ")");
-                return name;
-            }
+        String found = RangedAmmoPreference.findAmmoInOpenBank(config);
+        if (found != null) {
+            debug("findBestAmmo: " + found + " (pref="
+                    + ManagedJagexAccountsStore.resolveRangedAmmoTypeForDisplayName(
+                            config, RangedAmmoPreference.activeDisplayName()) + ")");
         }
-        return null;
+        return found;
     }
 
     /** Zoek beste rune in bank. */
@@ -1178,7 +1264,7 @@ public class CombatHandler {
 
     /** Of we ammo uit de rugzak moeten (lege quiver óf game zegt net dat die leeg is). */
     private boolean shouldTryInventoryRangedAmmoEquip() {
-        return getEquippedRangedAmmoQuantity() <= 0 || recentRangedEmptyQuiverGameMessage();
+        return RangedAmmoKit.quiverNeedsRefillFromInventory(lastRangedEmptyQuiverGameMessageMs);
     }
 
     private IInventoryItem findBestRangedAmmoInInventory() {
@@ -1209,6 +1295,7 @@ public class CombatHandler {
             return false;
         }
         String equipped = RangedAmmoKit.tryEquipRangedAmmoFromInventoryReturningDisplayName(
+                config,
                 getSkillLevel(Skill.RANGED),
                 lastRangedEmptyQuiverGameMessageMs,
                 this::sleep,
@@ -1403,12 +1490,7 @@ public class CombatHandler {
                     && config.combatStyle() == CombatBotConfig.ImpsCombatStyle.RANGED
                     && !Equipment.contains("Toxic blowpipe")
                     && isRangedAmmoItemName(missing)) {
-                String buyName = config.combatGeRangedAmmoItem();
-                if (buyName == null || buyName.trim().isEmpty()) {
-                    buyName = "Bronze arrow";
-                } else {
-                    buyName = buyName.trim();
-                }
+                String buyName = RangedAmmoPreference.geBuyItemName(config);
                 int buyQty = Math.max(shortage, Math.max(config.combatArrowTarget(), 100));
                 geOk = tryGeRestockRangedAmmo(buyName, buyQty);
                 if (geOk) {
@@ -1436,6 +1518,10 @@ public class CombatHandler {
 
         // Kleine pauze voordat we bank sluiten (menselijk gedrag)
         sleep(300, 600);
+        if (Bank.isOpen() && !ensureFreeSlotsBeforePostBankEquip()) {
+            debug("post-bank equip: nog onvoldoende ruimte — bank blijft open");
+            return antiBan.varyDelay(randomDelay(800, 1200));
+        }
         Bank.close();
         bankingManager.waitForBankClose();
 
@@ -1443,6 +1529,13 @@ public class CombatHandler {
         equipWeaponFromInventory();
         tryEquipRangedAmmoFromInventory();
         equipAmuletOfPowerFromInventory();
+        if (config.combatStyle() == CombatBotConfig.ImpsCombatStyle.RANGED) {
+            while (StyleArmourBankHelper.tryUnequipOneMeleeArmourBlockingRanged()) {
+                sleep(400, 700);
+            }
+            StyleArmourBankHelper.equipAllFromInventory(config, CombatBotConfig.ImpsCombatStyle.RANGED,
+                    (min, max) -> sleep(min, max));
+        }
 
         return antiBan.varyDelay(randomDelay(600, 1000));
     }
@@ -1487,9 +1580,14 @@ public class CombatHandler {
             return false;
         });
         if (weapon != null) {
-            debug("equipWeaponFromInventory: equipping " + weapon.getName());
-            weapon.interact("Wield");
-            sleep(600, 900);
+            if (InventoryEquipHelper.tryWieldOrWear(config, weapon)) {
+                debug("equipWeaponFromInventory: equipping " + weapon.getName());
+                sleep(600, 900);
+            } else {
+                debug("equipWeaponFromInventory: geen ruimte voor " + weapon.getName()
+                        + " (need " + InventoryEquipHelper.minFreeSlotsToWield(weapon.getName())
+                        + " free, have " + InventoryEquipHelper.freeSlots() + ")");
+            }
         }
     }
 
@@ -1499,9 +1597,71 @@ public class CombatHandler {
         IInventoryItem amulet = Inventory.getFirst(item -> item != null && item.getName() != null && item.getName().equalsIgnoreCase("Amulet of power"));
         if (amulet != null) {
             debug("equipAmuletOfPowerFromInventory: equipping Amulet of power");
-            amulet.interact(amulet.hasAction("Wear") ? "Wear" : "Wield");
+            InventoryActionHelper.interact(config, amulet, amulet.hasAction("Wear") ? "Wear" : "Wield");
             sleep(500, 800);
         }
+    }
+
+    /**
+     * Vóór bank sluiten: minstens N vrije slots voor melee→ranged/staff equip-swap.
+     * @return true als ruimte OK is (of geen pending wield nodig)
+     */
+    private boolean ensureFreeSlotsBeforePostBankEquip() {
+        int need = pendingWeaponEquipFreeSlots();
+        if (need <= 0) {
+            return true;
+        }
+        int free = InventoryEquipHelper.freeSlots();
+        if (free >= need) {
+            return true;
+        }
+        debug("ensureFreeSlotsBeforePostBankEquip: need " + need + " free, have " + free + " — deposit alles");
+        BankDepositHelper.depositEntireInventoryExceptGenieLamp();
+        sleep(400, 700);
+        free = InventoryEquipHelper.freeSlots();
+        if (free >= need) {
+            return true;
+        }
+        return false;
+    }
+
+    private int pendingWeaponEquipFreeSlots() {
+        switch (config.combatStyle()) {
+            case RANGED:
+                if (hasRangedWeaponEquipped()) {
+                    return 0;
+                }
+                return maxWieldSlotsForInventoryMatch("shortbow", "longbow", "crossbow", "bow");
+            case MAGE:
+                if (hasMagicWeaponEquipped()) {
+                    return 0;
+                }
+                return maxWieldSlotsForInventoryMatch("staff", "wand");
+            case MELEE:
+                if (hasMeleeWeaponEquipped()) {
+                    return 0;
+                }
+                return maxWieldSlotsForInventoryMatch("scimitar", "sword", "dagger", "mace", "axe", "halberd", "spear", "whip", "claw");
+            default:
+                return 0;
+        }
+    }
+
+    private int maxWieldSlotsForInventoryMatch(String... keywords) {
+        int max = 0;
+        for (IInventoryItem item : Inventory.getAll()) {
+            if (item == null || item.getName() == null) {
+                continue;
+            }
+            String name = item.getName().toLowerCase();
+            for (String kw : keywords) {
+                if (name.contains(kw)) {
+                    max = Math.max(max, InventoryEquipHelper.minFreeSlotsToWield(item.getName()));
+                    break;
+                }
+            }
+        }
+        return max;
     }
 
     private String detectBestFood() {

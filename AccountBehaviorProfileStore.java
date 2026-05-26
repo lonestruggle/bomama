@@ -185,7 +185,14 @@ public final class AccountBehaviorProfileStore {
         int x = goal.getX();
         int y = goal.getY();
         int p = goal.getPlane();
-        return x == 3206 && y == 3208 && (p == 0 || p == 1);
+        if (x == 3206 && y == 3208 && (p == 0 || p == 1)) {
+            return true;
+        }
+        // Al Kharid bank + booth-rij (mining → bank): geen ±1 shift — voorkomt klikken "achteruit"
+        if (p == 0 && x >= 3255 && x <= 3295 && y >= 3155 && y <= 3185) {
+            return true;
+        }
+        return false;
     }
 
     public static WorldPoint personalizeApproachTile(Profile profile, WorldPoint canonical) {

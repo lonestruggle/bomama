@@ -1558,7 +1558,7 @@ public final class VampireSlayerQuestHandler {
             return 0;
         }
         String action = food.hasAction("Eat") ? "Eat" : (food.hasAction("Drink") ? "Drink" : "Eat");
-        food.interact(action);
+        InventoryActionHelper.interact(config, food, action);
         InteractionThrottle.markGlobalInteraction();
         lastEatMs = now;
         paint.setCurrentStatus("Quest: nood-eat bij " + hp + " HP");
@@ -1727,7 +1727,7 @@ public final class VampireSlayerQuestHandler {
         if (act == null) {
             return false;
         }
-        best.interact(act);
+        InventoryActionHelper.interact(config, best, act);
         return true;
     }
 

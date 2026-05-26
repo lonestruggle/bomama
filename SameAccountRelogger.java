@@ -303,13 +303,19 @@ public class SameAccountRelogger {
             return 0;
         }
 
-        if (Game.isLoggedIn()) {
-            debug("handleLogin: Game.isLoggedIn() → re-log voltooid, timer reset");
+        if (WelcomeScreenPlayHelper.isInGameWorld()) {
+            debug("handleLogin: in game world → re-log voltooid, timer reset");
             state = State.IDLE;
             sessionStart = Instant.now();
             resetTimer();
             paint.setLastAntiBanAction("✓ Re-log voltooid");
             return 1000;
+        }
+
+        if (WelcomeScreenPlayHelper.isWelcomeLobbyPendingPlay()) {
+            int playDelay = WelcomeScreenPlayHelper.advanceWelcomeLobbyClick();
+            loginRetries++;
+            return playDelay > 0 ? playDelay : 260 + random.nextInt(140);
         }
 
         if (Game.isOnLoginScreen()) {
@@ -384,24 +390,22 @@ public class SameAccountRelogger {
     private boolean ensureAccountLoaded() {
         String cfg = config.reLogoutAccount();
         if (cfg == null || cfg.trim().isEmpty()) {
-            // Geen expliciet account ingevuld: probeer automatisch de enige aangevinkte Jagex-account te pakken
-            List<JagexCredentialsHelper.ParsedJagexAccount> pasted = JagexCredentialsHelper.parsePastedCredentials(config.pastedCredentials());
-            Set<String> enabledNames = JagexCredentialsHelper.parseEnabledDisplayNames(config.enabledDisplayNames());
-            JagexCredentialsHelper.ParsedJagexAccount chosen = null;
-            for (JagexCredentialsHelper.ParsedJagexAccount acc : pasted) {
-                if (enabledNames.contains(acc.getDisplayName())) {
-                    if (chosen != null) {
-                        // Meer dan 1 actief → laat de user kiezen
-                        paint.setLastAntiBanAction("⚠ Re-log: meerdere accounts aangevinkt, vul 1 naam of email in");
-                        debug("ensureAccountLoaded: meerdere enabled Jagex-accounts, user moet kiezen");
-                        return false;
-                    }
-                    chosen = acc;
-                }
-            }
+            JagexCredentialsHelper.ParsedJagexAccount chosen =
+                    JagexCredentialsHelper.resolveEnabledJagexAccountForAutoLogin(config);
             if (chosen == null) {
-                paint.setLastAntiBanAction("⚠ Re-log: geen actieve Jagex account (vink er 1 aan)");
-                debug("ensureAccountLoaded: geen enabled Jagex-account gevonden");
+                int enabledCount = JagexCredentialsHelper.listEnabledPastedJagexAccounts(config).size();
+                if (enabledCount > 1) {
+                    if (config.accountSwitchEnabled()) {
+                        paint.setLastAntiBanAction("⚠ Re-log: meerdere accounts — account-switcher gebruiken");
+                        debug("ensureAccountLoaded: meerdere enabled Jagex-accounts — account-switcher, geen ReLog");
+                    } else {
+                        paint.setLastAntiBanAction("⚠ Re-log: meerdere accounts — vul reLogoutAccount in (pasted:Naam)");
+                        debug("ensureAccountLoaded: meerdere enabled Jagex-accounts, user moet kiezen");
+                    }
+                } else {
+                    paint.setLastAntiBanAction("⚠ Re-log: geen actieve Jagex account (vink er 1 aan)");
+                    debug("ensureAccountLoaded: geen enabled Jagex-account gevonden");
+                }
                 return false;
             }
             gameAccount = chosen.toGameAccount();

@@ -46,7 +46,6 @@ import net.storm.sdk.items.Inventory;
 import net.storm.api.account.GameAccount;
 import net.storm.sdk.game.Game;
 import net.storm.sdk.game.Skills;
-import net.storm.sdk.quests.Quests;
 import net.storm.sdk.widgets.Dialog;
 import net.storm.sdk.widgets.Widgets;
 import javax.imageio.ImageIO;
@@ -124,6 +123,9 @@ public class CombatBotPlugin extends LoopedPlugin {
     @Inject
     private MouseDebugOverlay mouseDebugOverlay;
 
+    @Inject
+    private InventoryItemIdOverlay inventoryItemIdOverlay;
+
     private CombatBotPaint paint;
     private AntiBan antiBan;
     private AccountSwitcher accountSwitcher;
@@ -147,12 +149,14 @@ public class CombatBotPlugin extends LoopedPlugin {
     private CombatHandler combatHandler;
     private WoodcutterHandler woodcutterHandler;
     private MiningHandler miningHandler;
+    private DoricsQuestHandler doricsQuestHandler;
     private FishingHandler fishingHandler;
     private ImpsHandler impsHandler;
     private GiantsHandler giantsHandler;
     private BarbarianHandler barbarianHandler;
     private LootHandler lootHandler;
     private VampireSlayerQuestHandler vampireSlayerQuestHandler;
+    private BeginnerClueHandler beginnerClueHandler;
     private StarterSkillHandler starterSkillHandler;
     private TutorialModeHandler tutorialModeHandler;
 
@@ -169,6 +173,8 @@ public class CombatBotPlugin extends LoopedPlugin {
     private long switchCooldownUntil = 0;
     private long lastMeleeStyleSwitchMs = 0;
     private boolean wcImpsCashFarmActive = false;
+    /** Mining-handler gepauzeerd zolang Doric's Quest voorrang heeft (geen walk naar mining spot). */
+    private boolean miningHeldForDoricsQuest = false;
     private int wcImpsCashFarmTripsTarget = 0;
     private int wcImpsCashFarmTripsStart = 0;
     private boolean moneyImpsCashFarmActive = false;
@@ -176,9 +182,12 @@ public class CombatBotPlugin extends LoopedPlugin {
     private int moneyImpsCashFarmTripsTarget = 0;
     private int moneyImpsCashFarmTripsStart = 0;
     private long lastBankSnapshotSyncMs = 0L;
+    private long lastEquipmentSnapshotSyncMs = 0L;
     /** Vorige tick: bank open geweest voor snapshot (rising edge = direct sync). */
     private boolean bankSnapshotPrevOpen = false;
     private long lastQuestCalibrationSyncMs = 0L;
+    /** Periodieke sync: IQuests → {@link AccountQuestProgressStore} (o.a. Vampyre Slayer), los van bank. */
+    private long lastF2pQuestGameSyncMs = 0L;
     /** Panel “reset”: volgende fresh start laadt starter-fase niet uit account-JSON. */
     private boolean ignoreStarterJsonOnNextFreshStart;
 
@@ -292,6 +301,8 @@ public class CombatBotPlugin extends LoopedPlugin {
 
     // Track bot enabled state voor fresh start
     private boolean wasBotEnabled = false;
+    /** Eén debug-regel per Start-druk (niet elke loop-tick). */
+    private boolean botStartLoginLogged;
     private boolean startupInventoryChecked = false;
 
     // Directe knoppen: panel zet deze via callback, plugin verwerkt in loop (config kan vertraagd zijn)
@@ -299,9 +310,17 @@ public class CombatBotPlugin extends LoopedPlugin {
     private volatile boolean nextAccountRequested = false;
     private volatile boolean sellNowRequested = false;
     private volatile boolean loginNowRequested = false;
+    /**
+     * Na starter→imps handoff schrijven we {@code startSkill=COMBAT}, maar {@link CombatBotConfig#startSkill()}
+     * en/of per-account {@code startSkillOverride} kan nog even STARTER blijven — dan zou
+     * {@link #enforceStarterStartSkillIfConfigured()} Imps in een ping-pong trekken.
+     */
+    private volatile boolean ignoreStaleStarterStartSkillWhileImpsHandoff;
 
     // Cleanup state voor skill switch
     private boolean cleaningUpBeforeSwitch = false;
+    /** Na fishing (of volle inv): alles banken vóór volgende skill, ook bij drop-modus. */
+    private boolean cleanupForceFullBank = false;
     private ActiveSkill pendingSkill = null;
 
     private long lastAccountListReloadTime = 0;
@@ -312,6 +331,8 @@ public class CombatBotPlugin extends LoopedPlugin {
     private static final long ACCOUNT_STAT_SNAPSHOT_INTERVAL_MS = 45_000L;
     private long lastHiscoreBanCheckMs = 0L;
     private static final long HISCORE_BAN_CHECK_INTERVAL_MS = 30L * 60L * 1000L;
+    /** Min. anti-ban idle-duur voordat achtergrond-hiscore check start (zelfde band als {@link AntiBan} lange pauze). */
+    private static final long HISCORE_BAN_CHECK_DURING_ANTIBAN_PAUSE_MS = 5000L;
     private volatile boolean hiscoreBanCheckInFlight = false;
 
     /** Laatst gesynchroniseerde center-strings (panel / HTTP wijkt af → handlers herladen). */
@@ -327,6 +348,9 @@ public class CombatBotPlugin extends LoopedPlugin {
     private String masterFishingCenters = "";
     private String masterImpsCenters = "";
     private boolean applyingManagedCenters = false;
+
+    /** Verhoog in code bij wijziging van {@link CombatBotPanel#builtinDefaultMiningCenters()} om opnieuw te mergen. */
+    private static final int MINING_BUILTIN_PACK_VERSION = 2;
 
     /** Multi-account (👤-tabel): na logout volgende account voorbereiden + skill-voortgang per RSN. */
     private boolean prevGameLoggedIn;
@@ -369,6 +393,8 @@ public class CombatBotPlugin extends LoopedPlugin {
     private long loopWatchSignatureSinceMs = 0L;
     private long loopWatchLastLogMs = 0L;
     private static final long LOOP_WATCH_LOG_EVERY_MS = 30_000L;
+    private long loopWatchLastRecoveryMs = 0L;
+    private static final long LOOP_WATCH_RECOVERY_COOLDOWN_MS = 25_000L;
 
     /** Barb loot actief zonder {@code barbLootEnabled} (alleen bij start skill BARB_LOOT + Magic &lt; 5). */
     private boolean barbLootSessionActive;
@@ -413,6 +439,7 @@ public class CombatBotPlugin extends LoopedPlugin {
         overlayManager.add(walkClickHighlightOverlay);
         overlayManager.add(widgetHoverOverlay);
         overlayManager.add(mouseDebugOverlay);
+        overlayManager.add(inventoryItemIdOverlay);
         areaOverlay.setConfig(config);
         walkClickHighlightOverlay.setConfig(config);
         areaOverlay.setTileMarkerManager(tileMarkerManager);
@@ -423,6 +450,8 @@ public class CombatBotPlugin extends LoopedPlugin {
                 () -> config.debugWalkClickPersistedQueue());
 
         // Auto-log walk-tile events naar JSONL — alleen als toggle aan staat (config-gated bij elke event).
+        BankHelper.setKaramjaBoatExitHandler(this::travelKaramjaToPortSarimForFullBank);
+
         MovementHelper.setWalkTileEventSink(line -> {
             if (config.debugWalkAutoLogToDisk() && config.debugWalkClickOverlay()) {
                 DebugLog.appendWalkTilesJsonLine(line);
@@ -496,12 +525,14 @@ public class CombatBotPlugin extends LoopedPlugin {
         woodcutterHandler.setTileMarkerManager(tileMarkerManager);
         miningHandler = new MiningHandler(config, antiBan, paint);
         miningHandler.setTileMarkerManager(tileMarkerManager);
+        miningHandler.setWorldHopClient(client, clientThread);
+        doricsQuestHandler = new DoricsQuestHandler(config, antiBan, paint, stormConfigManager);
         fishingHandler = new FishingHandler(config, antiBan, paint, this::stopBotAndLogoutForFishing);
         fishingHandler.setTileMarkerManager(tileMarkerManager);
         impsHandler = new ImpsHandler(config, antiBan, paint);
-        impsHandler.setTileMarkerManager(tileMarkerManager);
-        impsHandler.setQuestProgressConfigManager(stormConfigManager);
+        wireImpsHandler(impsHandler);
         vampireSlayerQuestHandler = new VampireSlayerQuestHandler(config, antiBan, paint, stormConfigManager);
+        beginnerClueHandler = new BeginnerClueHandler(config, antiBan, paint);
         giantsHandler = new GiantsHandler(config, antiBan, paint);
         giantsHandler.setTileMarkerManager(tileMarkerManager);
         barbarianHandler = new BarbarianHandler(config, antiBan, paint);
@@ -512,6 +543,11 @@ public class CombatBotPlugin extends LoopedPlugin {
         starterSkillHandler = new StarterSkillHandler(config, antiBan, paint);
         tutorialModeHandler = new TutorialModeHandler(paint, config);
         wireStarterHandoffCallback();
+
+        // Ontbrekende standaard mining-tiles toevoegen (één keer per pack-versie), zonder andere center-keys te wissen.
+        maybeMergeBuiltinMiningCentersPack();
+        // Dubbele mining-soorten uit config halen (panel = bron; geen verborgen runtime-only dedupe).
+        maybePersistDedupedMiningCentersOnce();
 
         // Centers laden en op handlers zetten
         loadCentersAndSetHandlers();
@@ -558,6 +594,11 @@ public class CombatBotPlugin extends LoopedPlugin {
 
     @Override
     public void shutDown() throws Exception {
+        stopBeginnerClueSolver("plugin uitgeschakeld");
+        try {
+            stormConfigManager.setConfiguration("combatbot", "botEnabled", "false");
+        } catch (Throwable ignored) {
+        }
         CombatBotRuntime.setActivePlugin(null);
         if (antiBan != null) antiBan.stopFidgetWorker();
         overlayManager.remove(overlay);
@@ -565,6 +606,7 @@ public class CombatBotPlugin extends LoopedPlugin {
         overlayManager.remove(walkClickHighlightOverlay);
         overlayManager.remove(widgetHoverOverlay);
         overlayManager.remove(mouseDebugOverlay);
+        overlayManager.remove(inventoryItemIdOverlay);
         saveTileMarkersToConfig();
         uninstallGameplayMouseTraceListener();
 
@@ -577,6 +619,9 @@ public class CombatBotPlugin extends LoopedPlugin {
 
     @Subscribe
     public void onMenuOpened(MenuOpened event) {
+        if (!config.debugAreaContextMenu()) {
+            return;
+        }
         if (areaMenuListener != null) {
             areaMenuListener.setActiveSkill(activeSkill);
             areaMenuListener.onMenuOpened(event);
@@ -1002,6 +1047,16 @@ public class CombatBotPlugin extends LoopedPlugin {
         if (vampireSlayerQuestHandler != null) {
             vampireSlayerQuestHandler.onChatMessage(msg);
         }
+        if (doricsQuestHandler != null) {
+            doricsQuestHandler.onChatMessage(msg);
+        }
+        if (miningHandler != null) {
+            miningHandler.onChatMessage(msg);
+        }
+        if (beginnerClueHandler != null) {
+            beginnerClueHandler.onChatMessage(msg);
+        }
+        AccountSwitchWorldHop.onHopGameMessage(msg);
     }
 
     /**
@@ -1107,6 +1162,9 @@ public class CombatBotPlugin extends LoopedPlugin {
         String configKey = getCenterConfigKey(skill);
         String current = getCenterString(skill);
         String updated = CenterManager.addCenter(current, point, CenterManager.DEFAULT_RADIUS);
+        if (skill == ActiveSkill.MINING) {
+            updated = CenterManager.dedupeMiningCentersBlob(updated);
+        }
 
         stormConfigManager.setConfiguration("combatbot", configKey, updated);
         refreshCentersForSkill(skill, updated);
@@ -1114,17 +1172,34 @@ public class CombatBotPlugin extends LoopedPlugin {
         syncCenterChangeAcrossManagedRow(skill, updated);
 
         if (skill == activeSkill) {
-            setHandlerCenter(skill, point, CenterManager.DEFAULT_RADIUS);
-            areaOverlay.setActiveCenterForSkill(skill, point);
+            if (skill == ActiveSkill.MINING) {
+                CenterManager.Center focus = CenterManager.findNearest(updated, point);
+                if (focus != null) {
+                    setHandlerCenter(skill, focus.point, focus.radius);
+                    areaOverlay.setActiveCenterForSkill(skill, focus.point);
+                    paint.setLastAntiBanAction("✅ Center: " + getSkillName(skill) + " @ " + focus.point.getX() + "," + focus.point.getY());
+                } else {
+                    setHandlerCenter(skill, null, 0);
+                    areaOverlay.setActiveCenterForSkill(skill, null);
+                    paint.setLastAntiBanAction("✅ Center: " + getSkillName(skill) + " (lijst leeg)");
+                }
+            } else {
+                setHandlerCenter(skill, point, CenterManager.DEFAULT_RADIUS);
+                areaOverlay.setActiveCenterForSkill(skill, point);
+                paint.setLastAntiBanAction("✅ Center: " + getSkillName(skill) + " @ " + point.getX() + "," + point.getY());
+            }
+        } else {
+            paint.setLastAntiBanAction("✅ Center: " + getSkillName(skill) + " @ " + point.getX() + "," + point.getY());
         }
-
-        paint.setLastAntiBanAction("✅ Center: " + getSkillName(skill) + " @ " + point.getX() + "," + point.getY());
     }
 
     private void handleRemoveCenter(ActiveSkill skill, WorldPoint point) {
         String configKey = getCenterConfigKey(skill);
         String current = getCenterString(skill);
         String updated = CenterManager.removeNearest(current, point);
+        if (skill == ActiveSkill.MINING) {
+            updated = CenterManager.dedupeMiningCentersBlob(updated);
+        }
 
         stormConfigManager.setConfiguration("combatbot", configKey, updated);
         refreshCentersForSkill(skill, updated);
@@ -1149,6 +1224,9 @@ public class CombatBotPlugin extends LoopedPlugin {
         String configKey = getCenterConfigKey(skill);
         String current = getCenterString(skill);
         String updated = CenterManager.adjustRadius(current, point, delta);
+        if (skill == ActiveSkill.MINING) {
+            updated = CenterManager.dedupeMiningCentersBlob(updated);
+        }
 
         stormConfigManager.setConfiguration("combatbot", configKey, updated);
         refreshCentersForSkill(skill, updated);
@@ -1265,11 +1343,11 @@ public class CombatBotPlugin extends LoopedPlugin {
     }
 
     private void loadCentersAndSetHandlers() {
-        loadAndSetForSkill(ActiveSkill.COMBAT, config.combatCenters());
-        loadAndSetForSkill(ActiveSkill.WOODCUTTING, config.wcCenters());
-        loadAndSetForSkill(ActiveSkill.MINING, config.miningCenters());
-        loadAndSetForSkill(ActiveSkill.FISHING, config.fishingCenters());
-        loadAndSetForSkill(ActiveSkill.IMPS, config.impsCenters());
+        loadAndSetForSkill(ActiveSkill.COMBAT, effectiveCenterStringForLoggedInPlayer(ActiveSkill.COMBAT));
+        loadAndSetForSkill(ActiveSkill.WOODCUTTING, effectiveCenterStringForLoggedInPlayer(ActiveSkill.WOODCUTTING));
+        loadAndSetForSkill(ActiveSkill.MINING, effectiveCenterStringForLoggedInPlayer(ActiveSkill.MINING));
+        loadAndSetForSkill(ActiveSkill.FISHING, effectiveCenterStringForLoggedInPlayer(ActiveSkill.FISHING));
+        loadAndSetForSkill(ActiveSkill.IMPS, effectiveCenterStringForLoggedInPlayer(ActiveSkill.IMPS));
         areaOverlay.setActiveCenterForSkill(ActiveSkill.LOOT, LootHandler.getActivityCenter());
     }
 
@@ -1291,6 +1369,66 @@ public class CombatBotPlugin extends LoopedPlugin {
         masterMiningCenters = snapMiningCenters;
         masterFishingCenters = snapFishingCenters;
         masterImpsCenters = snapImpsCenters;
+    }
+
+    /**
+     * Voegt ontbrekende tiles uit het ingebouwde mining-pack toe aan bestaande {@code miningCenters}
+     * (dedupe op X:Y:vlak). Raakt combat/wc/fishing/imps niet aan. Eén migratie per pack-versie in code.
+     */
+    private void maybeMergeBuiltinMiningCentersPack() {
+        try {
+            if (config.miningBuiltinPackVersion() >= MINING_BUILTIN_PACK_VERSION) {
+                return;
+            }
+            String pack = CombatBotPanel.builtinDefaultMiningCenters();
+            String cur = nullToEmptyCenters(config.miningCenters());
+            java.util.ArrayList<CenterManager.Center> merged = new java.util.ArrayList<>(CenterManager.parse(cur));
+            java.util.HashSet<String> seen = new java.util.HashSet<>();
+            for (CenterManager.Center c : merged) {
+                if (c != null && c.point != null) {
+                    seen.add(centerTileKey(c));
+                }
+            }
+            boolean added = false;
+            for (CenterManager.Center d : CenterManager.parse(pack)) {
+                if (d == null || d.point == null) {
+                    continue;
+                }
+                String k = centerTileKey(d);
+                if (seen.contains(k)) {
+                    continue;
+                }
+                merged.add(new CenterManager.Center(d.point, d.radius, d.name, d.active));
+                seen.add(k);
+                added = true;
+            }
+            if (added) {
+                String ser = CenterManager.dedupeMiningCentersBlob(CenterManager.serialize(merged));
+                stormConfigManager.setConfiguration("combatbot", "miningCenters", ser);
+            }
+            stormConfigManager.setConfiguration("combatbot", "miningBuiltinPackVersion",
+                    String.valueOf(MINING_BUILTIN_PACK_VERSION));
+        } catch (Throwable t) {
+            DebugLog.log("Centers", "maybeMergeBuiltinMiningCentersPack: " + t.getMessage());
+        }
+    }
+
+    /** Schrijft {@code miningCenters} terug als er dubbele herkende mijn-soorten in de config staan. */
+    private void maybePersistDedupedMiningCentersOnce() {
+        try {
+            String cur = nullToEmptyCenters(config.miningCenters());
+            String ded = CenterManager.dedupeMiningCentersBlob(cur);
+            if (!ded.equals(cur)) {
+                stormConfigManager.setConfiguration("combatbot", "miningCenters", ded);
+                DebugLog.log("Centers", "Mining config ontdubbeld (zelfde lijst als in het paneel)");
+            }
+        } catch (Throwable t) {
+            DebugLog.log("Centers", "maybePersistDedupedMiningCentersOnce: " + t.getMessage());
+        }
+    }
+
+    private static String centerTileKey(CenterManager.Center c) {
+        return c.point.getX() + ":" + c.point.getY() + ":" + c.point.getPlane();
     }
 
     private void rememberCenterSnapshot(ActiveSkill skill, String serialized) {
@@ -1315,7 +1453,7 @@ public class CombatBotPlugin extends LoopedPlugin {
                 masterCombatCenters = c;
                 syncCenterChangeAcrossManagedRow(ActiveSkill.COMBAT, c);
             }
-            loadAndSetForSkill(ActiveSkill.COMBAT, c);
+            loadAndSetForSkill(ActiveSkill.COMBAT, effectiveCenterStringForLoggedInPlayer(ActiveSkill.COMBAT));
             any = true;
         }
         if (!Objects.equals((c = nullToEmptyCenters(config.wcCenters())), snapWcCenters)) {
@@ -1324,7 +1462,7 @@ public class CombatBotPlugin extends LoopedPlugin {
                 masterWcCenters = c;
                 syncCenterChangeAcrossManagedRow(ActiveSkill.WOODCUTTING, c);
             }
-            loadAndSetForSkill(ActiveSkill.WOODCUTTING, c);
+            loadAndSetForSkill(ActiveSkill.WOODCUTTING, effectiveCenterStringForLoggedInPlayer(ActiveSkill.WOODCUTTING));
             any = true;
         }
         if (!Objects.equals((c = nullToEmptyCenters(config.miningCenters())), snapMiningCenters)) {
@@ -1333,7 +1471,7 @@ public class CombatBotPlugin extends LoopedPlugin {
                 masterMiningCenters = c;
                 syncCenterChangeAcrossManagedRow(ActiveSkill.MINING, c);
             }
-            loadAndSetForSkill(ActiveSkill.MINING, c);
+            loadAndSetForSkill(ActiveSkill.MINING, effectiveCenterStringForLoggedInPlayer(ActiveSkill.MINING));
             any = true;
         }
         if (!Objects.equals((c = nullToEmptyCenters(config.fishingCenters())), snapFishingCenters)) {
@@ -1342,7 +1480,7 @@ public class CombatBotPlugin extends LoopedPlugin {
                 masterFishingCenters = c;
                 syncCenterChangeAcrossManagedRow(ActiveSkill.FISHING, c);
             }
-            loadAndSetForSkill(ActiveSkill.FISHING, c);
+            loadAndSetForSkill(ActiveSkill.FISHING, effectiveCenterStringForLoggedInPlayer(ActiveSkill.FISHING));
             any = true;
         }
         if (!Objects.equals((c = nullToEmptyCenters(config.impsCenters())), snapImpsCenters)) {
@@ -1351,7 +1489,7 @@ public class CombatBotPlugin extends LoopedPlugin {
                 masterImpsCenters = c;
                 syncCenterChangeAcrossManagedRow(ActiveSkill.IMPS, c);
             }
-            loadAndSetForSkill(ActiveSkill.IMPS, c);
+            loadAndSetForSkill(ActiveSkill.IMPS, effectiveCenterStringForLoggedInPlayer(ActiveSkill.IMPS));
             any = true;
         }
         if (any) {
@@ -1359,17 +1497,99 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
     }
 
+    private boolean shouldRunDoricsQuestNow() {
+        return doricsQuestHandler != null && DoricsQuestHandler.shouldRunQuest(config);
+    }
+
+    /** Blokkeert mining-pathing zolang Doric's Quest materialen/afleveren doet. */
+    private void enterDoricsQuestMiningHold() {
+        if (miningHeldForDoricsQuest) {
+            return;
+        }
+        if (miningHandler != null) {
+            miningHandler.resetState();
+        }
+        if (areaOverlay != null) {
+            areaOverlay.setMiningTargetRockTile(null);
+        }
+        miningHeldForDoricsQuest = true;
+        DebugLog.log("DoricQuest", "Mining gepauzeerd → Doric's Quest (geen walk naar mining spot)");
+    }
+
+    private void exitDoricsQuestMiningHold() {
+        miningHeldForDoricsQuest = false;
+    }
+
+    private int runMiningOrDoricsQuestLoop() {
+        if (shouldRunDoricsQuestNow()) {
+            enterDoricsQuestMiningHold();
+            paint.setActiveSkill("Doric's Quest");
+            return doricsQuestHandler.loop();
+        }
+        if (activeSkill == ActiveSkill.MINING) {
+            DoricsQuestHandler.logSkipReasonIfRelevant(config);
+        }
+        exitDoricsQuestMiningHold();
+        syncMiningCenterForTrainingLevel();
+        int delay = miningHandler.loop();
+        if (areaOverlay != null && miningHandler != null) {
+            areaOverlay.setMiningTargetRockTile(miningHandler.getOverlayTargetRockTile());
+        }
+        return delay;
+    }
+
+    private void syncMiningCenterForTrainingLevel() {
+        if (miningHandler == null || shouldRunDoricsQuestNow()) {
+            return;
+        }
+        // Niet het actieve mining-center wisselen tijdens lopen/banken: setActiveCenter wist centerWalkTarget
+        // en veroorzaakt heen-en-weer pathing met Storm/RuneLite destination updates.
+        MiningHandler.MiningState st = miningHandler.getCurrentState();
+        if (st == MiningHandler.MiningState.WALKING_TO_SPOT
+                || st == MiningHandler.MiningState.WALKING_TO_BANK
+                || st == MiningHandler.MiningState.WALKING_BACK_TO_SPOT
+                || st == MiningHandler.MiningState.BANKING) {
+            return;
+        }
+        if (countSafeActiveCentersForSkill(ActiveSkill.MINING, effectiveCenterStringForLoggedInPlayer(ActiveSkill.MINING)) < 1) {
+            WorldPoint curSpot = miningHandler.getMiningSpot();
+            if (curSpot != null && isUnsafeAlkharidScorpionMineSpot(curSpot) && paint != null) {
+                paint.setCurrentStatus("⚠ Combat te laag voor Al Kharid (scorpions lvl "
+                        + MiningSiteRules.ALKHARID_SCORPION_NPC_LEVEL + ", min "
+                        + MiningSiteRules.alkharidScorpionSafeCombatLevel() + ")");
+            }
+            return;
+        }
+        String mineEffective = effectiveCenterStringForLoggedInPlayer(ActiveSkill.MINING);
+        CenterManager.Center ideal = pickCenterForSkillWithSafety(ActiveSkill.MINING, mineEffective);
+        if (ideal == null) {
+            return;
+        }
+        WorldPoint cur = miningHandler.getMiningSpot();
+        int miningLvl = Skills.getLevel(Skill.MINING);
+        String filtered = filterCentersBySafety(ActiveSkill.MINING, mineEffective);
+        if (cur != null && CenterManager.miningTrainingCenterStillValid(filtered, cur, miningLvl)
+                && !isUnsafeAlkharidScorpionMineSpot(cur)) {
+            return;
+        }
+        miningHandler.setActiveCenter(ideal.point, ideal.radius, ideal.name != null ? ideal.name : "");
+        areaOverlay.setActiveCenterForSkill(ActiveSkill.MINING, ideal.point);
+        String label = ideal.name != null && !ideal.name.isEmpty() ? ideal.name : "Mining";
+        paint.setLastAntiBanAction("⛏ Mining spot: " + label + " (lvl " + miningLvl + ")");
+    }
+
     /**
      * Twee fishing-centers (Barbarian + Draynor): bij level-up vanaf 20 overschakelen naar Barbarian-centers.
      */
     private void syncFishingCenterForTrainingLevel() {
         if (fishingHandler == null) return;
-        if (countSafeActiveCentersForSkill(ActiveSkill.FISHING, config.fishingCenters()) < 2) return;
-        CenterManager.Center ideal = pickCenterForSkillWithSafety(ActiveSkill.FISHING, config.fishingCenters());
+        String fishEffective = effectiveCenterStringForLoggedInPlayer(ActiveSkill.FISHING);
+        if (countSafeActiveCentersForSkill(ActiveSkill.FISHING, fishEffective) < 2) return;
+        CenterManager.Center ideal = pickCenterForSkillWithSafety(ActiveSkill.FISHING, fishEffective);
         if (ideal == null) return;
         WorldPoint cur = fishingHandler.getFishingSpot();
         int fishLvl = Skills.getLevel(Skill.FISHING);
-        String filtered = filterCentersBySafety(ActiveSkill.FISHING, config.fishingCenters());
+        String filtered = filterCentersBySafety(ActiveSkill.FISHING, fishEffective);
         if (cur != null && CenterManager.fishingTrainingCenterStillValid(filtered, cur, fishLvl)) {
             return;
         }
@@ -1384,30 +1604,44 @@ public class CombatBotPlugin extends LoopedPlugin {
         areaOverlay.setCentersForSkill(skill, centers);
         CenterManager.Center chosen = pickCenterForSkillWithSafety(skill, centersData);
         if (chosen != null) {
-            setHandlerCenter(skill, chosen.point, chosen.radius);
+            setHandlerCenter(skill, chosen.point, chosen.radius, chosen.name != null ? chosen.name : "");
             areaOverlay.setActiveCenterForSkill(skill, chosen.point);
         } else {
-            setHandlerCenter(skill, null, 0);
+            setHandlerCenter(skill, null, 0, "");
             areaOverlay.setActiveCenterForSkill(skill, null);
         }
     }
 
     private void setHandlerCenter(ActiveSkill skill, WorldPoint center, int radius) {
+        setHandlerCenter(skill, center, radius, "");
+    }
+
+    private void setHandlerCenter(ActiveSkill skill, WorldPoint center, int radius, String centerName) {
         switch (skill) {
             case COMBAT:
-                if (combatHandler != null) combatHandler.setActiveCenter(center, radius);
+                if (combatHandler != null) {
+                    combatHandler.setActiveCenter(center, radius);
+                }
                 break;
             case WOODCUTTING:
-                if (woodcutterHandler != null) woodcutterHandler.setActiveCenter(center, radius);
+                if (woodcutterHandler != null) {
+                    woodcutterHandler.setActiveCenter(center, radius);
+                }
                 break;
             case MINING:
-                if (miningHandler != null) miningHandler.setActiveCenter(center, radius);
+                if (miningHandler != null && !shouldRunDoricsQuestNow()) {
+                    miningHandler.setActiveCenter(center, radius, centerName != null ? centerName : "");
+                }
                 break;
             case FISHING:
-                if (fishingHandler != null) fishingHandler.setActiveCenter(center, radius);
+                if (fishingHandler != null) {
+                    fishingHandler.setActiveCenter(center, radius);
+                }
                 break;
             case IMPS:
-                if (impsHandler != null) impsHandler.setActiveCenter(center, radius);
+                if (impsHandler != null) {
+                    impsHandler.setActiveCenter(center, radius);
+                }
                 break;
         }
     }
@@ -1448,16 +1682,60 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
     }
 
+    /**
+     * Center-string zoals dit account ze effectief gebruikt: master uit config (Centers-tab) plus filtering
+     * uit het account-profiel bij een bekende Jagex-login. Zo blijven subset-vinkjes gelden na config-refresh.
+     */
+    private String effectiveCenterStringForLoggedInPlayer(ActiveSkill skill) {
+        String masterBlob = nullToEmptyCenters(getCenterString(skill));
+        if (applyingManagedCenters || !Game.isLoggedIn()) {
+            return masterBlob;
+        }
+        try {
+            IPlayer lp = Players.getLocal();
+            if (lp == null || lp.getName() == null) {
+                return masterBlob;
+            }
+            String label = Text.removeTags(lp.getName()).trim();
+            if (label.isEmpty()) {
+                return masterBlob;
+            }
+            ManagedJagexAccountsStore.ManagedJagexAccountRow row =
+                    ManagedJagexAccountsStore.findRowForDisplayName(config, label);
+            if (row == null) {
+                return masterBlob;
+            }
+            boolean forceGlobal = row.useGlobalCenterListsOnly;
+            switch (skill) {
+                case COMBAT:
+                    return managedCenterTargets(row.useGlobalCombatCenters, forceGlobal ? "" : row.combatCenters, masterBlob).handlers;
+                case WOODCUTTING:
+                    return managedCenterTargets(row.useGlobalWcCenters, forceGlobal ? "" : row.wcCenters, masterBlob).handlers;
+                case MINING:
+                    return managedCenterTargets(row.useGlobalMiningCenters, forceGlobal ? "" : row.miningCenters, masterBlob).handlers;
+                case FISHING:
+                    return managedCenterTargets(row.useGlobalFishingCenters, forceGlobal ? "" : row.fishingCenters, masterBlob).handlers;
+                case IMPS:
+                    return managedCenterTargets(row.useGlobalImpsCenters, forceGlobal ? "" : row.impsCenters, masterBlob).handlers;
+                default:
+                    return masterBlob;
+            }
+        } catch (Throwable t) {
+            return masterBlob;
+        }
+    }
+
     private void wireStarterHandoffCallback() {
         if (starterSkillHandler == null) {
             return;
         }
         starterSkillHandler.setOnHandoffToImps(() -> {
+            ignoreStaleStarterStartSkillWhileImpsHandoff = true;
             stormConfigManager.setConfiguration("combatbot", "startSkill", CombatBotConfig.StartSkill.COMBAT.name());
             stormConfigManager.setConfiguration("combatbot", "impsMode", "true");
+            persistClearStarterStartSkillOverrideAfterImpsHandoff(tryGetLocalRsn());
             impsHandler = new ImpsHandler(config, antiBan, paint);
-            impsHandler.setTileMarkerManager(tileMarkerManager);
-            impsHandler.setQuestProgressConfigManager(stormConfigManager);
+            wireImpsHandler(impsHandler);
             impsHandler.resetState();
             impsHandler.beginStarterSkillBridge(() -> {
                 stormConfigManager.setConfiguration("combatbot", "botEnabled", "false");
@@ -1502,9 +1780,13 @@ public class CombatBotPlugin extends LoopedPlugin {
 
         // Pauze/Stop moet echt stil zijn: geen account-switch/relog/skill-cleanup meer door laten lopen.
         if (!config.botEnabled()) {
+            if (wasBotEnabled) {
+                stopBeginnerClueSolver("bot gestopt");
+            }
             coldLoginAccountListPrimed = false;
             startupInventoryChecked = false;
             wasBotEnabled = false;
+            botStartLoginLogged = false;
             resetIdleStuckMonitor();
             prevTickBankOpen = false;
             bankSnapshotPrevOpen = false;
@@ -1535,11 +1817,29 @@ public class CombatBotPlugin extends LoopedPlugin {
             }
         }
 
-        // Bot aan maar nog niet ingelogd: eerst inlog-flow (geen hiscore, geen fresh start, geen random events).
-        if (config.botEnabled() && !Game.isLoggedIn()) {
+        // Bot aan maar nog niet in game world: inlog-flow (getState + welcome-lobby).
+        if (config.botEnabled() && !WelcomeScreenPlayHelper.isInGameWorld()) {
             resetIdleStuckMonitor();
+            if (!botStartLoginLogged) {
+                botStartLoginLogged = true;
+                WelcomeScreenPlayHelper.debugLogLoginState();
+                DebugLog.log("Login", "Bot Start — Game.getState()="
+                        + WelcomeScreenPlayHelper.stormGameStateName()
+                        + " loginPhase=" + WelcomeScreenPlayHelper.resolveLoginPhase()
+                        + " → inlog-flow");
+            }
             if (handleClientUpdatedPromptStop()) {
                 return 1500;
+            }
+            WelcomeScreenPlayHelper.LoginPhase loginPhase = WelcomeScreenPlayHelper.resolveLoginPhase();
+            if (loginPhase == WelcomeScreenPlayHelper.LoginPhase.LOADING) {
+                paint.setCurrentStatus("⏳ Client laden...");
+                return 600 + random.nextInt(300);
+            }
+            if (loginPhase == WelcomeScreenPlayHelper.LoginPhase.WELCOME_LOBBY) {
+                int playDelay = WelcomeScreenPlayHelper.advanceWelcomeLobbyClick();
+                paint.setCurrentStatus("🔐 Welkomstscherm — CLICK HERE TO PLAY...");
+                return playDelay > 0 ? playDelay : 600 + random.nextInt(300);
             }
             handleManagedAccountSessionTracking();
             long nowLogin = System.currentTimeMillis();
@@ -1558,29 +1858,40 @@ public class CombatBotPlugin extends LoopedPlugin {
                     return accountDelayEarly;
                 }
             }
-            if (sameAccountRelogger != null && (config.botEnabled() || sameAccountRelogger.isRelogFlowActive())) {
-                int relogDelay = sameAccountRelogger.check();
-                maybeSendDiscordRelogPing();
-                if (relogDelay > 0) {
-                    return relogDelay;
+            boolean accountSwitcherHandlesLogin = config.accountSwitchEnabled()
+                    && accountSwitcher.getAccountCount() > 0;
+            if (!accountSwitcherHandlesLogin) {
+                if (sameAccountRelogger != null && (config.botEnabled() || sameAccountRelogger.isRelogFlowActive())) {
+                    int relogDelay = sameAccountRelogger.check();
+                    maybeSendDiscordRelogPing();
+                    if (relogDelay > 0) {
+                        return relogDelay;
+                    }
                 }
+                if (sameAccountRelogger == null || !sameAccountRelogger.isRelogFlowActive()) {
+                    lastDiscordRelogPingMs = 0L;
+                }
+                if (sameAccountRelogger != null && sameAccountRelogger.isIdle() && !sameAccountRelogger.isRelogFlowActive()
+                        && (loginPhase == WelcomeScreenPlayHelper.LoginPhase.LOGIN_SCREEN
+                        || Game.isOnLoginScreen())) {
+                    sameAccountRelogger.startTestAutoLoginFromLoginScreen();
+                    return 80 + random.nextInt(70);
+                }
+            } else {
+                DebugLog.log("Login", "Inlog-flow via account-switcher (" + accountSwitcher.getAccountCount() + " accounts)");
             }
-            if (sameAccountRelogger == null || !sameAccountRelogger.isRelogFlowActive()) {
-                lastDiscordRelogPingMs = 0L;
-            }
-            if (config.accountSwitchEnabled() && accountSwitcher.getAccountCount() == 0
-                    && sameAccountRelogger != null && sameAccountRelogger.isIdle() && !sameAccountRelogger.isRelogFlowActive()
-                    && Game.isOnLoginScreen() && !Game.isLoggedIn()) {
-                sameAccountRelogger.startTestAutoLoginFromLoginScreen();
-                return 80 + random.nextInt(70);
-            }
-            if (Game.isOnLoginScreen()) {
+            if (loginPhase == WelcomeScreenPlayHelper.LoginPhase.LOGIN_SCREEN || Game.isOnLoginScreen()) {
+                if (!accountSwitcher.isSwitching()) {
+                    WelcomeScreenPlayHelper.tryClickPlay();
+                }
                 paint.setCurrentStatus("🔐 Inloggen...");
-                return 60 + random.nextInt(60);
+                return 800 + random.nextInt(400);
             }
             paint.setCurrentStatus("⏳ Wacht op client...");
             return 120 + random.nextInt(100);
         }
+
+        botStartLoginLogged = false;
 
         handleManagedAccountSessionTracking();
         observeFailureNudgeBankWindowEdge();
@@ -1601,6 +1912,10 @@ public class CombatBotPlugin extends LoopedPlugin {
         if (Game.isLoggedIn()) {
             syncPanelLogoutSuppressToHandlers();
             monitorRepeatedLoopDebugSignature();
+            int loopWatchDelay = handleLoopWatchRecovery();
+            if (loopWatchDelay > 0) {
+                return loopWatchDelay;
+            }
         }
 
         int deathFailoverDelay = maybeHandleDeathFailover();
@@ -1608,8 +1923,8 @@ public class CombatBotPlugin extends LoopedPlugin {
             return deathFailoverDelay;
         }
 
-        // Fresh start: als bot net weer is aangezet, reset alles (alleen als de client al ingelogd is).
-        if (!wasBotEnabled && Game.isLoggedIn()) {
+        // Fresh start: als bot net weer is aangezet, reset alles (alleen als de client in game world is).
+        if (!wasBotEnabled && WelcomeScreenPlayHelper.isInGameWorld()) {
             wasBotEnabled = true;
             // One-shot triggers kunnen persisted zijn; reset ze bij start om onverwachte skill jumps te voorkomen.
             switchNowRequested = false;
@@ -1637,6 +1952,7 @@ public class CombatBotPlugin extends LoopedPlugin {
         if (bankCalibDelay > 0) {
             return bankCalibDelay;
         }
+        handlePerAccountEquipmentSnapshot();
 
         int idleStuckDelay = handleIdleStuckRecovery();
         if (idleStuckDelay > 0) {
@@ -1677,11 +1993,18 @@ public class CombatBotPlugin extends LoopedPlugin {
             return 80 + random.nextInt(70);
         }
 
-        // Geen skill-handlers tot de client echt ingelogd is (fallback; normaal vangt de vroege login-route dit af).
-        if (!Game.isLoggedIn()) {
-            if (Game.isOnLoginScreen()) {
+        // Geen skill-handlers tot de client echt in game world is (fallback).
+        if (!WelcomeScreenPlayHelper.isInGameWorld()) {
+            WelcomeScreenPlayHelper.LoginPhase phase = WelcomeScreenPlayHelper.resolveLoginPhase();
+            if (phase == WelcomeScreenPlayHelper.LoginPhase.WELCOME_LOBBY) {
+                WelcomeScreenPlayHelper.tryClickPlay();
+                paint.setCurrentStatus("🔐 Welkomstscherm — Play...");
+                return 800 + random.nextInt(400);
+            }
+            if (phase == WelcomeScreenPlayHelper.LoginPhase.LOGIN_SCREEN || Game.isOnLoginScreen()) {
+                WelcomeScreenPlayHelper.tryClickPlay();
                 paint.setCurrentStatus("🔐 Inloggen...");
-                return 60 + random.nextInt(60);
+                return 800 + random.nextInt(400);
             }
             paint.setCurrentStatus("⏳ Wacht op client...");
             return 120 + random.nextInt(100);
@@ -1691,11 +2014,16 @@ public class CombatBotPlugin extends LoopedPlugin {
 
         enforceStarterStartSkillIfConfigured();
 
+        maybePollF2pQuestGameCompletionFromClient();
+
         maybeUpdateAccountStatSnapshot();
-        maybeRunPeriodicHiscoreBanCheck();
 
         // Anti-ban check
         int antiBanDelay = antiBan.check();
+        // Hiscore-ban check (30m-interval): alleen tijdens lange anti-ban pauze, niet midden in GE/combat.
+        if (antiBanDelay >= HISCORE_BAN_CHECK_DURING_ANTIBAN_PAUSE_MS) {
+            maybeRunPeriodicHiscoreBanCheck();
+        }
         if (antiBanDelay > 0) return antiBanDelay;
 
         // Tile marker preset knoppen
@@ -1758,7 +2086,7 @@ public class CombatBotPlugin extends LoopedPlugin {
             if (activeSkill != ActiveSkill.IMPS) {
                 activeSkill = ActiveSkill.IMPS;
                 impsHandler = new ImpsHandler(config, antiBan, paint);
-                impsHandler.setQuestProgressConfigManager(stormConfigManager);
+                wireImpsHandler(impsHandler);
                 syncImpsHandlerActiveCenter();
             }
             impsHandler.startGeSellNow();
@@ -1800,6 +2128,23 @@ public class CombatBotPlugin extends LoopedPlugin {
                     paint.setLastAntiBanAction("Vampyre Slayer overgeslagen: HP level < " + VAMPIRE_SLAYER_MIN_HP_LEVEL);
                 }
             }
+        }
+
+        if (beginnerClueSolverShouldRun()) {
+            if (beginnerClueHandler == null) {
+                beginnerClueHandler = new BeginnerClueHandler(config, antiBan, paint);
+            }
+            int clueDelay = beginnerClueHandler.loop();
+            if (clueDelay <= 0) {
+                return 600;
+            }
+            paint.setActiveSkill("Beginner clues");
+            paint.setLastAntiBanAction(BeginnerClueHandler.hasBeginnerClueScroll()
+                    ? "Beginner clue solver actief"
+                    : "Beginner clue: scroll zoeken (bank)…");
+            return finalizePanelLogoutIfReady(clueDelay);
+        } else if (beginnerClueHandler != null) {
+            beginnerClueHandler.cancelAndReset("solver uit of geen scroll");
         }
 
         if (activeSkill == ActiveSkill.BARBARIAN && !config.barbarianMode()) {
@@ -1900,7 +2245,9 @@ public class CombatBotPlugin extends LoopedPlugin {
                 }
                 break;
             }
-            case MINING:      handlerDelay = miningHandler.loop(); break;
+            case MINING:
+                handlerDelay = runMiningOrDoricsQuestLoop();
+                break;
             case FISHING:
                 syncFishingCenterForTrainingLevel();
                 handlerDelay = fishingHandler.loop();
@@ -1970,7 +2317,7 @@ public class CombatBotPlugin extends LoopedPlugin {
                     refreshCentersForSkill(ActiveSkill.IMPS, deactivated);
                     activeSkill = ActiveSkill.COMBAT;
                     impsHandler = new ImpsHandler(config, antiBan, paint);
-                    impsHandler.setQuestProgressConfigManager(stormConfigManager);
+                    wireImpsHandler(impsHandler);
                     syncImpsHandlerActiveCenter();
                     paint.setLastAntiBanAction("⚠ Imps: geen coins → normaal combat");
                     handlerDelay = 2000;
@@ -2322,6 +2669,12 @@ public class CombatBotPlugin extends LoopedPlugin {
         if (enabledSkills.size() == 1) {
             ActiveSkill only = enabledSkills.get(0);
             if (activeSkill != only) {
+                if (isPlayerOnKaramja() && impsHandler != null) {
+                    pendingSkill = only;
+                    cleaningUpBeforeSwitch = true;
+                    paint.setCurrentStatus("🚢 Karamja → Port Sarim (skill wissel)...");
+                    return;
+                }
                 activeSkill = only;
                 performSkillSwitchInternal();
             }
@@ -2338,14 +2691,39 @@ public class CombatBotPlugin extends LoopedPlugin {
             return;
         }
 
+        // Check of er items zijn om op te ruimen (fishing: altijd volledig banken bij niet-lege inv)
+        if (needsFullBankBeforeSkillSwitch()) {
+            cleanupForceFullBank = true;
+            cleaningUpBeforeSwitch = true;
+            paint.setCurrentStatus("🏦 Inventory banken voor skill wissel...");
+            return;
+        }
+
         // Check of er items zijn om op te ruimen
         if (hasSkillItems(activeSkill) && !Inventory.isEmpty()) {
             cleaningUpBeforeSwitch = true;
             paint.setCurrentStatus("🧹 Inventory opruimen voor wissel...");
-        } else {
-            // Geen cleanup nodig, direct switchen
-            activeSkill = pendingSkill;
-            performSkillSwitchInternal();
+            return;
+        }
+
+        // Op Karamja: altijd eerst mainland via boot (Travel = loot-dump pad), ook zonder loot in inv
+        if (isPlayerOnKaramja() && impsHandler != null) {
+            cleaningUpBeforeSwitch = true;
+            paint.setCurrentStatus("🚢 Karamja → Port Sarim (skill wissel)...");
+            return;
+        }
+
+        // Geen cleanup nodig, direct switchen
+        activeSkill = pendingSkill;
+        performSkillSwitchInternal();
+    }
+
+    private boolean isPlayerOnKaramja() {
+        try {
+            net.storm.api.domain.actors.IPlayer local = net.storm.sdk.entities.Players.getLocal();
+            return ImpsHandler.isOnKaramja(local);
+        } catch (Throwable ignored) {
+            return false;
         }
     }
 
@@ -2354,43 +2732,41 @@ public class CombatBotPlugin extends LoopedPlugin {
      * Als banken aanstaat, loop naar bank en bank alles.
      */
     private int handleCleanupBeforeSwitch() {
-        // Geen items meer → klaar
-        if (!hasSkillItems(activeSkill) && !(activeSkill == ActiveSkill.IMPS && impsHandler.isBankingBeforeRotation())) {
-            return 0; // 0 = klaar
-        }
-
-        // IMPS: gebruik ImpsHandler's eigen banking flow (deposit box bij Port Sarim)
-        if (activeSkill == ActiveSkill.IMPS && impsHandler.isBankingBeforeRotation()) {
+        // Imps rotatie-banking: volledige imps-flow (boot + deposit box)
+        if (activeSkill == ActiveSkill.IMPS && impsHandler != null && impsHandler.isBankingBeforeRotation()) {
             int result = impsHandler.loop();
             if (!impsHandler.isBankingBeforeRotation()) {
-                // Banking klaar
                 return 0;
             }
             return result;
         }
 
+        // Op Karamja: eerst mainland via loot-dump boot (Travel op Customs officer)
+        if (impsHandler != null && isPlayerOnKaramja()) {
+            net.storm.api.domain.actors.IPlayer local = net.storm.sdk.entities.Players.getLocal();
+            if (local != null) {
+                paint.setCurrentStatus("🚢 Karamja → Port Sarim (skill wissel)...");
+                return impsHandler.travelToPortSarimFromKaramja(local);
+            }
+        }
+
+        // Geen items meer → klaar (tenzij volledige bank na fishing e.d.)
+        if (!cleanupForceFullBank && !hasSkillItems(activeSkill)) {
+            cleanupForceFullBank = false;
+            return 0; // 0 = klaar
+        }
+
         // Als banken aanstaat voor de huidige skill, ga banken
-        boolean shouldBank = shouldBankForSkill(activeSkill);
+        boolean shouldBank = cleanupForceFullBank || shouldBankForSkill(activeSkill);
 
         if (shouldBank) {
             if (Bank.isOpen()) {
-                // Deposit items 1-voor-1 (menselijker, voorkomt bank loop bij lege inv)
-                java.util.List<net.storm.api.domain.items.IInventoryItem> skillItems = getSkillItemsToClean(activeSkill);
-                if (skillItems != null && !skillItems.isEmpty()) {
-                    java.util.Collections.shuffle(skillItems, random);
-                    for (net.storm.api.domain.items.IInventoryItem item : skillItems) {
-                        if (item != null && item.getName() != null) {
-                            if (item.getId() == GENIE_LAMP_ITEM_ID) {
-                                continue;
-                            }
-                            Bank.depositAll(item.getName());
-                            HumanBanking.pauseBetweenActions();
-                        }
-                    }
-                }
+                BankDepositHelper.depositEntireInventoryExceptGenieLamp();
+                HumanBanking.pauseBetweenActions();
                 HumanBanking.pauseBeforeClose();
                 Bank.close();
                 HumanBanking.pauseAfterClose();
+                cleanupForceFullBank = false;
                 paint.setLastAntiBanAction("✓ Inventory gebankt voor wissel");
                 return 0; // klaar
             }
@@ -2414,7 +2790,7 @@ public class CombatBotPlugin extends LoopedPlugin {
             // Drop 1-3 items per tick (menselijk patroon)
             int dropCount = 1 + random.nextInt(3);
             for (int i = 0; i < Math.min(dropCount, items.size()); i++) {
-                items.get(i).interact("Drop");
+                InventoryActionHelper.interact(config, items.get(i), "Drop");
                 try { Thread.sleep(80 + random.nextInt(200)); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             }
             return 300 + random.nextInt(400); // Wacht even tussen batches
@@ -2425,9 +2801,26 @@ public class CombatBotPlugin extends LoopedPlugin {
 
     private void finishSkillSwitch() {
         cleaningUpBeforeSwitch = false;
+        cleanupForceFullBank = false;
         activeSkill = pendingSkill;
         pendingSkill = null;
         performSkillSwitchInternal();
+    }
+
+    /**
+     * Volledige bank vóór skill-wissel: na fishing altijd; bij WC/mining als inv bijna vol.
+     */
+    private boolean needsFullBankBeforeSkillSwitch() {
+        if (Inventory.isEmpty()) {
+            return false;
+        }
+        if (activeSkill == ActiveSkill.FISHING) {
+            return true;
+        }
+        if (activeSkill == ActiveSkill.WOODCUTTING || activeSkill == ActiveSkill.MINING) {
+            return BankInventoryHelper.freeSlots() < 3;
+        }
+        return false;
     }
 
     /** Check of de huidige skill items in de inventory heeft. */
@@ -2500,9 +2893,20 @@ public class CombatBotPlugin extends LoopedPlugin {
     /** Bepaal of banken aanstaat voor de huidige skill. */
     private boolean shouldBankForSkill(ActiveSkill skill) {
         switch (skill) {
-            case WOODCUTTING: return !config.wcDropLogs() && !config.wcFiremaking();
-            case MINING: return !config.miningDropOre();
-            case FISHING: return !config.fishingDropFish();
+            case WOODCUTTING: {
+                WorldPoint wp = woodcutterHandler != null ? woodcutterHandler.getTreeArea() : null;
+                AccountCenterBehaviorStore.CenterBehavior b = AccountCenterBehaviorStore.forCenter(
+                        AccountCenterBehaviorStore.SkillKind.WOODCUTTING, wp, config);
+                return !b.drop && !b.extra;
+            }
+            case MINING:
+                return miningHandler != null && miningHandler.shouldBankFilledInventory();
+            case FISHING: {
+                WorldPoint wp = fishingHandler != null ? fishingHandler.getFishingSpot() : null;
+                AccountCenterBehaviorStore.CenterBehavior b = AccountCenterBehaviorStore.forCenter(
+                        AccountCenterBehaviorStore.SkillKind.FISHING, wp, config);
+                return !b.drop;
+            }
             case LOOT: return true;
             default: return false;
         }
@@ -2704,9 +3108,9 @@ public class CombatBotPlugin extends LoopedPlugin {
             case STARTER:
                 candidate = ActiveSkill.STARTER;
                 break;
-            case WOODCUTTING: candidate = CenterManager.countActive(config.wcCenters()) > 0 ? ActiveSkill.WOODCUTTING : fallback; break;
-            case MINING:      candidate = CenterManager.countActive(config.miningCenters()) > 0 ? ActiveSkill.MINING : fallback; break;
-            case FISHING:     candidate = CenterManager.countActive(config.fishingCenters()) > 0 ? ActiveSkill.FISHING : fallback; break;
+            case WOODCUTTING: candidate = CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.WOODCUTTING)) > 0 ? ActiveSkill.WOODCUTTING : fallback; break;
+            case MINING:      candidate = CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.MINING)) > 0 ? ActiveSkill.MINING : fallback; break;
+            case FISHING:     candidate = CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.FISHING)) > 0 ? ActiveSkill.FISHING : fallback; break;
             case BARBARIAN:   candidate = config.barbarianMode() ? ActiveSkill.BARBARIAN : fallback; break;
             case LOOT:        candidate = config.barbLootEnabled() ? ActiveSkill.LOOT : fallback; break;
             case BARB_LOOT: {
@@ -2732,7 +3136,7 @@ public class CombatBotPlugin extends LoopedPlugin {
 
         // Skilling skills MOETEN actieve centers hebben, anders fallback
         if (candidate == ActiveSkill.WOODCUTTING || candidate == ActiveSkill.MINING || candidate == ActiveSkill.FISHING) {
-            String centersData = getCenterString(candidate);
+            String centersData = effectiveCenterStringForLoggedInPlayer(candidate);
             if (CenterManager.countActive(centersData) == 0) {
                 paint.setLastAntiBanAction("⚠ Geen centers voor " + getSkillName(candidate) + " → fallback");
                 // Zoek een andere skill die WEL centers heeft
@@ -2775,15 +3179,20 @@ public class CombatBotPlugin extends LoopedPlugin {
         woodcutterHandler.resetState();
         miningHandler = new MiningHandler(config, antiBan, paint);
         miningHandler.setTileMarkerManager(tileMarkerManager);
+        miningHandler.setWorldHopClient(client, clientThread);
         miningHandler.resetState();
+        if (doricsQuestHandler == null) {
+            doricsQuestHandler = new DoricsQuestHandler(config, antiBan, paint, stormConfigManager);
+        } else {
+            doricsQuestHandler.resetState();
+        }
         barbarianHandler = new BarbarianHandler(config, antiBan, paint);
         barbarianHandler.resetState();
         fishingHandler = new FishingHandler(config, antiBan, paint, this::stopBotAndLogoutForFishing);
         fishingHandler.setTileMarkerManager(tileMarkerManager);
         fishingHandler.resetState();
         impsHandler = new ImpsHandler(config, antiBan, paint);
-        impsHandler.setTileMarkerManager(tileMarkerManager);
-        impsHandler.setQuestProgressConfigManager(stormConfigManager);
+        wireImpsHandler(impsHandler);
         impsHandler.resetState();
         vampireSlayerQuestHandler = new VampireSlayerQuestHandler(config, antiBan, paint, stormConfigManager);
         giantsHandler = new GiantsHandler(config, antiBan, paint);
@@ -2859,24 +3268,30 @@ public class CombatBotPlugin extends LoopedPlugin {
             if (r.displayName != null && r.displayName.equalsIgnoreCase(label)) {
                 applyingManagedCenters = true;
                 try {
-                    boolean any = false;
                     boolean forceGlobal = r.useGlobalCenterListsOnly;
-                    any |= setManagedCenterConfig("combatCenters", r.useGlobalCombatCenters,
+                    ManagedCenterTargets tCombat = managedCenterTargets(r.useGlobalCombatCenters,
                             forceGlobal ? "" : r.combatCenters, masterCombatCenters);
-                    any |= setManagedCenterConfig("wcCenters", r.useGlobalWcCenters,
+                    ManagedCenterTargets tWc = managedCenterTargets(r.useGlobalWcCenters,
                             forceGlobal ? "" : r.wcCenters, masterWcCenters);
-                    any |= setManagedCenterConfig("miningCenters", r.useGlobalMiningCenters,
+                    ManagedCenterTargets tMine = managedCenterTargets(r.useGlobalMiningCenters,
                             forceGlobal ? "" : r.miningCenters, masterMiningCenters);
-                    any |= setManagedCenterConfig("fishingCenters", r.useGlobalFishingCenters,
+                    ManagedCenterTargets tFish = managedCenterTargets(r.useGlobalFishingCenters,
                             forceGlobal ? "" : r.fishingCenters, masterFishingCenters);
-                    any |= setManagedCenterConfig("impsCenters", r.useGlobalImpsCenters,
+                    ManagedCenterTargets tImps = managedCenterTargets(r.useGlobalImpsCenters,
                             forceGlobal ? "" : r.impsCenters, masterImpsCenters);
-                    if (any) {
-                        captureCentersSnapshotFromConfig();
-                        loadCentersAndSetHandlers();
-                        updateMenuListenerCenters();
-                        paint.setLastAntiBanAction("📍 Centers voor account " + label);
-                    }
+                    persistCenterConfigIfDifferent("combatCenters", tCombat.persist);
+                    persistCenterConfigIfDifferent("wcCenters", tWc.persist);
+                    persistCenterConfigIfDifferent("miningCenters", tMine.persist);
+                    persistCenterConfigIfDifferent("fishingCenters", tFish.persist);
+                    persistCenterConfigIfDifferent("impsCenters", tImps.persist);
+                    captureCentersSnapshotFromConfig();
+                    loadAndSetForSkill(ActiveSkill.COMBAT, tCombat.handlers);
+                    loadAndSetForSkill(ActiveSkill.WOODCUTTING, tWc.handlers);
+                    loadAndSetForSkill(ActiveSkill.MINING, tMine.handlers);
+                    loadAndSetForSkill(ActiveSkill.FISHING, tFish.handlers);
+                    loadAndSetForSkill(ActiveSkill.IMPS, tImps.handlers);
+                    updateMenuListenerCenters();
+                    paint.setLastAntiBanAction("📍 Centers voor account " + label);
                 } finally {
                     applyingManagedCenters = false;
                 }
@@ -2886,18 +3301,36 @@ public class CombatBotPlugin extends LoopedPlugin {
     }
 
     /**
-     * Zet config voor één skill: leeg (uit), volledige master, of account-subset (deels globale lijst).
-     * {@code accountSubset} leeg bij {@code useGlobal} = hele master; anders alleen geselecteerde locaties.
+     * Welke center-string op schijf hoort (altijd de globale master-lijst voor de tab Centers) en welke
+     * string de runtime-handlers gebruiken (subset of account-eigen lijst).
      */
-    private boolean setManagedCenterConfig(String key, boolean useGlobal, String accountSubset, String masterValue) {
-        String target;
-        if (!useGlobal) {
-            target = "";
-        } else if (accountSubset == null || accountSubset.trim().isEmpty()) {
-            target = nullToEmptyCenters(masterValue);
-        } else {
-            target = nullToEmptyCenters(accountSubset);
+    private static final class ManagedCenterTargets {
+        final String persist;
+        final String handlers;
+
+        ManagedCenterTargets(String persist, String handlers) {
+            this.persist = persist;
+            this.handlers = handlers;
         }
+    }
+
+    /**
+     * {@code rowCenters} = uit accountrij: bij useGlobal+subset = gekozen locaties; bij !useGlobal = volledige eigen lijst.
+     * Op schijf bewaren we altijd {@code masterValue} zodat login/wissel de globale lijst niet overschrijft met een subset.
+     */
+    private static ManagedCenterTargets managedCenterTargets(boolean useGlobal, String rowCenters, String masterValue) {
+        String master = nullToEmptyCenters(masterValue);
+        String row = rowCenters != null ? rowCenters.trim() : "";
+        if (!useGlobal) {
+            return new ManagedCenterTargets(master, nullToEmptyCenters(rowCenters));
+        }
+        if (row.isEmpty()) {
+            return new ManagedCenterTargets(master, master);
+        }
+        return new ManagedCenterTargets(master, nullToEmptyCenters(rowCenters));
+    }
+
+    private void persistCenterConfigIfDifferent(String key, String newPersist) {
         String cur;
         switch (key) {
             case "combatCenters": cur = nullToEmptyCenters(config.combatCenters()); break;
@@ -2905,13 +3338,15 @@ public class CombatBotPlugin extends LoopedPlugin {
             case "miningCenters": cur = nullToEmptyCenters(config.miningCenters()); break;
             case "fishingCenters": cur = nullToEmptyCenters(config.fishingCenters()); break;
             case "impsCenters": cur = nullToEmptyCenters(config.impsCenters()); break;
-            default: return false;
+            default: return;
         }
-        if (Objects.equals(cur, target)) {
-            return false;
+        if ("miningCenters".equals(key)) {
+            newPersist = CenterManager.dedupeMiningCentersBlob(newPersist);
         }
-        stormConfigManager.setConfiguration("combatbot", key, target);
-        return true;
+        if (Objects.equals(cur, newPersist)) {
+            return;
+        }
+        stormConfigManager.setConfiguration("combatbot", key, newPersist);
     }
 
     private void maybeUpdateAccountStatSnapshot() {
@@ -3044,7 +3479,7 @@ public class CombatBotPlugin extends LoopedPlugin {
         draynorAvoidCentersUntilMs = now + (20L * 60L * 1000L); // 20 min Draynor skippen
         DebugLog.log("Accounts", "Draynor bot-melding door " + speaker + ": \"" + lowerMessage + "\"");
 
-        String centersData = activeSkill == ActiveSkill.WOODCUTTING ? config.wcCenters() : config.fishingCenters();
+        String centersData = effectiveCenterStringForLoggedInPlayer(activeSkill == ActiveSkill.WOODCUTTING ? ActiveSkill.WOODCUTTING : ActiveSkill.FISHING);
         CenterManager.Center safe = pickCenterForSkillWithSafety(activeSkill, centersData);
         if (safe != null) {
             setHandlerCenter(activeSkill, safe.point, safe.radius);
@@ -3231,11 +3666,11 @@ public class CombatBotPlugin extends LoopedPlugin {
                 return 400 + random.nextInt(250);
             }
             if (lamp.hasAction("Rub")) {
-                lamp.interact("Rub");
+                InventoryActionHelper.interact(config, lamp, "Rub");
             } else if (lamp.hasAction("Use")) {
-                lamp.interact("Use");
+                InventoryActionHelper.interact(config, lamp, "Use");
             } else {
-                lamp.interact(0);
+                InventoryActionHelper.interact(config, lamp, 0);
             }
             lastLampActionMs = now;
             lastRandomEventActionMs = now;
@@ -3581,6 +4016,11 @@ public class CombatBotPlugin extends LoopedPlugin {
     }
 
     private String discordGameStateName() {
+        return getClientGameStateLabel();
+    }
+
+    /** Voor debug/login-test: RuneLite {@link net.runelite.api.GameState}. */
+    public String getClientGameStateLabel() {
         try {
             if (client != null && client.getGameState() != null) {
                 return client.getGameState().name();
@@ -3588,6 +4028,10 @@ public class CombatBotPlugin extends LoopedPlugin {
         } catch (Exception ignored) {
         }
         return "onbekend";
+    }
+
+    public net.runelite.api.Client getRuneliteClient() {
+        return client;
     }
 
     private String discordWorldLine() {
@@ -3991,12 +4435,17 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
         String s = status.toLowerCase(Locale.ROOT);
         if (s.contains("karamja dock")) return "imps_karamja_dock";
+        if (s.contains("naar karamja") || s.contains("oversteek") || s.contains("wacht op oversteek")) {
+            return "imps_boat_naar_karamja";
+        }
         // Banking-trip boot (status zegt niet "karamja dock") — zelfde dock-vastloop-profiel als Musa Point.
         if (s.contains("boot naar port sarim")
                 || (s.contains("[boat]") && s.contains("port sarim"))) {
             return "imps_karamja_dock";
         }
         if (s.contains("gear aantrekken")) return "imps_gear_aantrekken";
+        if (s.contains("gear prep")) return "imps_gear_prep";
+        if (s.contains("onnodige items banken")) return "imps_gear_prep_deposit";
         if (s.contains("-> bank")) return "to_bank";
         if (s.contains("-> ge")) return "to_ge";
         s = s.replaceAll("[^a-z0-9_\\- ]", " ").replaceAll("\\s+", "_");
@@ -4094,6 +4543,47 @@ public class CombatBotPlugin extends LoopedPlugin {
         return 700;
     }
 
+    /** Bonfire / FM-animaties (zelfde range als {@link WoodcutterHandler}). */
+    private static boolean isWoodcutBonfireAnimation(int animId) {
+        return animId == 733 || (animId >= 10563 && animId <= 10580);
+    }
+
+    private static String normalizeStatusForPassiveLoopCheck(String status) {
+        if (status == null || status.isEmpty()) {
+            return "";
+        }
+        return status.toLowerCase(Locale.ROOT)
+                .replaceAll("[^a-z0-9\\s]", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
+    }
+
+    /**
+     * Vissen / WC+FM / mining op vaste spot met vaste animatie is géén vastloop — niet meetellen voor LoopWatch.
+     */
+    private boolean isExpectedPassiveGatheringLoop(IPlayer lp, String status) {
+        if (activeSkill == null) {
+            return false;
+        }
+        String s = normalizeStatusForPassiveLoopCheck(status);
+        switch (activeSkill) {
+            case FISHING:
+                return s.contains("aan het vissen") || s.contains("vis koken") || s.contains("aan het koken");
+            case WOODCUTTING:
+                if (lp != null && isWoodcutBonfireAnimation(lp.getAnimation())) {
+                    return true;
+                }
+                return s.contains("hout hakken") || s.contains(" hakken")
+                        || s.contains("logs verbranden") || s.contains("verbranden")
+                        || s.contains("bonfire") || s.contains("firemaking")
+                        || s.contains("vuur") || s.contains("forester");
+            case MINING:
+                return s.contains("aan het mijnen") || s.contains("mijnen");
+            default:
+                return false;
+        }
+    }
+
     private void monitorRepeatedLoopDebugSignature() {
         IPlayer lp = Players.getLocal();
         if (lp == null || lp.getWorldLocation() == null) {
@@ -4103,6 +4593,19 @@ public class CombatBotPlugin extends LoopedPlugin {
             return;
         }
         String status = paint != null ? paint.getCurrentStatus() : "";
+        if (isExpectedPassiveGatheringLoop(lp, status)) {
+            loopWatchLastSignature = "";
+            loopWatchSignatureSinceMs = 0L;
+            loopWatchLastLogMs = 0L;
+            return;
+        }
+        if (status != null && status.toLowerCase(Locale.ROOT).contains("beginner clue")) {
+            loopWatchLastSignature = "";
+            loopWatchSignatureSinceMs = 0L;
+            loopWatchLastLogMs = 0L;
+            resetIdleStuckMonitor();
+            return;
+        }
         WorldPoint p = lp.getWorldLocation();
         String signature = activeSkill + "|" + status + "|" + p.getX() + "," + p.getY()
                 + "|m=" + lp.isMoving() + "|a=" + lp.getAnimation();
@@ -4132,6 +4635,136 @@ public class CombatBotPlugin extends LoopedPlugin {
     }
 
     /**
+     * Actie op {@link #monitorRepeatedLoopDebugSignature()}: zacht herstel, daarna bot uit + logout.
+     * Werkt ook met bank open (gear-prep-lussen).
+     */
+    private int handleLoopWatchRecovery() {
+        if (shouldSuppressRecoveryForBeginnerClues()) {
+            resetLoopWatchState();
+            resetIdleStuckMonitor();
+            return 0;
+        }
+        if (!config.loopWatchRecoveryEnabled()) {
+            return 0;
+        }
+        IPlayer lp = Players.getLocal();
+        if (lp == null || lp.getWorldLocation() == null || loopWatchSignatureSinceMs <= 0L) {
+            return 0;
+        }
+        long now = System.currentTimeMillis();
+        long durMs = now - loopWatchSignatureSinceMs;
+        int triggerSec = Math.max(45, config.loopWatchTriggerSec());
+        int logoutSec = Math.max(triggerSec + 30, config.loopWatchLogoutSec());
+        long triggerMs = triggerSec * 1000L;
+        long logoutMs = logoutSec * 1000L;
+        if (durMs < triggerMs) {
+            return 0;
+        }
+        if (now - loopWatchLastRecoveryMs < LOOP_WATCH_RECOVERY_COOLDOWN_MS) {
+            return 0;
+        }
+
+        String status = paint != null ? paint.getCurrentStatus() : "";
+        if (isExpectedPassiveGatheringLoop(lp, status)) {
+            resetLoopWatchState();
+            return 0;
+        }
+        String statusBucket = normalizeStuckStatusBucket(status);
+        String rsn = resolveCurrentRsnForLearning(lp);
+        String learnKey = rsn.toLowerCase(Locale.ROOT) + "|LOOP|" + activeSkill + "|" + statusBucket;
+        StuckLearningStore.Entry learned = StuckLearningStore.get(config, learnKey);
+        int learnedCount = learned != null ? learned.count : 0;
+
+        if ((durMs >= logoutMs || learnedCount >= 2) && !isExpectedPassiveGatheringLoop(lp, status)) {
+            loopWatchLastRecoveryMs = now;
+            StuckLearningStore.increment(stormConfigManager, config, learnKey);
+            String reason = "LoopWatch " + (durMs / 1000) + "s vast in " + statusBucket
+                    + " (" + status + ")";
+            stopBotAndLogoutForLoopWatch(reason);
+            resetLoopWatchState();
+            return 2500;
+        }
+
+        if (isExpectedPassiveGatheringLoop(lp, status)) {
+            resetLoopWatchState();
+            return 0;
+        }
+
+        loopWatchLastRecoveryMs = now;
+        loopWatchSignatureSinceMs = now;
+        StuckLearningStore.increment(stormConfigManager, config, learnKey);
+        DebugLog.log("CombatBot", "[LoopWatchRecovery] " + (durMs / 1000) + "s | bucket=" + statusBucket
+                + " | learned=" + (learnedCount + 1) + " | status=" + status);
+
+        if (config.accountSwitchEnabled() && accountSwitcher != null && accountSwitcher.getAccountCount() >= 2
+                && learnedCount >= 1
+                && activeSkill != ActiveSkill.FISHING
+                && activeSkill != ActiveSkill.WOODCUTTING
+                && activeSkill != ActiveSkill.MINING) {
+            boolean switching = accountSwitcher.requestImmediateSwitch(
+                    "⚠ LoopWatch: " + (durMs / 1000) + "s in " + statusBucket);
+            if (switching) {
+                if (paint != null) {
+                    paint.setCurrentStatus("⚠ LoopWatch: volgende account");
+                    paint.setLastAntiBanAction("LoopWatch → account switch");
+                }
+                resetIdleStuckMonitor();
+                return 250;
+            }
+        }
+
+        if (activeSkill == ActiveSkill.IMPS && impsHandler != null) {
+            impsHandler.recoverFromStuckLoop(statusBucket);
+            if (paint != null) {
+                paint.setCurrentStatus("⚠ LoopWatch: Imps herstel");
+                paint.setLastAntiBanAction("LoopWatch: gear/bank reset");
+            }
+            return 900;
+        }
+        if (activeSkill == ActiveSkill.GIANTS && giantsHandler != null) {
+            giantsHandler.resetState();
+        }
+        if (activeSkill == ActiveSkill.FISHING && fishingHandler != null) {
+            fishingHandler.resetState();
+        }
+        if (activeSkill == ActiveSkill.COMBAT && combatHandler != null) {
+            combatHandler.resetState();
+        }
+        if (paint != null) {
+            paint.setCurrentStatus("⚠ LoopWatch: handler reset");
+            paint.setLastAntiBanAction("LoopWatch: " + activeSkill + " reset");
+        }
+        return 700;
+    }
+
+    private void resetLoopWatchState() {
+        loopWatchLastSignature = "";
+        loopWatchSignatureSinceMs = 0L;
+        loopWatchLastLogMs = 0L;
+        loopWatchLastRecoveryMs = 0L;
+    }
+
+    private void stopBotAndLogoutForLoopWatch(String reason) {
+        String msg = reason != null ? reason : "LoopWatch vastgelopen";
+        DebugLog.log("CombatBot", "STOP + LOGOUT (LoopWatch): " + msg);
+        if (paint != null) {
+            paint.setCurrentStatus("⛔ " + msg);
+            paint.setLastAntiBanAction("⛔ LoopWatch → logout");
+        }
+        if (stormConfigManager != null) {
+            stormConfigManager.setConfiguration("combatbot", "botEnabled", "false");
+        }
+        wasBotEnabled = false;
+        if (impsHandler != null) {
+            impsHandler.recoverFromStuckLoop("");
+        }
+        if (fishingHandler != null) {
+            fishingHandler.resetState();
+        }
+        invokeGameLogoutOnClientThread();
+    }
+
+    /**
      * Vastloopdetectie: speler blijft te lang stil op exact dezelfde tile zonder animatie.
      * Uitzonderingen (geen stuck-teller): GE/bank open; NPC-combat ({@link AccountSwitchCombatGate});
      * open dialoog — stilstaan is dan normaal (o.a. farmen/kopen/goblins tussen kills met korte idle).
@@ -4140,6 +4773,10 @@ public class CombatBotPlugin extends LoopedPlugin {
      * 2) Daarna account-switch (indien mogelijk), anders skill-switch.
      */
     private int handleIdleStuckRecovery() {
+        if (shouldSuppressRecoveryForBeginnerClues()) {
+            resetIdleStuckMonitor();
+            return 0;
+        }
         IPlayer local = Players.getLocal();
         if (local == null || local.getWorldLocation() == null) {
             resetIdleStuckMonitor();
@@ -4159,9 +4796,20 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
 
         try {
-            if (GrandExchange.isOpen() || Bank.isOpen()) {
+            if (GrandExchange.isOpen()) {
                 resetIdleStuckMonitor();
                 return 0;
+            }
+            if (Bank.isOpen()) {
+                String statusBank = paint != null ? paint.getCurrentStatus() : "";
+                String bucket = normalizeStuckStatusBucket(statusBank);
+                // Bank open is normaal, behalve bekende gear-prep/bank-lussen
+                if (!"imps_gear_prep".equals(bucket)
+                        && !"imps_gear_prep_deposit".equals(bucket)
+                        && !"imps_gear_aantrekken".equals(bucket)) {
+                    resetIdleStuckMonitor();
+                    return 0;
+                }
             }
         } catch (Throwable ignored) {
         }
@@ -4223,19 +4871,33 @@ public class CombatBotPlugin extends LoopedPlugin {
 
         AccountBehaviorProfileStore.recordEnvironmentStruggle(stormConfigManager, config, rsn);
 
-        boolean dockContext = "imps_karamja_dock".equals(statusBucket);
+        boolean dockContext = "imps_karamja_dock".equals(statusBucket)
+                || (statusBucket != null && statusBucket.contains("naar_karamja"));
         boolean aggressiveRecovery = learnedCount >= 2;
         if (activeSkill == ActiveSkill.IMPS && impsHandler != null && dockContext && aggressiveRecovery) {
             impsHandler.setPreferAlternateKaramjaDockRoute(true);
         }
         if (activeSkill == ActiveSkill.IMPS && idleStuckRecoveryCount <= 1 && !aggressiveRecovery && impsHandler != null) {
-            impsHandler.resetState();
-            impsHandler.startGearPreparation();
-            if (paint != null) {
-                paint.setCurrentStatus("⚠ Stuck detectie: Imps herstel");
-                paint.setLastAntiBanAction("Stuck recovery: Imps soft reset");
+            if (dockContext || (status != null && status.toLowerCase(Locale.ROOT).contains("naar karamja"))) {
+                impsHandler.recoverFromStuckLoop(statusBucket);
+                if (paint != null) {
+                    paint.setCurrentStatus("⚠ Stuck detectie: Imps boot herstel");
+                    paint.setLastAntiBanAction("Stuck recovery: boot reset (geen gear-prep)");
+                }
+            } else {
+                impsHandler.resetState();
+                impsHandler.startGearPreparation();
+                if (paint != null) {
+                    paint.setCurrentStatus("⚠ Stuck detectie: Imps herstel");
+                    paint.setLastAntiBanAction("Stuck recovery: Imps soft reset");
+                }
             }
             return 900;
+        }
+
+        if (shouldSuppressRecoveryForBeginnerClues()) {
+            resetIdleStuckMonitor();
+            return 0;
         }
 
         if (config.accountSwitchEnabled() && accountSwitcher != null && accountSwitcher.getAccountCount() >= 2) {
@@ -4261,6 +4923,59 @@ public class CombatBotPlugin extends LoopedPlugin {
 
     /** Wordt aangeroepen door het panel wanneer de gebruiker op "Sell now" klikt. */
     public void requestSellNow() { sellNowRequested = true; }
+
+    /** Panel Start / Bot inschakelen: check getState() en start inlog-flow indien nodig. */
+    public void onBotStartRequested() {
+        Runnable task = () -> {
+            WelcomeScreenPlayHelper.debugLogLoginState();
+            WelcomeScreenPlayHelper.LoginPhase phase = WelcomeScreenPlayHelper.resolveLoginPhase();
+            if (phase == WelcomeScreenPlayHelper.LoginPhase.IN_GAME) {
+                DebugLog.log("Login", "Bot Start OK — in game world (Game.getState()="
+                        + WelcomeScreenPlayHelper.stormGameStateName() + ")");
+                return;
+            }
+            botStartLoginLogged = true;
+            DebugLog.log("Login", "Bot Start — niet in game world, loginPhase=" + phase
+                    + " Game.getState()=" + WelcomeScreenPlayHelper.stormGameStateName()
+                    + " → inlog-flow starten");
+            if (phase == WelcomeScreenPlayHelper.LoginPhase.WELCOME_LOBBY) {
+                WelcomeScreenPlayHelper.tryClickPlay();
+                if (paint != null) {
+                    paint.setCurrentStatus("▶ Start — welkomstscherm Play...");
+                }
+                return;
+            }
+            if (config.accountSwitchEnabled() && accountSwitcher != null) {
+                accountSwitcher.reload();
+                int switchCount = accountSwitcher.getAccountCount();
+                if (switchCount > 0) {
+                    DebugLog.log("Login", "Bot Start — account-switcher (" + switchCount
+                            + " accounts), Game.getState()=" + WelcomeScreenPlayHelper.stormGameStateName());
+                    accountSwitcher.check();
+                    if (paint != null) {
+                        paint.setCurrentStatus("▶ Start — account-switcher inloggen...");
+                    }
+                    return;
+                }
+            }
+            if (sameAccountRelogger != null && sameAccountRelogger.tryLoginNow()) {
+                return;
+            }
+            if (phase == WelcomeScreenPlayHelper.LoginPhase.LOGIN_SCREEN
+                    && sameAccountRelogger != null && sameAccountRelogger.isIdle()) {
+                sameAccountRelogger.startTestAutoLoginFromLoginScreen();
+            }
+            WelcomeScreenPlayHelper.tryClickPlay();
+            if (paint != null) {
+                paint.setCurrentStatus("▶ Start — inloggen...");
+            }
+        };
+        if (clientThread != null) {
+            clientThread.invokeLater(task);
+        } else {
+            task.run();
+        }
+    }
 
     /** Wordt aangeroepen door het panel wanneer de gebruiker op "Log in" klikt (Centers-tab). */
     public void requestLoginNow() {
@@ -4432,6 +5147,9 @@ public class CombatBotPlugin extends LoopedPlugin {
             case WOODCUTTING:
                 return woodcutterHandler != null ? woodcutterHandler.loop() : 600;
             case MINING:
+                if (shouldRunDoricsQuestNow()) {
+                    return doricsQuestHandler != null ? doricsQuestHandler.loop() : 600;
+                }
                 return miningHandler != null ? miningHandler.loop() : 600;
             case FISHING:
                 return fishingHandler != null ? fishingHandler.loop() : 600;
@@ -4530,11 +5248,11 @@ public class CombatBotPlugin extends LoopedPlugin {
                 return;
             }
             if (lamp.hasAction("Rub")) {
-                lamp.interact("Rub");
+                InventoryActionHelper.interact(config, lamp, "Rub");
             } else if (lamp.hasAction("Use")) {
-                lamp.interact("Use");
+                InventoryActionHelper.interact(config, lamp, "Use");
             } else {
-                lamp.interact(0);
+                InventoryActionHelper.interact(config, lamp, 0);
             }
             DebugLog.log("Lamp", "[TEST] Lamp interact gedaan (Rub/Use)");
         } catch (Throwable t) {
@@ -5107,7 +5825,7 @@ public class CombatBotPlugin extends LoopedPlugin {
 
     /** Herinitialiseer handler en kies een nieuw random center. */
     private void resetHandlerForSkill(ActiveSkill skill) {
-        String centersData = getCenterString(skill);
+        String centersData = effectiveCenterStringForLoggedInPlayer(skill);
         CenterManager.Center chosen = skill == ActiveSkill.LOOT ? null : pickCenterForSkillWithSafety(skill, centersData);
 
         switch (skill) {
@@ -5131,10 +5849,14 @@ public class CombatBotPlugin extends LoopedPlugin {
             case MINING:
                 miningHandler = new MiningHandler(config, antiBan, paint);
                 miningHandler.setTileMarkerManager(tileMarkerManager);
+                miningHandler.setWorldHopClient(client, clientThread);
                 miningHandler.resetState();
+                miningHeldForDoricsQuest = false;
                 if (chosen != null) {
-                    miningHandler.setActiveCenter(chosen.point, chosen.radius);
                     areaOverlay.setActiveCenterForSkill(skill, chosen.point);
+                    if (!shouldRunDoricsQuestNow()) {
+                        miningHandler.setActiveCenter(chosen.point, chosen.radius, chosen.name != null ? chosen.name : "");
+                    }
                 }
                 break;
             case BARBARIAN:
@@ -5153,8 +5875,7 @@ public class CombatBotPlugin extends LoopedPlugin {
                 break;
             case IMPS:
                 impsHandler = new ImpsHandler(config, antiBan, paint);
-                impsHandler.setTileMarkerManager(tileMarkerManager);
-                impsHandler.setQuestProgressConfigManager(stormConfigManager);
+                wireImpsHandler(impsHandler);
                 impsHandler.resetState();
                 impsHandler.startGearPreparation();
                 if (chosen != null) {
@@ -5221,13 +5942,13 @@ public class CombatBotPlugin extends LoopedPlugin {
             if (config.barbarianMode()) {
                 skills.add(ActiveSkill.BARBARIAN);
             }
-            if (rotRow.rotationPickWc && CenterManager.countActive(config.wcCenters()) > 0) {
+            if (rotRow.rotationPickWc && CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.WOODCUTTING)) > 0) {
                 skills.add(ActiveSkill.WOODCUTTING);
             }
-            if (rotRow.rotationPickMining && CenterManager.countActive(config.miningCenters()) > 0) {
+            if (rotRow.rotationPickMining && CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.MINING)) > 0) {
                 skills.add(ActiveSkill.MINING);
             }
-            if (rotRow.rotationPickFishing && CenterManager.countActive(config.fishingCenters()) > 0) {
+            if (rotRow.rotationPickFishing && CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.FISHING)) > 0) {
                 skills.add(ActiveSkill.FISHING);
             }
             boolean barbLootListed = config.barbLootEnabled() || barbLootSessionActive
@@ -5252,13 +5973,13 @@ public class CombatBotPlugin extends LoopedPlugin {
         if (config.barbarianMode()) {
             skills.add(ActiveSkill.BARBARIAN);
         }
-        if (CenterManager.countActive(config.wcCenters()) > 0) {
+        if (CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.WOODCUTTING)) > 0) {
             skills.add(ActiveSkill.WOODCUTTING);
         }
-        if (CenterManager.countActive(config.miningCenters()) > 0) {
+        if (CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.MINING)) > 0) {
             skills.add(ActiveSkill.MINING);
         }
-        if (CenterManager.countActive(config.fishingCenters()) > 0) {
+        if (CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.FISHING)) > 0) {
             skills.add(ActiveSkill.FISHING);
         }
         boolean barbLootListed = config.barbLootEnabled() || barbLootSessionActive
@@ -5302,24 +6023,50 @@ public class CombatBotPlugin extends LoopedPlugin {
         if (centersData == null || centersData.trim().isEmpty()) {
             return "";
         }
-        if (!(skill == ActiveSkill.WOODCUTTING || skill == ActiveSkill.FISHING)) {
-            return centersData;
-        }
-        if (!shouldAvoidDraynorCentersNow()) {
+        boolean filterDraynor = (skill == ActiveSkill.WOODCUTTING || skill == ActiveSkill.FISHING)
+                && shouldAvoidDraynorCentersNow();
+        boolean filterAlkharidScorpions = skill == ActiveSkill.MINING && shouldAvoidAlkharidScorpionCentersNow();
+        if (!filterDraynor && !filterAlkharidScorpions) {
             return centersData;
         }
         List<CenterManager.Center> all = CenterManager.parse(centersData);
         List<CenterManager.Center> safe = new ArrayList<>();
         for (CenterManager.Center c : all) {
-            if (c == null || !c.active) continue;
-            if (!isDraynorLikeCenter(c)) {
-                safe.add(c);
+            if (c == null || !c.active) {
+                continue;
             }
+            if (filterDraynor && isDraynorLikeCenter(c)) {
+                continue;
+            }
+            if (filterAlkharidScorpions && isAlkharidScorpionMineCenter(c)) {
+                continue;
+            }
+            safe.add(c);
         }
         if (safe.isEmpty()) {
             return "";
         }
         return CenterManager.serialize(safe);
+    }
+
+    private boolean shouldAvoidAlkharidScorpionCentersNow() {
+        return MiningSiteRules.scorpionsAggressiveToCombatLevel(getLocalCombatLevelSafe());
+    }
+
+    private boolean isAlkharidScorpionMineCenter(CenterManager.Center c) {
+        if (c == null || c.point == null) {
+            return false;
+        }
+        MiningSiteRules.MiningSiteKind kind = MiningSiteRules.classify(
+                c.name != null ? c.name : "", c.point);
+        return MiningSiteRules.siteHasAlkharidScorpions(kind);
+    }
+
+    private boolean isUnsafeAlkharidScorpionMineSpot(WorldPoint spot) {
+        if (spot == null || !shouldAvoidAlkharidScorpionCentersNow()) {
+            return false;
+        }
+        return MiningSiteRules.siteHasAlkharidScorpions(MiningSiteRules.classify("", spot));
     }
 
     private int countSafeActiveCentersForSkill(ActiveSkill skill, String centersData) {
@@ -5333,6 +6080,12 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
         if (skill == ActiveSkill.FISHING) {
             return CenterManager.pickFishingCenterForTraining(filtered, Skills.getLevel(Skill.FISHING));
+        }
+        if (skill == ActiveSkill.MINING) {
+            CenterManager.Center m = CenterManager.pickMiningCenterForTraining(filtered, Skills.getLevel(Skill.MINING));
+            if (m != null) {
+                return m;
+            }
         }
         return CenterManager.pickRandom(filtered);
     }
@@ -5349,14 +6102,21 @@ public class CombatBotPlugin extends LoopedPlugin {
         boolean hasUsable = false;
         for (ActiveSkill s : enabled) {
             if (s == ActiveSkill.WOODCUTTING) {
-                if (countSafeActiveCentersForSkill(s, config.wcCenters()) > 0) {
+                if (countSafeActiveCentersForSkill(s, effectiveCenterStringForLoggedInPlayer(ActiveSkill.WOODCUTTING)) > 0) {
                     hasUsable = true;
                     break;
                 }
                 continue;
             }
             if (s == ActiveSkill.FISHING) {
-                if (countSafeActiveCentersForSkill(s, config.fishingCenters()) > 0) {
+                if (countSafeActiveCentersForSkill(s, effectiveCenterStringForLoggedInPlayer(ActiveSkill.FISHING)) > 0) {
+                    hasUsable = true;
+                    break;
+                }
+                continue;
+            }
+            if (s == ActiveSkill.MINING) {
+                if (countSafeActiveCentersForSkill(s, effectiveCenterStringForLoggedInPlayer(ActiveSkill.MINING)) > 0) {
                     hasUsable = true;
                     break;
                 }
@@ -5436,6 +6196,41 @@ public class CombatBotPlugin extends LoopedPlugin {
     /** Imps in rotatie: {@code impsMode} + imps-centers, met per-account “alleen Imps / alleen Giants”. */
     private boolean effectiveImpsInRotation() {
         return ManagedJagexAccountsStore.resolveImpsInRotationForDisplayName(config, tryGetLocalRsn());
+    }
+
+    /** Globale {@link CombatBotConfig#impsCompetitorWorldHop()} + per-account vink in account-editor. */
+    private boolean effectiveImpsCompetitorWorldHop() {
+        if (!config.impsCompetitorWorldHop()) {
+            return false;
+        }
+        ManagedJagexAccountsStore.ManagedJagexAccountRow row = findManagedRowByDisplayName(tryGetLocalRsn());
+        if (row == null) {
+            return true;
+        }
+        return row.impsCompetitorWorldHopEnabled;
+    }
+
+    private void wireImpsHandler(ImpsHandler handler) {
+        if (handler == null) {
+            return;
+        }
+        handler.setTileMarkerManager(tileMarkerManager);
+        handler.setQuestProgressConfigManager(stormConfigManager);
+        handler.setWorldHopClient(client, clientThread);
+        handler.setCompetitorWorldHopEnabled(this::effectiveImpsCompetitorWorldHop);
+    }
+
+    /** Zelfde boot als imps loot-dump — voor elke volwaardige bank-trip vanaf Karamja (mining/wc/fishing/gear prep). */
+    private boolean travelKaramjaToPortSarimForFullBank() {
+        if (impsHandler == null) {
+            return false;
+        }
+        net.storm.api.domain.actors.IPlayer local = net.storm.sdk.entities.Players.getLocal();
+        if (local == null || !ImpsHandler.isOnKaramja(local)) {
+            return false;
+        }
+        impsHandler.travelToPortSarimFromKaramja(local);
+        return true;
     }
 
     private ManagedJagexAccountsStore.ManagedJagexAccountRow findManagedRowByDisplayName(String displayName) {
@@ -5520,6 +6315,36 @@ public class CombatBotPlugin extends LoopedPlugin {
         return needsCalibrate ? 250 : 0;
     }
 
+    /** Elke ~2s: alle equipped items → account-JSON (geen vaste item-lijst). */
+    private void handlePerAccountEquipmentSnapshot() {
+        if (!Game.isLoggedIn()) {
+            return;
+        }
+        String rsn = tryGetLocalRsn();
+        if (rsn == null || rsn.trim().isEmpty()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastEquipmentSnapshotSyncMs < 2000L) {
+            return;
+        }
+        lastEquipmentSnapshotSyncMs = now;
+        EquipmentSnapshotHelper.writeSnapshotIfLoggedIn(rsn);
+    }
+
+    private void maybePollF2pQuestGameCompletionFromClient() {
+        long now = System.currentTimeMillis();
+        if (now - lastF2pQuestGameSyncMs < 4000L) {
+            return;
+        }
+        lastF2pQuestGameSyncMs = now;
+        String rsn = tryGetLocalRsn();
+        if (rsn == null || rsn.trim().isEmpty()) {
+            return;
+        }
+        AccountQuestProgressStore.syncVampireSlayerFromGameIfFinished(stormConfigManager, config, rsn);
+    }
+
     private void syncQuestCompletionOnCalibration(String rsn) {
         if (rsn == null || rsn.trim().isEmpty()) {
             return;
@@ -5530,23 +6355,40 @@ public class CombatBotPlugin extends LoopedPlugin {
         }
         lastQuestCalibrationSyncMs = now;
 
-        boolean vampDone = false;
+        AccountQuestProgressStore.QuestEntry before = AccountQuestProgressStore.get(config, rsn);
+        AccountQuestProgressStore.syncVampireSlayerFromGameIfFinished(stormConfigManager, config, rsn);
+        AccountQuestProgressStore.QuestEntry after = AccountQuestProgressStore.get(config, rsn);
+        if ((before == null || before.vampireSlayerStep < AccountQuestProgressStore.VAMPIRE_SLAYER_STEP_DONE)
+                && after != null && after.vampireSlayerStep >= AccountQuestProgressStore.VAMPIRE_SLAYER_STEP_DONE) {
+            DebugLog.log("QUEST", "Calibratie-sync: Vampire Slayer voltooid gedetecteerd voor " + rsn);
+        }
+    }
+
+    /** Geen stuck/loopwatch-logout tijdens beginner-clue bank/GE prep. */
+    private boolean shouldSuppressRecoveryForBeginnerClues() {
+        if (!beginnerClueSolverShouldRun()) {
+            return false;
+        }
+        if (beginnerClueHandler != null && beginnerClueHandler.shouldSuppressStuckAndLogout()) {
+            return true;
+        }
+        String st = paint != null ? paint.getCurrentStatus() : "";
+        return st != null && st.toLowerCase(Locale.ROOT).contains("beginner clue");
+    }
+
+    /** Panel + RuneLite config: beginner clue solver aan (vereist ook {@link CombatBotConfig#botEnabled()}). */
+    private boolean beginnerClueSolverEnabledLive() {
         try {
-            vampDone = Quests.isFinished(Quest.VAMPYRE_SLAYER);
+            Object v = stormConfigManager.getConfiguration("combatbot", "beginnerClueSolverEnabled");
+            if (v instanceof Boolean) {
+                return (Boolean) v;
+            }
+            if (v != null) {
+                return Boolean.parseBoolean(String.valueOf(v).trim());
+            }
         } catch (Throwable ignored) {
         }
-        if (!vampDone) {
-            return;
-        }
-
-        AccountQuestProgressStore.QuestEntry cur = AccountQuestProgressStore.get(config, rsn);
-        if (cur != null && cur.vampireSlayerStep >= AccountQuestProgressStore.VAMPIRE_SLAYER_STEP_DONE) {
-            return;
-        }
-        AccountQuestProgressStore.QuestEntry q = cur != null ? cur : new AccountQuestProgressStore.QuestEntry();
-        q.vampireSlayerStep = AccountQuestProgressStore.VAMPIRE_SLAYER_STEP_DONE;
-        AccountQuestProgressStore.put(stormConfigManager, config, rsn, q);
-        DebugLog.log("QUEST", "Calibratie-sync: Vampire Slayer voltooid gedetecteerd voor " + rsn);
+        return config.beginnerClueSolverEnabled();
     }
 
     /** Alleen expliciete quest-mode toggle mag Vampire Slayer prioriteren. */
@@ -5582,13 +6424,13 @@ public class CombatBotPlugin extends LoopedPlugin {
         if (CenterManager.countActive(config.combatCenters()) > 0) {
             return ActiveSkill.COMBAT;
         }
-        if (CenterManager.countActive(config.wcCenters()) > 0) {
+        if (CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.WOODCUTTING)) > 0) {
             return ActiveSkill.WOODCUTTING;
         }
-        if (CenterManager.countActive(config.miningCenters()) > 0) {
+        if (CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.MINING)) > 0) {
             return ActiveSkill.MINING;
         }
-        if (CenterManager.countActive(config.fishingCenters()) > 0) {
+        if (CenterManager.countActive(effectiveCenterStringForLoggedInPlayer(ActiveSkill.FISHING)) > 0) {
             return ActiveSkill.FISHING;
         }
         if (effectiveGiantsMode()) {
@@ -5753,7 +6595,20 @@ public class CombatBotPlugin extends LoopedPlugin {
                         || n.contains("shark")
                         || n.contains("monkfish")
                         || n.contains("pizza")
-                        || n.contains("amulet");
+                        || n.contains("amulet")
+                        || n.contains("helm")
+                        || n.contains("plate")
+                        || n.contains("chain")
+                        || n.contains("legs")
+                        || n.contains("skirt")
+                        || n.contains("chaps")
+                        || n.contains("vambraces")
+                        || n.contains("gloves")
+                        || n.contains("boots")
+                        || n.contains("cape")
+                        || n.contains("coif")
+                        || n.contains("robe")
+                        || n.contains("shield");
             case LOOT:
                 if (n.contains("pickaxe")) return false;
                 return n.contains("trout")
@@ -5948,11 +6803,28 @@ public class CombatBotPlugin extends LoopedPlugin {
         if (giantsHandler != null) giantsHandler.resetState();
         if (lootHandler != null) lootHandler.resetState();
         if (starterSkillHandler != null) starterSkillHandler.resetState();
+        stopBeginnerClueSolver("noodstop");
         resetAllAccountLocalProgressOnStop();
         if (paint != null) {
             paint.setLastAntiBanAction("⛔ Noodstop — alle bot-acties gestopt");
             paint.setCurrentStatus("⛔ Noodstop actief — Start om opnieuw te hervatten");
         }
+    }
+
+    private void stopBeginnerClueSolver(String reason) {
+        if (beginnerClueHandler != null) {
+            beginnerClueHandler.cancelAndReset(reason);
+        }
+        if (paint != null) {
+            paint.clearBeginnerClueKitDisplay();
+        }
+    }
+
+    /** Bot aan + solver-checkbox + beginner scroll in inventory. */
+    private boolean beginnerClueSolverShouldRun() {
+        return config.botEnabled()
+                && beginnerClueSolverEnabledLive()
+                && BeginnerClueHandler.hasBeginnerClueScroll();
     }
 
     /**
@@ -6184,14 +7056,57 @@ public class CombatBotPlugin extends LoopedPlugin {
                 + " -> " + e.activeSkillName + " " + e.elapsedSec + "s/" + e.totalSwitchSec + "s");
     }
 
+    private void persistClearStarterStartSkillOverrideAfterImpsHandoff(String displayName) {
+        if (displayName == null || displayName.trim().isEmpty()) {
+            return;
+        }
+        List<ManagedJagexAccountsStore.ManagedJagexAccountRow> rows =
+                ManagedJagexAccountsStore.parseRows(config.managedJagexAccountsBlob());
+        if (rows.isEmpty()) {
+            return;
+        }
+        String norm = JagexCredentialsHelper.normalizeDisplayNameForMatch(displayName.trim());
+        boolean changed = false;
+        for (ManagedJagexAccountsStore.ManagedJagexAccountRow r : rows) {
+            if (r == null || r.displayName == null || r.displayName.trim().isEmpty()) {
+                continue;
+            }
+            if (!JagexCredentialsHelper.normalizeDisplayNameForMatch(r.displayName.trim()).equalsIgnoreCase(norm)) {
+                continue;
+            }
+            if (!r.useGlobalCenterListsOnly) {
+                String ov = r.startSkillOverride != null ? r.startSkillOverride.trim() : "";
+                if (ov.equalsIgnoreCase(CombatBotConfig.StartSkill.STARTER.name())) {
+                    r.startSkillOverride = "";
+                    changed = true;
+                }
+            }
+            break;
+        }
+        if (changed) {
+            ManagedJagexAccountsStore.persist(stormConfigManager, rows);
+        }
+    }
+
     /**
-     * Zorgt dat {@code activeSkill} overeenkomt met {@code startSkill = Starter}.
      * <p>Oorzaak van veel "waarom Imps?": opgeslagen {@link AccountLocalProgressStore} had nog IMPS actief terwijl
      * je Start skill opnieuw op Starter zette, of de bot bleef aan over een relog heen zonder fresh start
      * ({@code wasBotEnabled} bleef true) waardoor oude {@code activeSkill} bleef hangen.
      * <p>Geen {@link #resetHandlerForSkill(ActiveSkill)}: dat zou Starter-fase uit JSON wissen. Imps-state wel resetten.
+     * <p>Na een geslaagde starter→imps-handoff blijft {@link #effectiveStartSkillSetting()} soms kort (of lang)
+     * STARTER door trage config-sync of {@code startSkillOverride} op de accountrij; dan niet terugforceren
+     * zolang we nog op Imps zitten en de effectieve start-skill nog STARTER lijkt.
      */
     private void enforceStarterStartSkillIfConfigured() {
+        if (ignoreStaleStarterStartSkillWhileImpsHandoff) {
+            boolean stillStaleHandoff = activeSkill == ActiveSkill.IMPS
+                    && effectiveStartSkillSetting() == CombatBotConfig.StartSkill.STARTER;
+            if (!stillStaleHandoff) {
+                ignoreStaleStarterStartSkillWhileImpsHandoff = false;
+            } else {
+                return;
+            }
+        }
         if (effectiveStartSkillSetting() != CombatBotConfig.StartSkill.STARTER) {
             return;
         }

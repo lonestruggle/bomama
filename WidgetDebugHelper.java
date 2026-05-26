@@ -290,4 +290,138 @@ public final class WidgetDebugHelper {
             }
         }
     }
+
+    /** Resultaat voor hover-overlay (Storm-widget API). */
+    public static final class WidgetHoverInfo {
+        public final int scanGroup;
+        public final int scanChild;
+        public final int packedId;
+        public final int ifaceGroup;
+        public final int ifaceChild;
+        public final String humanLabel;
+        public final String name;
+        public final String text;
+        public final String actions;
+        public final int canvasX;
+        public final int canvasY;
+        public final int boundsW;
+        public final int boundsH;
+
+        WidgetHoverInfo(int scanGroup, int scanChild, IWidget w, String name, String text, String actions) {
+            this.scanGroup = scanGroup;
+            this.scanChild = scanChild;
+            int packed = safeId(w);
+            this.packedId = packed;
+            this.ifaceGroup = packed > 0 ? (packed >>> 16) : -1;
+            this.ifaceChild = packed > 0 ? (packed & 0xFFFF) : -1;
+            this.name = name;
+            this.text = text;
+            this.actions = actions;
+            this.humanLabel = deriveHumanLabel(name, text, actions);
+            Point canvas = safeCanvas(w);
+            this.canvasX = canvas.getX();
+            this.canvasY = canvas.getY();
+            Rectangle b = safeBounds(w);
+            this.boundsW = b.width;
+            this.boundsH = b.height;
+        }
+    }
+
+    /**
+     * Kleinste zichtbare widget onder canvas-muiscoördinaat (Storm {@link Widgets} API).
+     * Betrouwbaarder dan alleen RuneLite {@code getBounds()} op game widgets.
+     */
+    public static WidgetHoverInfo findSmallestStormWidgetAt(int canvasX, int canvasY) {
+        BestHit best = new BestHit();
+        outer:
+        for (int g = 0; g <= MAX_GROUP; g++) {
+            for (int c = 0; c <= MAX_CHILD; c++) {
+                IWidget root;
+                try {
+                    root = Widgets.get(g, c);
+                } catch (Throwable ignored) {
+                    continue;
+                }
+                if (root == null) {
+                    continue;
+                }
+                visitStormHit(root, g, c, canvasX, canvasY, best);
+                if (best.w != null && best.area <= 4) {
+                    break outer;
+                }
+            }
+        }
+        if (best.w == null) {
+            return null;
+        }
+        return new WidgetHoverInfo(best.scanGroup, best.scanChild, best.w,
+                clean(best.w.getName()), clean(best.w.getText()), formatActions(best.w));
+    }
+
+    private static void visitStormHit(IWidget w, int scanGroup, int scanChild, int mx, int my, BestHit best) {
+        if (w == null) {
+            return;
+        }
+        try {
+            if (w.isHidden() || !w.isVisible()) {
+                return;
+            }
+        } catch (Throwable ignored) {
+            return;
+        }
+        Rectangle b = safeBounds(w);
+        Point loc = safeCanvas(w);
+        int bw = b.width > 0 ? b.width : safeWidth(w);
+        int bh = b.height > 0 ? b.height : safeHeight(w);
+        int bx = loc.getX() >= 0 ? loc.getX() : b.x;
+        int by = loc.getY() >= 0 ? loc.getY() : b.y;
+        if (bw > 0 && bh > 0
+                && mx >= bx && mx < bx + bw
+                && my >= by && my < by + bh) {
+            int area = bw * bh;
+            if (area < best.area) {
+                best.area = area;
+                best.w = w;
+                best.scanGroup = scanGroup;
+                best.scanChild = scanChild;
+            }
+        }
+        visitStormChildren(w.getChildren(), scanGroup, scanChild, mx, my, best);
+        visitStormChildren(w.getDynamicChildren(), scanGroup, scanChild, mx, my, best);
+        visitStormChildren(w.getNestedChildren(), scanGroup, scanChild, mx, my, best);
+    }
+
+    private static void visitStormChildren(IWidget[] children, int scanGroup, int scanChild, int mx, int my, BestHit best) {
+        if (children == null) {
+            return;
+        }
+        for (IWidget ch : children) {
+            if (ch != null) {
+                visitStormHit(ch, scanGroup, scanChild, mx, my, best);
+            }
+        }
+    }
+
+    private static int safeWidth(IWidget w) {
+        try {
+            return Math.max(0, w.getWidth());
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
+    private static int safeHeight(IWidget w) {
+        try {
+            return Math.max(0, w.getHeight());
+        } catch (Throwable ignored) {
+            return 0;
+        }
+    }
+
+    private static final class BestHit {
+        IWidget w;
+        int scanGroup;
+        int scanChild;
+        int area = Integer.MAX_VALUE;
+    }
 }
